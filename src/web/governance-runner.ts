@@ -5,6 +5,7 @@ import { requirementSchema, type Requirement } from "../schemas/requirement.js";
 import type { Workflow } from "../schemas/workflow.js";
 import { runDesignReviewLoop } from "../workflow/design-review-loop.js";
 import { ArtifactStore, type GovernanceArtifacts } from "./artifact-store.js";
+import { buildRequirementDescription } from "./request-formatting.js";
 
 export interface GovernanceRequest {
   workflowId?: string;
@@ -94,15 +95,11 @@ export async function runGovernanceWorkflow(input: {
 }
 
 function buildRequirement(request: GovernanceRequest): Requirement {
-  const description = [request.description.trim(), formatDiscussion(request.discussion)]
-    .filter(Boolean)
-    .join("\n\n");
-
   return requirementSchema.parse({
     id: request.workflowId?.trim() || createWorkflowId(),
     title: request.title.trim(),
     source: "web",
-    description,
+    description: buildRequirementDescription(request),
     acceptanceCriteria: request.acceptanceCriteria ?? [],
     constraints: request.constraints ?? []
   });
@@ -128,9 +125,4 @@ function createDraftWorkflow(requirement: Requirement, maxDesignReviewRounds: nu
     maxDesignReviewRounds,
     tasks: []
   };
-}
-
-function formatDiscussion(discussion: string | undefined): string {
-  const trimmed = discussion?.trim();
-  return trimmed ? `讨论记录：\n${trimmed}` : "";
 }

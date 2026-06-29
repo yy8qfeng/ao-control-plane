@@ -355,8 +355,9 @@ export function renderIndexHtml(): string {
           <input name="maxDesignReviewRounds" type="number" min="1" max="20" step="1" value="3">
         </label>
         <div class="actions">
-          <button id="reviewButton" type="submit">开始设计审查循环</button>
+          <button id="reviewButton" type="submit">生成需求设计并审查</button>
           <button id="rerunButton" class="secondary" type="submit">补充需求并重新审查</button>
+          <button id="stopButton" class="secondary" type="button" disabled>停止</button>
           <button id="planButton" class="secondary" type="button" disabled>生成任务计划</button>
           <button id="dryRunButton" class="secondary" type="button" disabled>预演执行</button>
         </div>
@@ -370,16 +371,18 @@ export function renderIndexHtml(): string {
           <div class="metric"><span>Workflow</span><strong id="workflowId">未生成</strong></div>
           <div class="metric"><span>状态</span><strong id="workflowStatus">-</strong></div>
           <div class="metric"><span>审查轮次</span><strong id="reviewCount">0</strong></div>
-          <div class="metric"><span>任务数</span><strong id="taskCount">0</strong></div>
+          <div class="metric"><span>已等待</span><strong id="elapsedSeconds">0s</strong></div>
         </div>
         <div class="tabs">
-          <button class="tab active" type="button" data-tab="design">设计稿</button>
+          <button class="tab active" type="button" data-tab="logs">过程</button>
+          <button class="tab" type="button" data-tab="design">设计稿</button>
           <button class="tab" type="button" data-tab="reviews">审查</button>
           <button class="tab" type="button" data-tab="plan">任务计划</button>
           <button class="tab" type="button" data-tab="execution">执行预演</button>
         </div>
       </div>
       <div class="content">
+        <div class="actions" id="versionControls" style="margin-bottom: 10px; display: none;"></div>
         <pre id="output">填写需求后点击生成。</pre>
       </div>
     </section>
@@ -410,8 +413,10 @@ export function renderIndexHtml(): string {
     const headerStatus = document.querySelector("#headerStatus");
     const reviewButton = document.querySelector("#reviewButton");
     const rerunButton = document.querySelector("#rerunButton");
+    const stopButton = document.querySelector("#stopButton");
     const planButton = document.querySelector("#planButton");
     const dryRunButton = document.querySelector("#dryRunButton");
+    const versionControls = document.querySelector("#versionControls");
     const projectButton = document.querySelector("#projectButton");
     const projectDialog = document.querySelector("#projectDialog");
     const closeProjectDialog = document.querySelector("#closeProjectDialog");
@@ -421,17 +426,27 @@ export function renderIndexHtml(): string {
     const directoryList = document.querySelector("#directoryList");
     const currentPath = document.querySelector("#currentPath");
     const projectRootInput = document.querySelector('input[name="projectRoot"]');
-    const state = { result: null, execution: null, activeTab: "design", browsingPath: "" };
+    const state = {
+      result: null,
+      job: null,
+      pollTimer: null,
+      localTimer: null,
+      execution: null,
+      activeTab: "logs",
+      selectedDesignIndex: null,
+      selectedReviewIndex: null,
+      browsingPath: ""
+    };
 
     loadProjects();
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       await runStep(
-        "/api/governance/design-review",
-        "正在由 Codex 生成设计，并交由 ClaudeCode 审查...",
-        "设计审查循环已完成。若补充需求后重新审查，审查轮次会从 1 开始。",
-        "design"
+        "/api/governance/run",
+        "正在执行完整治理流程：Codex 生成设计、ClaudeCode 审查、Codex 整改，并生成任务计划...",
+        "完整治理流程已完成。若补充需求后重新审查，审查轮次会从 1 开始。",
+        "logs"
       );
     });
 
@@ -448,6 +463,22 @@ export function renderIndexHtml(): string {
     parentPathButton.addEventListener("click", async () => {
       const parentPath = parentPathButton.dataset.path;
       if (parentPath) await browseDirectories(parentPath);
+    });
+
+    stopButton.addEventListener("click", async () => {
+      if (!state.job?.jobId) return;
+      try {
+        const response = await fetch("/api/governance/jobs/" + encodeURIComponent(state.job.jobId) + "/stop", {
+          method: "POST"
+        });
+        state.job = await readResponse(response);
+        stopPollingTimers();
+        updateSummary();
+        renderActiveTab();
+        setStatus("warn", "已停止当前治理流程。");
+      } catch (error) {
+        setStatus("bad", error.message || String(error));
+      }
     });
 
     planButton.addEventListener("click", async () => {
@@ -508,16 +539,40 @@ export function renderIndexHtml(): string {
       });
     });
 
+    document.addEventListener("visibilitychange", () => {
+      if (!state.job || state.job.status !== "running") return;
+      if (document.hidden) {
+        stopPollingTimers();
+      } else {
+        startPollingJob(state.job.jobId, "完整治理流程已完成。若补充需求后重新审查，审查轮次会从 1 开始。");
+      }
+    });
+
     async function runStep(path, busyMessage, successMessage, nextTab) {
       setBusy(true, busyMessage);
       state.execution = null;
+      state.selectedDesignIndex = null;
+      state.selectedReviewIndex = null;
+      let startedJob = false;
       try {
         const response = await fetch(path, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(buildGovernancePayload())
         });
-        state.result = await readResponse(response);
+        const responseBody = await readResponse(response);
+        if (responseBody.jobId) {
+          startedJob = true;
+          state.job = responseBody;
+          state.result = null;
+          state.activeTab = nextTab;
+          activateTab(nextTab);
+          updateSummary();
+          renderActiveTab();
+          startPollingJob(responseBody.jobId, successMessage);
+          return;
+        }
+        state.result = responseBody;
         state.activeTab = nextTab;
         activateTab(nextTab);
         updateSummary();
@@ -526,7 +581,68 @@ export function renderIndexHtml(): string {
       } catch (error) {
         setStatus("bad", error.message || String(error));
       } finally {
+        if (!startedJob) {
+          setBusy(false);
+        }
+      }
+    }
+
+    function startPollingJob(jobId, successMessage) {
+      stopPollingTimers();
+      pollJob(jobId, successMessage);
+      state.pollTimer = setInterval(() => pollJob(jobId, successMessage), 1500);
+      state.localTimer = setInterval(() => {
+        if (state.job?.status === "running") {
+          state.job.elapsedSeconds = Math.max(
+            0,
+            Math.floor((Date.now() - new Date(state.job.startedAt).getTime()) / 1000)
+          );
+          updateSummary();
+          if (state.activeTab === "logs") renderActiveTab();
+        }
+      }, 1000);
+    }
+
+    function stopPollingTimers() {
+      if (state.pollTimer) {
+        clearInterval(state.pollTimer);
+        state.pollTimer = null;
+      }
+      if (state.localTimer) {
+        clearInterval(state.localTimer);
+        state.localTimer = null;
+      }
+    }
+
+    async function pollJob(jobId, successMessage) {
+      try {
+        const response = await fetch("/api/governance/jobs/" + encodeURIComponent(jobId));
+        const job = await readResponse(response);
+        if (state.job?.jobId !== job.jobId) return;
+        state.job = job;
+        if (job.result) state.result = job.result;
+        if (job.designs?.length && state.selectedDesignIndex === null) {
+          state.selectedDesignIndex = job.designs.length - 1;
+        }
+        if (job.reviews?.length && state.selectedReviewIndex === null) {
+          state.selectedReviewIndex = job.reviews.length - 1;
+        }
+        updateSummary();
+        renderActiveTab();
+        if (job.status === "completed" || job.status === "failed") {
+          stopPollingTimers();
+          setBusy(false);
+          setStatus(job.status === "completed" ? "ok" : "bad", job.status === "completed" ? successMessage : job.error || "流程失败。");
+        }
+        if (job.status === "stopped") {
+          stopPollingTimers();
+          setBusy(false);
+          setStatus("warn", "已停止当前治理流程。");
+        }
+      } catch (error) {
+        stopPollingTimers();
         setBusy(false);
+        setStatus("bad", error.message || String(error));
       }
     }
 
@@ -645,7 +761,8 @@ export function renderIndexHtml(): string {
 
     function setBusy(busy, message = "") {
       reviewButton.disabled = busy;
-      rerunButton.disabled = busy;
+      rerunButton.disabled = false;
+      stopButton.disabled = !busy;
       planButton.disabled = busy || state.result?.workflow?.status !== "ready_for_planning";
       dryRunButton.disabled = busy || !state.result?.plan;
       if (message) setStatus("warn", message);
@@ -666,28 +783,84 @@ export function renderIndexHtml(): string {
 
     function updateSummary() {
       const result = state.result;
-      document.querySelector("#workflowId").textContent = result?.workflow?.workflowId || "未生成";
-      document.querySelector("#workflowStatus").textContent = result?.workflow?.status || "-";
-      document.querySelector("#reviewCount").textContent = String(result?.reviews?.length || 0);
-      document.querySelector("#taskCount").textContent = String(result?.plan?.tasks?.length || 0);
-      planButton.disabled = result?.workflow?.status !== "ready_for_planning";
-      dryRunButton.disabled = !result?.plan;
+      const job = state.job;
+      const running = job?.status === "running";
+      document.querySelector("#workflowId").textContent = result?.workflow?.workflowId || job?.result?.workflow?.workflowId || "未生成";
+      document.querySelector("#workflowStatus").textContent = job?.currentStep || result?.workflow?.status || job?.status || "-";
+      document.querySelector("#reviewCount").textContent = String(result?.reviews?.length || job?.reviews?.length || 0);
+      document.querySelector("#elapsedSeconds").textContent = String(job?.elapsedSeconds || 0) + "s";
+      reviewButton.disabled = running;
+      rerunButton.disabled = false;
+      stopButton.disabled = !running;
+      planButton.disabled = running || result?.workflow?.status !== "ready_for_planning";
+      dryRunButton.disabled = running || !result?.plan;
     }
 
     function renderActiveTab() {
-      if (!state.result) {
+      renderVersionControls();
+      if (!state.result && !state.job) {
         output.textContent = "填写需求后点击生成。";
         return;
       }
 
-      if (state.activeTab === "design") {
-        output.textContent = state.result.design || "";
+      if (state.activeTab === "logs") {
+        const timer = state.job ? ["当前步骤：" + state.job.currentStep, "已等待：" + state.job.elapsedSeconds + " 秒", ""].join("\\n") : "";
+        output.textContent = timer + ((state.job?.logs || []).join("\\n") || "等待流程开始。");
+      } else if (state.activeTab === "design") {
+        const designs = state.job?.designs || [];
+        if (designs.length > 0) {
+          const index = state.selectedDesignIndex ?? designs.length - 1;
+          output.textContent = designs[index]?.content || "";
+        } else {
+          output.textContent = state.result?.design || "";
+        }
       } else if (state.activeTab === "reviews") {
-        output.textContent = JSON.stringify(state.result.reviews || [], null, 2);
+        const reviews = state.job?.reviews || state.result?.reviews || [];
+        if (state.job?.reviews?.length) {
+          const index = state.selectedReviewIndex ?? reviews.length - 1;
+          output.textContent = JSON.stringify(reviews[index] || null, null, 2);
+        } else {
+          output.textContent = JSON.stringify(reviews, null, 2);
+        }
       } else if (state.activeTab === "plan") {
-        output.textContent = JSON.stringify(state.result.plan || null, null, 2);
+        output.textContent = JSON.stringify(state.result?.plan || state.job?.plan || null, null, 2);
       } else {
         output.textContent = JSON.stringify(state.execution || { message: "尚未执行预演。" }, null, 2);
+      }
+    }
+
+    function renderVersionControls() {
+      versionControls.innerHTML = "";
+      versionControls.style.display = "none";
+      if (state.activeTab === "design" && state.job?.designs?.length > 0) {
+        versionControls.style.display = "flex";
+        state.job.designs.forEach((design, index) => {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "secondary";
+          button.textContent = design.version;
+          button.disabled = index === (state.selectedDesignIndex ?? state.job.designs.length - 1);
+          button.addEventListener("click", () => {
+            state.selectedDesignIndex = index;
+            renderActiveTab();
+          });
+          versionControls.appendChild(button);
+        });
+      }
+      if (state.activeTab === "reviews" && state.job?.reviews?.length > 0) {
+        versionControls.style.display = "flex";
+        state.job.reviews.forEach((review, index) => {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "secondary";
+          button.textContent = "review-" + review.round;
+          button.disabled = index === (state.selectedReviewIndex ?? state.job.reviews.length - 1);
+          button.addEventListener("click", () => {
+            state.selectedReviewIndex = index;
+            renderActiveTab();
+          });
+          versionControls.appendChild(button);
+        });
       }
     }
   </script>

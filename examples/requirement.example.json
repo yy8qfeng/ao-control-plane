@@ -1,0 +1,16 @@
+{
+  "id": "WF-EXAMPLE-001",
+  "title": "Add governance workflow CLI",
+  "source": "user",
+  "description": "Add a CLI workflow that turns a requirement into a reviewed design and a structured AO task plan.",
+  "acceptanceCriteria": [
+    "The workflow accepts a requirement JSON file.",
+    "Each design review round is persisted.",
+    "The final task-plan.json can be passed to execute-plan."
+  ],
+  "constraints": [
+    "Execution tasks must use AO roles only.",
+    "ClaudeCode task-plan output must be validated before writing the final plan."
+  ],
+  "maxDesignReviewRounds": 3
+}

@@ -25,19 +25,20 @@ export class ArtifactStore {
       writeJson(join(workflowDir, "workflow.json"), artifacts.workflow),
       writeFile(join(workflowDir, "design.md"), artifacts.design, "utf8"),
       writeJson(join(workflowDir, "reviews.json"), artifacts.reviews),
-      artifacts.plan
-        ? writeJson(join(workflowDir, "task-plan.json"), artifacts.plan)
-        : writeJson(join(workflowDir, "task-plan.json"), null)
+      artifacts.plan ? writeJson(join(workflowDir, "task-plan.json"), artifacts.plan) : Promise.resolve()
     ]);
 
     return workflowDir;
   }
 
   async readTaskPlan(workflowId: string): Promise<TaskPlan> {
-    const raw = await readFile(join(this.getWorkflowDir(workflowId), "task-plan.json"), "utf8");
+    const raw = await readOptionalFile(join(this.getWorkflowDir(workflowId), "task-plan.json"));
+    if (!raw) {
+      throw new Error(`Workflow ${workflowId} is not ready for execution because no task plan was generated`);
+    }
     const parsed = JSON.parse(raw) as TaskPlan | null;
     if (!parsed) {
-      throw new Error(`Workflow ${workflowId} does not have a task plan`);
+      throw new Error(`Workflow ${workflowId} is not ready for execution because task-plan.json is empty`);
     }
     return parsed;
   }
@@ -49,7 +50,7 @@ export class ArtifactStore {
       readJson<Workflow>(join(workflowDir, "workflow.json")),
       readFile(join(workflowDir, "design.md"), "utf8"),
       readJson<DesignReview[]>(join(workflowDir, "reviews.json")),
-      readJson<TaskPlan | null>(join(workflowDir, "task-plan.json"))
+      readOptionalJson<TaskPlan>(join(workflowDir, "task-plan.json"))
     ]);
 
     return {
@@ -73,4 +74,24 @@ async function writeJson(file: string, value: unknown): Promise<void> {
 async function readJson<T>(file: string): Promise<T> {
   const raw = await readFile(file, "utf8");
   return JSON.parse(raw) as T;
+}
+
+async function readOptionalJson<T>(file: string): Promise<T | undefined> {
+  const raw = await readOptionalFile(file);
+  return raw ? (JSON.parse(raw) as T) : undefined;
+}
+
+async function readOptionalFile(file: string): Promise<string | undefined> {
+  try {
+    return await readFile(file, "utf8");
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
 }

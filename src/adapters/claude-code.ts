@@ -1,5 +1,19 @@
 import type { DesignReview } from "../schemas/design-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
+import { execa } from "execa";
+import { designReviewSchema } from "../schemas/design-review.js";
+import { taskPlanSchema } from "../schemas/task-plan.js";
+
+export class StructuredOutputError extends Error {
+  constructor(
+    message: string,
+    readonly rawOutput: string,
+    readonly causeDetail?: unknown
+  ) {
+    super(message);
+    this.name = "StructuredOutputError";
+  }
+}
 
 export interface ClaudeCodeAdapter {
   reviewDesign(input: {
@@ -7,8 +21,144 @@ export interface ClaudeCodeAdapter {
     round: number;
     designVersion: string;
     design: string;
-  }): Promise<DesignReview>;
-  createTaskPlan(input: { workflowId: string; approvedDesign: string }): Promise<TaskPlan>;
+  }, options?: { signal?: AbortSignal }): Promise<DesignReview>;
+  createTaskPlan(
+    input: { workflowId: string; approvedDesign: string },
+    options?: { signal?: AbortSignal }
+  ): Promise<TaskPlan>;
+}
+
+export interface ClaudeCodeCliAdapterOptions {
+  projectRoot?: string;
+  claudeBin?: string;
+  model?: string;
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
+}
+
+export class ClaudeCodeCliAdapter implements ClaudeCodeAdapter {
+  constructor(private readonly options: ClaudeCodeCliAdapterOptions = {}) {}
+
+  async reviewDesign(input: {
+    workflowId: string;
+    round: number;
+    designVersion: string;
+    design: string;
+  }, options: { signal?: AbortSignal } = {}): Promise<DesignReview> {
+    const rawOutput = await this.runClaude([
+      "你是需求治理层的 ClaudeCode 设计审查员。请审查 Codex 生成的设计稿。",
+      "",
+      "必须只输出一个 JSON 对象，不要使用 Markdown 代码块，不要输出解释文字。",
+      "JSON 必须符合以下 TypeScript 形状：",
+      "{",
+      '  "workflowId": "string",',
+      '  "round": number,',
+      '  "designer": "codex",',
+      '  "reviewer": "claude-code",',
+      '  "designVersion": "string",',
+      '  "reviewDecision": "approved" | "changes_requested" | "human_review_required",',
+      '  "findings": [{',
+      '    "id": "DRF-001",',
+      '    "title": "string",',
+      '    "body": "string",',
+      '    "severity": "blocking" | "major" | "minor" | "warning" | "observation",',
+      '    "status": "addressed" | "accepted_as_is" | "unresolved",',
+      '    "rationale": "optional string"',
+      "  }]",
+      "}",
+      "",
+      "审查规则：",
+      "- 如果设计缺少关键章节、风险、验收或可实施性信息，输出 changes_requested。",
+      "- 如果存在无法自动判断的问题，输出 human_review_required。",
+      "- approved 时不得包含 unresolved finding。",
+      "- 非 approved 且存在 findings 时，至少一个 finding 必须是 unresolved。",
+      "",
+      `workflowId: ${input.workflowId}`,
+      `round: ${input.round}`,
+      `designVersion: ${input.designVersion}`,
+      "",
+      "设计稿：",
+      input.design
+    ].join("\n"), options);
+
+    return parseStructuredOutput(rawOutput, designReviewSchema, "ClaudeCode review JSON is invalid");
+  }
+
+  async createTaskPlan(
+    input: { workflowId: string; approvedDesign: string },
+    options: { signal?: AbortSignal } = {}
+  ): Promise<TaskPlan> {
+    const rawOutput = await this.runClaude([
+      "你是需求治理层的 ClaudeCode 任务拆解员。请根据已批准设计稿输出 AO 执行层 task-plan。",
+      "",
+      "必须只输出一个 JSON 对象，不要使用 Markdown 代码块，不要输出解释文字。",
+      "JSON 必须符合以下 TypeScript 形状：",
+      "{",
+      '  "workflowId": "string",',
+      '  "title": "string",',
+      '  "tasks": [{',
+      '    "taskId": "TASK-001",',
+      '    "workflowId": "string",',
+      '    "title": "string",',
+      '    "description": "string",',
+      '    "type": "design" | "implementation" | "test" | "refactor" | "review" | "docs" | "verification",',
+      '    "dependencies": ["TASK-001"],',
+      '    "dependencyCondition": "all_completed" | "any_completed" | "manual_gate",',
+      '    "aoRole": "architect" | "reviewer" | "ui-designer" | "frontend-senior" | "frontend-junior" | "backend-senior" | "backend-junior" | "qa" | "docs" | "second-opinion" | "frontend" | "backend",',
+      '    "acceptanceCriteria": ["string"],',
+      '    "aoPrompt": "string",',
+      '    "status": "pending"',
+      "  }]",
+      "}",
+      "",
+      "硬性规则：",
+      "- 任务只能指定 aoRole，禁止出现 agent、model、provider、codex、claudeCode 字段。",
+      "- aoPrompt 中禁止要求 AO worker 选择、切换或调用具体 agent 或 model。",
+      "- 每个 aoPrompt 必须包含 workflowId、taskId、任务名称、AO 角色、验收标准和上下文摘要。",
+      "- taskId 使用 TASK-001 递增。",
+      "- status 全部使用 pending。",
+      "",
+      `workflowId: ${input.workflowId}`,
+      "",
+      "已批准设计稿：",
+      input.approvedDesign
+    ].join("\n"), options);
+
+    return parseStructuredOutput(rawOutput, taskPlanSchema, "ClaudeCode task plan JSON is invalid");
+  }
+
+  private async runClaude(prompt: string, options: { signal?: AbortSignal }): Promise<string> {
+    const args = [
+      "-p",
+      "--output-format",
+      "text",
+      "--permission-mode",
+      "plan",
+      "--effort",
+      this.options.effort ?? "high",
+      ...(this.options.model ? ["--model", this.options.model] : [])
+    ];
+
+    const result = await execa(this.options.claudeBin ?? "claude", args, {
+      cwd: this.options.projectRoot,
+      cancelSignal: options.signal,
+      input: prompt,
+      reject: false
+    });
+
+    if (options.signal?.aborted) {
+      throw new Error("Workflow was stopped by user");
+    }
+
+    if (result.exitCode !== 0) {
+      throw new Error(result.stderr || result.stdout || "ClaudeCode CLI failed");
+    }
+
+    if (!result.stdout.trim()) {
+      throw new StructuredOutputError("ClaudeCode CLI returned empty output", result.stdout);
+    }
+
+    return result.stdout;
+  }
 }
 
 export class PlaceholderClaudeCodeAdapter implements ClaudeCodeAdapter {
@@ -99,4 +249,44 @@ function summarizeDesignForAoPrompt(design: string): string {
   return title
     ? `已批准设计：${title}。请参考已落盘最终设计稿完成实现。`
     : "请参考已落盘最终设计稿完成实现。";
+}
+
+export function parseStructuredOutput<T>(
+  rawOutput: string,
+  schema: { parse(value: unknown): T },
+  errorMessage: string
+): T {
+  const jsonText = extractJsonObject(rawOutput);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch (error) {
+    throw new StructuredOutputError(errorMessage, rawOutput, error);
+  }
+
+  try {
+    return schema.parse(parsed);
+  } catch (error) {
+    throw new StructuredOutputError(errorMessage, rawOutput, error);
+  }
+}
+
+function extractJsonObject(rawOutput: string): string {
+  const trimmed = rawOutput.trim();
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    return trimmed;
+  }
+
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenced?.[1]) {
+    return fenced[1].trim();
+  }
+
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    return trimmed.slice(start, end + 1);
+  }
+
+  throw new StructuredOutputError("ClaudeCode output does not contain a JSON object", rawOutput);
 }
