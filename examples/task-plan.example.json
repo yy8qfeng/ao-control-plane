@@ -1,0 +1,24 @@
+{
+  "id": "plan-example-001",
+  "title": "AO 上层控制软件第一阶段骨架",
+  "tasks": [
+    {
+      "id": "task-001",
+      "title": "补充 CLI 入口",
+      "type": "development",
+      "aoRole": "backend-senior",
+      "prompt": "实现 AO Control Plane 的 CLI 入口，并确保命令参数可校验。",
+      "dependencies": [],
+      "dependencyCondition": "all_completed"
+    },
+    {
+      "id": "task-002",
+      "title": "补充任务计划校验测试",
+      "type": "test",
+      "aoRole": "qa",
+      "prompt": "为任务计划 schema 增加单元测试，覆盖非法 agent/model/provider 字段。",
+      "dependencies": ["task-001"],
+      "dependencyCondition": "all_completed"
+    }
+  ]
+}
