@@ -1,0 +1,36 @@
+[
+  {
+    "workflowId": "WF-EXAMPLE-001",
+    "round": 1,
+    "designer": "codex",
+    "reviewer": "claude-code",
+    "designVersion": "design-v1",
+    "reviewDecision": "changes_requested",
+    "findings": [
+      {
+        "id": "DRF-001",
+        "title": "缺少状态采集说明",
+        "body": "设计稿需要说明如何从 AO session JSON 建立 taskId 到 aoSessionId 的映射。",
+        "severity": "major",
+        "status": "unresolved"
+      }
+    ]
+  },
+  {
+    "workflowId": "WF-EXAMPLE-001",
+    "round": 2,
+    "designer": "codex",
+    "reviewer": "claude-code",
+    "designVersion": "design-v2",
+    "reviewDecision": "approved",
+    "findings": [
+      {
+        "id": "DRF-001",
+        "title": "缺少状态采集说明",
+        "body": "设计稿已经补充 AO session JSON 归一化与 prompt 前缀映射策略。",
+        "severity": "major",
+        "status": "addressed"
+      }
+    ]
+  }
+]

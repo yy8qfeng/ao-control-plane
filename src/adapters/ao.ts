@@ -1,6 +1,8 @@
 import { execa } from "execa";
 import type { ExecutionTask } from "../schemas/task-plan.js";
 
+const forbiddenExecutionFields = ["agent", "model", "provider", "codex", "claudeCode"] as const;
+
 export interface AoSpawnResult {
   sessionId?: string;
   stdout: string;
@@ -9,6 +11,7 @@ export interface AoSpawnResult {
 
 export interface AoAdapterOptions {
   projectRoot?: string;
+  projectId?: string;
   dryRun?: boolean;
 }
 
@@ -16,11 +19,11 @@ export class AoCliAdapter {
   constructor(private readonly options: AoAdapterOptions = {}) {}
 
   async spawnTask(task: ExecutionTask): Promise<AoSpawnResult> {
-    const args = ["spawn", "--role", task.aoRole, "--prompt", task.prompt];
+    const args = buildSpawnArgs(task);
 
     if (this.options.dryRun) {
       return {
-        sessionId: `dry-run-${task.id}`,
+        sessionId: `dry-run-${task.taskId}`,
         stdout: `ao ${args.join(" ")}`,
         stderr: ""
       };
@@ -39,7 +42,12 @@ export class AoCliAdapter {
   }
 
   async listSessions(): Promise<unknown> {
-    const result = await execa("ao", ["session", "ls", "--json", "--include-terminated"], {
+    const args = ["session", "ls", "--json", "--include-terminated"];
+    if (this.options.projectId) {
+      args.push("--project", this.options.projectId);
+    }
+
+    const result = await execa("ao", args, {
       cwd: this.options.projectRoot,
       reject: false
     });
@@ -52,7 +60,22 @@ export class AoCliAdapter {
   }
 }
 
-function parseSessionId(stdout: string): string | undefined {
+export function buildSpawnArgs(task: ExecutionTask): string[] {
+  assertNoConcreteAgentFields(task);
+  const args = ["spawn", "--role", task.aoRole, "--prompt", task.aoPrompt];
+  return args;
+}
+
+export function parseSessionId(stdout: string): string | undefined {
   const match = stdout.match(/SESSION=([^\s]+)/);
   return match?.[1];
+}
+
+function assertNoConcreteAgentFields(task: ExecutionTask): void {
+  const taskRecord = task as Record<string, unknown>;
+  for (const field of forbiddenExecutionFields) {
+    if (field in taskRecord) {
+      throw new Error(`AO dispatcher rejects forbidden execution field: ${field}`);
+    }
+  }
 }

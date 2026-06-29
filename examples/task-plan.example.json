@@ -1,24 +1,32 @@
 {
-  "id": "plan-example-001",
+  "workflowId": "WF-EXAMPLE-001",
   "title": "AO 上层控制软件第一阶段骨架",
   "tasks": [
     {
-      "id": "task-001",
+      "taskId": "TASK-001",
+      "workflowId": "WF-EXAMPLE-001",
       "title": "补充 CLI 入口",
-      "type": "development",
-      "aoRole": "backend-senior",
-      "prompt": "实现 AO Control Plane 的 CLI 入口，并确保命令参数可校验。",
+      "description": "实现 AO Control Plane 的 CLI 入口，并确保命令参数可校验。",
+      "type": "implementation",
       "dependencies": [],
-      "dependencyCondition": "all_completed"
+      "dependencyCondition": "all_completed",
+      "aoRole": "backend-senior",
+      "acceptanceCriteria": ["CLI 可以校验任务计划", "CLI 可以预演 AO 下发命令"],
+      "aoPrompt": "[WF-EXAMPLE-001 / TASK-001]\n任务名称：补充 CLI 入口\nAO 角色：backend-senior\n验收标准：\n1. CLI 可以校验任务计划。\n2. CLI 可以预演 AO 下发命令。",
+      "status": "pending"
     },
     {
-      "id": "task-002",
+      "taskId": "TASK-002",
+      "workflowId": "WF-EXAMPLE-001",
       "title": "补充任务计划校验测试",
+      "description": "为任务计划 schema 增加单元测试，覆盖非法 agent/model/provider 字段。",
       "type": "test",
+      "dependencies": ["TASK-001"],
+      "dependencyCondition": "all_completed",
       "aoRole": "qa",
-      "prompt": "为任务计划 schema 增加单元测试，覆盖非法 agent/model/provider 字段。",
-      "dependencies": ["task-001"],
-      "dependencyCondition": "all_completed"
+      "acceptanceCriteria": ["非法执行字段会被拒绝", "AO 下发命令只包含 role 和 prompt"],
+      "aoPrompt": "[WF-EXAMPLE-001 / TASK-002]\n任务名称：补充任务计划校验测试\nAO 角色：qa\n验收标准：\n1. 非法执行字段会被拒绝。\n2. AO 下发命令只包含 role 和 prompt。",
+      "status": "pending"
     }
   ]
 }

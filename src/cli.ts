@@ -2,7 +2,13 @@
 import { readFile } from "node:fs/promises";
 import { Command } from "commander";
 import { AoCliAdapter } from "./adapters/ao.js";
+import { designReviewSchema } from "./schemas/design-review.js";
 import { taskPlanSchema } from "./schemas/task-plan.js";
+import {
+  createCompletionReport,
+  normalizeAoSessions,
+  reconcileTaskSessions
+} from "./workflow/ao-status.js";
 import { executePlan } from "./workflow/plan-execution.js";
 
 const program = new Command();
@@ -18,7 +24,7 @@ program
   .description("Validate a structured task plan before sending it to AO")
   .action(async (file: string) => {
     const plan = await readTaskPlan(file);
-    console.log(JSON.stringify({ valid: true, planId: plan.id, taskCount: plan.tasks.length }, null, 2));
+    console.log(JSON.stringify({ valid: true, workflowId: plan.workflowId, taskCount: plan.tasks.length }, null, 2));
   });
 
 program
@@ -37,10 +43,81 @@ program
     console.log(JSON.stringify(result, null, 2));
   });
 
+program
+  .command("collect-status")
+  .argument("<plan-file>", "Task plan JSON file")
+  .option("--project-root <path>", "AO project root used as cwd for ao CLI")
+  .option("--project-id <id>", "AO project id used only for ao session ls")
+  .option("--sessions-file <file>", "Read AO session JSON from a file instead of invoking ao")
+  .description("Collect AO session status and map sessions back to workflow tasks")
+  .action(
+    async (
+      planFile: string,
+      options: { projectRoot?: string; projectId?: string; sessionsFile?: string }
+    ) => {
+      const plan = await readTaskPlan(planFile);
+      const rawSessions = options.sessionsFile
+        ? await readJson(options.sessionsFile)
+        : await new AoCliAdapter({
+            projectRoot: options.projectRoot,
+            projectId: options.projectId
+          }).listSessions();
+      const sessions = normalizeAoSessions(rawSessions);
+      const mappings = reconcileTaskSessions({ plan, sessions });
+
+      console.log(JSON.stringify({ workflowId: plan.workflowId, tasks: mappings }, null, 2));
+    }
+  );
+
+program
+  .command("report")
+  .argument("<plan-file>", "Task plan JSON file")
+  .argument("<reviews-file>", "Design review JSON array file")
+  .option("--project-root <path>", "AO project root used as cwd for ao CLI")
+  .option("--project-id <id>", "AO project id used only for ao session ls")
+  .option("--sessions-file <file>", "Read AO session JSON from a file instead of invoking ao")
+  .description("Create a final workflow report from reviews, task plan, and AO sessions")
+  .action(
+    async (
+      planFile: string,
+      reviewsFile: string,
+      options: { projectRoot?: string; projectId?: string; sessionsFile?: string }
+    ) => {
+      const plan = await readTaskPlan(planFile);
+      const reviews = await readDesignReviews(reviewsFile);
+      const rawSessions = options.sessionsFile
+        ? await readJson(options.sessionsFile)
+        : await new AoCliAdapter({
+            projectRoot: options.projectRoot,
+            projectId: options.projectId
+          }).listSessions();
+      const report = createCompletionReport({
+        workflowId: plan.workflowId,
+        reviews,
+        plan,
+        sessions: normalizeAoSessions(rawSessions)
+      });
+
+      console.log(JSON.stringify(report, null, 2));
+    }
+  );
+
 await program.parseAsync();
 
 async function readTaskPlan(file: string) {
-  const raw = await readFile(file, "utf8");
-  const parsed = JSON.parse(raw) as unknown;
+  const parsed = await readJson(file);
   return taskPlanSchema.parse(parsed);
+}
+
+async function readDesignReviews(file: string) {
+  const parsed = await readJson(file);
+  if (!Array.isArray(parsed)) {
+    throw new Error("Design reviews file must contain a JSON array");
+  }
+  return parsed.map((review) => designReviewSchema.parse(review));
+}
+
+async function readJson(file: string): Promise<unknown> {
+  const raw = await readFile(file, "utf8");
+  return JSON.parse(raw) as unknown;
 }

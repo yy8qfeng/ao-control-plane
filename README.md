@@ -46,6 +46,18 @@ pnpm dev validate-plan examples/task-plan.example.json
 pnpm dev execute-plan examples/task-plan.example.json --dry-run
 ```
 
+采集 AO 状态并映射回任务：
+
+```bash
+pnpm dev collect-status examples/task-plan.example.json --sessions-file examples/ao-sessions.example.json
+```
+
+输出最终交付报告：
+
+```bash
+pnpm dev report examples/task-plan.example.json examples/design-reviews.example.json --sessions-file examples/ao-sessions.example.json
+```
+
 真实下发 AO：
 
 ```bash
