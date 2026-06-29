@@ -7,3 +7,4 @@ dist/
 coverage/
 data/*.db
 data/*.sqlite
+.ao-control-plane/

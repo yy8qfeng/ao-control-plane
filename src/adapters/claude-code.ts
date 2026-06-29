@@ -85,11 +85,18 @@ export class PlaceholderClaudeCodeAdapter implements ClaudeCodeAdapter {
             "1. 实现内容符合最终设计稿。",
             "2. 相关测试通过。",
             "上下文摘要：",
-            input.approvedDesign
+            summarizeDesignForAoPrompt(input.approvedDesign)
           ].join("\n"),
           status: "pending"
         }
       ]
     };
   }
+}
+
+function summarizeDesignForAoPrompt(design: string): string {
+  const title = design.split("\n").find((line) => line.startsWith("# "))?.replace(/^#\s+/, "").trim();
+  return title
+    ? `已批准设计：${title}。请参考已落盘最终设计稿完成实现。`
+    : "请参考已落盘最终设计稿完成实现。";
 }

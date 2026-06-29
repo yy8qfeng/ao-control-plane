@@ -10,6 +10,7 @@ import {
   reconcileTaskSessions
 } from "./workflow/ao-status.js";
 import { executePlan } from "./workflow/plan-execution.js";
+import { startWebServer } from "./web/server.js";
 
 const program = new Command();
 
@@ -99,6 +100,33 @@ program
       });
 
       console.log(JSON.stringify(report, null, 2));
+    }
+  );
+
+program
+  .command("serve")
+  .option("--host <host>", "Host for the local web console", "127.0.0.1")
+  .option("--port <port>", "Port for the local web console", "4317")
+  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .option("--project-root <path>", "AO project root used when executing task plans")
+  .description("Start the local web console for requirement governance")
+  .action(
+    async (options: {
+      host: string;
+      port: string;
+      artifactRoot: string;
+      projectRoot?: string;
+    }) => {
+      const server = await startWebServer({
+        host: options.host,
+        port: Number(options.port),
+        artifactRoot: options.artifactRoot,
+        aoProjectRoot: options.projectRoot
+      });
+      console.log(`AO Control Plane web console: ${server.url}`);
+      await new Promise<void>(() => {
+        // Keep the process alive until the user stops it.
+      });
     }
   );
 

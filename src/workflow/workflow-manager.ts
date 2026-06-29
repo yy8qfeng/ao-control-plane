@@ -9,6 +9,7 @@ import { runDesignReviewLoop } from "./design-review-loop.js";
 export interface PlanningWorkflowResult {
   workflow: Workflow;
   design: string;
+  reviews: Awaited<ReturnType<typeof runDesignReviewLoop>>["reviews"];
   plan?: TaskPlan;
 }
 
@@ -41,7 +42,8 @@ export async function runPlanningWorkflow(input: {
     workflow.status = "blocked_for_human";
     return {
       workflow,
-      design: reviewLoop.design
+      design: reviewLoop.design,
+      reviews: reviewLoop.reviews
     };
   }
 
@@ -61,6 +63,7 @@ export async function runPlanningWorkflow(input: {
   return {
     workflow,
     design: reviewLoop.design,
+    reviews: reviewLoop.reviews,
     plan
   };
 }
