@@ -41,6 +41,10 @@ describe("runGovernanceWorkflow", () => {
     await expect(readFile(join(result.artifactDir, "task-plan.json"), "utf8")).resolves.toContain(
       result.workflow.workflowId
     );
+    await expect(readFile(join(result.artifactDir, "task-plan-reviews.json"), "utf8")).resolves.toContain(
+      '"reviewDecision": "approved"'
+    );
+    expect(result.taskPlanReviews).toHaveLength(1);
   });
 
   it("supports pausing after design review and restarts review count after requirement supplements", async () => {
@@ -77,5 +81,6 @@ describe("runGovernanceWorkflow", () => {
     });
     expect(planned.workflow.status).toBe("executing");
     expect(planned.plan?.tasks).toHaveLength(1);
+    expect(planned.taskPlanReviews).toHaveLength(1);
   });
 });

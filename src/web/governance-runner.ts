@@ -2,8 +2,10 @@ import { PlaceholderClaudeCodeAdapter } from "../adapters/claude-code.js";
 import { PlaceholderCodexAdapter } from "../adapters/codex.js";
 import type { DesignReview } from "../schemas/design-review.js";
 import { requirementSchema, type Requirement } from "../schemas/requirement.js";
+import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { Workflow } from "../schemas/workflow.js";
 import { runDesignReviewLoop } from "../workflow/design-review-loop.js";
+import { runTaskPlanReviewLoop } from "../workflow/task-plan-review-loop.js";
 import { ArtifactStore, type GovernanceArtifacts } from "./artifact-store.js";
 import { buildRequirementDescription } from "./request-formatting.js";
 
@@ -20,6 +22,7 @@ export interface GovernanceRequest {
 export interface GovernanceRunResult extends GovernanceArtifacts {
   artifactDir: string;
   reviews: DesignReview[];
+  taskPlanReviews?: TaskPlanReview[];
 }
 
 export async function runDesignReviewStage(input: {
@@ -68,19 +71,23 @@ export async function createTaskPlanStage(input: {
     throw new Error(`Workflow ${input.workflowId} is not ready for planning`);
   }
 
-  const plan = await new PlaceholderCodexAdapter().createTaskPlan({
+  const planLoop = await runTaskPlanReviewLoop({
     workflowId: artifacts.workflow.workflowId,
     approvedDesign: artifacts.design,
-    deferredFindings: collectDeferredFindings(artifacts.reviews)
+    deferredFindings: collectDeferredFindings(artifacts.reviews),
+    codex: new PlaceholderCodexAdapter(),
+    claudeCode: new PlaceholderClaudeCodeAdapter(),
+    options: { maxTaskPlanReviewRounds: artifacts.workflow.maxDesignReviewRounds }
   });
   const nextArtifacts: GovernanceArtifacts = {
     ...artifacts,
     workflow: {
       ...artifacts.workflow,
-      status: "executing",
-      tasks: plan.tasks.map((task) => task.taskId)
+      status: planLoop.approved ? "executing" : "blocked_for_human",
+      tasks: planLoop.approved ? planLoop.plan.tasks.map((task) => task.taskId) : []
     },
-    plan
+    taskPlanReviews: planLoop.reviews,
+    plan: planLoop.approved ? planLoop.plan : undefined
   };
   const artifactDir = await input.store.saveWorkflow(nextArtifacts);
   return { ...nextArtifacts, artifactDir };

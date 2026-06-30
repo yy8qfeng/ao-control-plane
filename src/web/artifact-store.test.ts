@@ -44,4 +44,46 @@ describe("ArtifactStore", () => {
       "no task plan was generated"
     );
   });
+
+  it("persists task plan review artifacts with workflow artifacts", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-artifacts-"));
+    const store = new ArtifactStore(tempDir);
+
+    await store.saveWorkflow({
+      requirement: {
+        id: "WF-PLAN-REVIEWS",
+        title: "Plan reviews",
+        source: "test",
+        description: "Persist task plan reviews.",
+        acceptanceCriteria: [],
+        constraints: []
+      },
+      workflow: {
+        workflowId: "WF-PLAN-REVIEWS",
+        title: "Plan reviews",
+        rawRequirement: "Persist task plan reviews.",
+        status: "executing",
+        designRounds: 1,
+        maxDesignReviewRounds: 3,
+        tasks: ["TASK-001"]
+      },
+      design: "# Plan reviews",
+      reviews: [],
+      taskPlanReviews: [
+        {
+          workflowId: "WF-PLAN-REVIEWS",
+          round: 1,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: "task-plan-current",
+          reviewDecision: "approved",
+          findings: []
+        }
+      ]
+    });
+
+    const restored = await store.readWorkflow("WF-PLAN-REVIEWS");
+    expect(restored.taskPlanReviews).toHaveLength(1);
+    expect(restored.taskPlanReviews?.[0]?.reviewDecision).toBe("approved");
+  });
 });

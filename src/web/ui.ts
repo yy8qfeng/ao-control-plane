@@ -954,6 +954,7 @@ export function renderIndexHtml(): string {
       saveDraftButton.disabled = busy;
       deleteDraftButton.disabled = busy || !state.requirementDrafts.length;
       planButton.disabled = busy || state.result?.workflow?.status !== "ready_for_planning";
+      planButton.title = getPlanButtonTitle(busy, state.result?.workflow?.status);
       dryRunButton.disabled = busy || state.result?.workflow?.status !== "executing" || !state.result?.plan;
       clearDraftButton.disabled = busy;
       if (message) setStatus("warn", message);
@@ -990,7 +991,16 @@ export function renderIndexHtml(): string {
       clearDraftButton.disabled = running;
       deleteDraftButton.disabled = running || !state.requirementDrafts.length;
       planButton.disabled = running || result?.workflow?.status !== "ready_for_planning";
+      planButton.title = getPlanButtonTitle(running, result?.workflow?.status);
       dryRunButton.disabled = running || result?.workflow?.status !== "executing" || !result?.plan;
+    }
+
+    function getPlanButtonTitle(running, workflowStatus) {
+      if (running) return "治理流程运行中，暂不能单独生成任务计划。";
+      if (workflowStatus === "ready_for_planning") return "设计审查已通过，可以生成并审查任务计划。";
+      if (workflowStatus === "executing") return "任务计划已在治理流程中生成。";
+      if (workflowStatus === "blocked_for_human") return "当前仍需人工补充或复核，不能生成任务计划。";
+      return "需先完成分阶段设计审查。";
     }
 
     function renderActiveTab() {

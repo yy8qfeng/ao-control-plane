@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { DesignReview } from "../schemas/design-review.js";
 import type { Requirement } from "../schemas/requirement.js";
+import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
 import type { Workflow } from "../schemas/workflow.js";
 
@@ -10,6 +11,7 @@ export interface GovernanceArtifacts {
   workflow: Workflow;
   design: string;
   reviews: DesignReview[];
+  taskPlanReviews?: TaskPlanReview[];
   plan?: TaskPlan;
 }
 
@@ -25,6 +27,9 @@ export class ArtifactStore {
       writeJson(join(workflowDir, "workflow.json"), artifacts.workflow),
       writeFile(join(workflowDir, "design.md"), artifacts.design, "utf8"),
       writeJson(join(workflowDir, "reviews.json"), artifacts.reviews),
+      artifacts.taskPlanReviews
+        ? writeJson(join(workflowDir, "task-plan-reviews.json"), artifacts.taskPlanReviews)
+        : Promise.resolve(),
       artifacts.plan ? writeJson(join(workflowDir, "task-plan.json"), artifacts.plan) : Promise.resolve()
     ]);
 
@@ -45,11 +50,12 @@ export class ArtifactStore {
 
   async readWorkflow(workflowId: string): Promise<GovernanceArtifacts> {
     const workflowDir = this.getWorkflowDir(workflowId);
-    const [requirement, workflow, design, reviews, plan] = await Promise.all([
+    const [requirement, workflow, design, reviews, taskPlanReviews, plan] = await Promise.all([
       readJson<Requirement>(join(workflowDir, "requirement.json")),
       readJson<Workflow>(join(workflowDir, "workflow.json")),
       readFile(join(workflowDir, "design.md"), "utf8"),
       readJson<DesignReview[]>(join(workflowDir, "reviews.json")),
+      readOptionalJson<TaskPlanReview[]>(join(workflowDir, "task-plan-reviews.json")),
       readOptionalJson<TaskPlan>(join(workflowDir, "task-plan.json"))
     ]);
 
@@ -58,6 +64,7 @@ export class ArtifactStore {
       workflow,
       design,
       reviews,
+      taskPlanReviews: taskPlanReviews ?? undefined,
       plan: plan ?? undefined
     };
   }

@@ -1,6 +1,7 @@
 import type { ClaudeCodeAdapter } from "../adapters/claude-code.js";
 import type { CodexAdapter } from "../adapters/codex.js";
 import type { Requirement } from "../schemas/requirement.js";
+import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
 import type { Workflow } from "../schemas/workflow.js";
 import { taskPlanSchema } from "../schemas/task-plan.js";
@@ -11,6 +12,7 @@ export interface PlanningWorkflowResult {
   workflow: Workflow;
   design: string;
   reviews: Awaited<ReturnType<typeof runDesignReviewLoop>>["reviews"];
+  taskPlanReviews: TaskPlanReview[];
   plan?: TaskPlan;
 }
 
@@ -44,7 +46,8 @@ export async function runPlanningWorkflow(input: {
     return {
       workflow,
       design: reviewLoop.design,
-      reviews: reviewLoop.reviews
+      reviews: reviewLoop.reviews,
+      taskPlanReviews: []
     };
   }
 
@@ -66,6 +69,7 @@ export async function runPlanningWorkflow(input: {
       workflow,
       design: reviewLoop.design,
       reviews: reviewLoop.reviews,
+      taskPlanReviews: planLoop.reviews,
       plan: planLoop.plan
     };
   }
@@ -79,6 +83,7 @@ export async function runPlanningWorkflow(input: {
     workflow,
     design: reviewLoop.design,
     reviews: reviewLoop.reviews,
+    taskPlanReviews: planLoop.reviews,
     plan
   };
 }
