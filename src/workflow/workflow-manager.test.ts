@@ -20,7 +20,7 @@ describe("runPlanningWorkflow", () => {
     });
 
     expect(result.workflow.status).toBe("executing");
-    expect(result.workflow.approvedDesignVersion).toBe("design-v1");
+    expect(result.workflow.approvedDesignVersion).toBe("design-current");
     expect(result.reviews).toHaveLength(1);
     expect(result.plan?.tasks[0]?.aoRole).toBe("backend-senior");
     expect(result.plan?.tasks[0]).not.toHaveProperty("agent");

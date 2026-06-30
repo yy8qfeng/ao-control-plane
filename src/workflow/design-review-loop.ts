@@ -29,15 +29,18 @@ export async function runDesignReviewLoop(input: {
   options: DesignReviewLoopOptions;
   hooks?: DesignReviewLoopHooks;
   signal?: AbortSignal;
+  initialDesign?: string;
 }): Promise<DesignReviewLoopResult> {
   throwIfAborted(input.signal);
-  let design = await input.codex.createDesign(input.requirement, { signal: input.signal });
-  let designVersionNumber = 1;
+  let design = input.initialDesign;
+  if (!design) {
+    design = await input.codex.createDesign(input.requirement, { signal: input.signal });
+  }
   const reviews: DesignReview[] = [];
+  const designVersion = "design-current";
 
   for (let round = 1; round <= input.options.maxDesignReviewRounds; round += 1) {
     throwIfAborted(input.signal);
-    const designVersion = `design-v${designVersionNumber}`;
     await input.hooks?.onDesign?.({ designVersion, design });
     await input.hooks?.onReviewStart?.({ round, designVersion });
     const review = await input.claudeCode.reviewDesign({
@@ -79,13 +82,12 @@ export async function runDesignReviewLoop(input: {
       currentDesign: design,
       review
     }, { signal: input.signal });
-    designVersionNumber += 1;
   }
 
   return {
     approved: false,
     design,
-    designVersion: `design-v${designVersionNumber}`,
+    designVersion,
     reviews,
     blockedForHuman: true
   };

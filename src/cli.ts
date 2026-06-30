@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { readFile } from "node:fs/promises";
 import { Command } from "commander";
+import { appVersion } from "./app-version.js";
 import { AoCliAdapter } from "./adapters/ao.js";
 import { ClaudeCodeCliAdapter, StructuredOutputError } from "./adapters/claude-code.js";
 import { CodexCliAdapter } from "./adapters/codex.js";
@@ -14,13 +15,14 @@ import {
 import { executePlan } from "./workflow/plan-execution.js";
 import { runWorkflow } from "./workflow/run-workflow.js";
 import { startWebServer } from "./web/server.js";
+import { stopServiceOnPort } from "./web/service-control.js";
 
 const program = new Command();
 
 program
   .name("ao-control-plane")
   .description("Requirement design review and structured execution control plane for AO")
-  .version("0.1.0");
+  .version(appVersion);
 
 program
   .command("run-workflow")
@@ -68,9 +70,7 @@ program
         });
       } catch (error) {
         if (error instanceof StructuredOutputError) {
-          console.error(
-            "ClaudeCode output is not valid JSON or does not match the schema. Human review artifacts were written."
-          );
+          console.error(`${error.message}. Human review artifacts were written.`);
         }
         throw error;
       }
@@ -192,6 +192,65 @@ program
       projectRoot?: string;
       allowPublicHost?: boolean;
     }) => {
+      const server = await startWebServer({
+        host: options.host,
+        port: Number(options.port),
+        artifactRoot: options.artifactRoot,
+        aoProjectRoot: options.projectRoot,
+        allowPublicHost: options.allowPublicHost
+      });
+      console.log(`AO Control Plane web console: ${server.url}`);
+      await new Promise<void>(() => {
+        // Keep the process alive until the user stops it.
+      });
+    }
+  );
+
+program
+  .command("stop-service")
+  .option("--port <port>", "Port of the local web console", "4317")
+  .description("Stop the local web console listening on the given port")
+  .action(async (options: { port: string }) => {
+    const result = await stopServiceOnPort(Number(options.port));
+    if (result.stoppedPids.length === 0) {
+      console.log(`No AO Control Plane service was listening on port ${result.port}.`);
+      return;
+    }
+
+    console.log(
+      JSON.stringify(
+        {
+          port: result.port,
+          stoppedPids: result.stoppedPids,
+          skippedPids: result.skippedPids
+        },
+        null,
+        2
+      )
+    );
+  });
+
+program
+  .command("restart-service")
+  .option("--host <host>", "Host for the local web console", "127.0.0.1")
+  .option("--port <port>", "Port for the local web console", "4317")
+  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .option("--project-root <path>", "AO project root used when executing task plans")
+  .option("--allow-public-host", "Allow binding the web console to a public host")
+  .description("Stop the local web console on the port and start it again")
+  .action(
+    async (options: {
+      host: string;
+      port: string;
+      artifactRoot: string;
+      projectRoot?: string;
+      allowPublicHost?: boolean;
+    }) => {
+      const stopResult = await stopServiceOnPort(Number(options.port));
+      if (stopResult.stoppedPids.length > 0) {
+        console.log(`Stopped service process(es): ${stopResult.stoppedPids.join(", ")}`);
+      }
+
       const server = await startWebServer({
         host: options.host,
         port: Number(options.port),

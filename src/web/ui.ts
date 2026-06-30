@@ -1,3 +1,5 @@
+import { appVersion } from "../app-version.js";
+
 export function renderIndexHtml(): string {
   return `<!doctype html>
 <html lang="zh-CN">
@@ -311,7 +313,7 @@ export function renderIndexHtml(): string {
 <body>
   <header>
     <h1>AO Control Plane</h1>
-    <div id="headerStatus" class="status">本地治理控制台</div>
+    <div id="headerStatus" class="status">v${appVersion}</div>
   </header>
 
   <main>
@@ -323,6 +325,15 @@ export function renderIndexHtml(): string {
         <label>
           需求标题
           <input name="title" value="用户权限管理" required>
+        </label>
+        <label>
+          历史草稿
+          <div class="field-row">
+            <select id="draftHistory">
+              <option value="">暂无历史草稿</option>
+            </select>
+            <button id="deleteDraftButton" class="secondary" type="button" disabled>删除</button>
+          </div>
         </label>
         <label>
           项目目录
@@ -358,9 +369,12 @@ export function renderIndexHtml(): string {
           <button id="reviewButton" type="submit">生成需求设计并审查</button>
           <button id="rerunButton" class="secondary" type="submit">补充需求并重新审查</button>
           <button id="stopButton" class="secondary" type="button" disabled>停止</button>
+          <button id="saveDraftButton" class="secondary" type="button">保存草稿</button>
+          <button id="clearDraftButton" class="secondary" type="button">清空草稿</button>
           <button id="planButton" class="secondary" type="button" disabled>生成任务计划</button>
           <button id="dryRunButton" class="secondary" type="button" disabled>预演执行</button>
         </div>
+        <div id="draftStatus" class="status">表单草稿会自动保存到本地。</div>
         <div id="formStatus" class="status"></div>
       </form>
     </section>
@@ -382,7 +396,6 @@ export function renderIndexHtml(): string {
         </div>
       </div>
       <div class="content">
-        <div class="actions" id="versionControls" style="margin-bottom: 10px; display: none;"></div>
         <pre id="output">填写需求后点击生成。</pre>
       </div>
     </section>
@@ -410,13 +423,16 @@ export function renderIndexHtml(): string {
     const form = document.querySelector("#requirementForm");
     const output = document.querySelector("#output");
     const formStatus = document.querySelector("#formStatus");
-    const headerStatus = document.querySelector("#headerStatus");
+    const draftStatus = document.querySelector("#draftStatus");
+    const draftHistory = document.querySelector("#draftHistory");
+    const deleteDraftButton = document.querySelector("#deleteDraftButton");
     const reviewButton = document.querySelector("#reviewButton");
     const rerunButton = document.querySelector("#rerunButton");
     const stopButton = document.querySelector("#stopButton");
+    const saveDraftButton = document.querySelector("#saveDraftButton");
+    const clearDraftButton = document.querySelector("#clearDraftButton");
     const planButton = document.querySelector("#planButton");
     const dryRunButton = document.querySelector("#dryRunButton");
-    const versionControls = document.querySelector("#versionControls");
     const projectButton = document.querySelector("#projectButton");
     const projectDialog = document.querySelector("#projectDialog");
     const closeProjectDialog = document.querySelector("#closeProjectDialog");
@@ -433,9 +449,10 @@ export function renderIndexHtml(): string {
       localTimer: null,
       execution: null,
       activeTab: "logs",
-      selectedDesignIndex: null,
-      selectedReviewIndex: null,
-      browsingPath: ""
+      browsingPath: "",
+      workflowId: "",
+      draftSaveTimer: null,
+      requirementDrafts: []
     };
 
     loadProjects();
@@ -448,6 +465,43 @@ export function renderIndexHtml(): string {
         "完整治理流程已完成。若补充需求后重新审查，审查轮次会从 1 开始。",
         "logs"
       );
+    });
+
+    form.addEventListener("input", () => scheduleDraftSave());
+    form.addEventListener("change", () => scheduleDraftSave());
+
+    draftHistory.addEventListener("change", () => {
+      const selected = state.requirementDrafts[Number(draftHistory.value)];
+      if (!selected) return;
+      restoreDraft(selected);
+    });
+
+    deleteDraftButton.addEventListener("click", async () => {
+      const selected = state.requirementDrafts[Number(draftHistory.value)];
+      if (!selected?.draftKey) return;
+      try {
+        const response = await fetch("/api/governance/drafts/" + encodeURIComponent(selected.draftKey), {
+          method: "DELETE"
+        });
+        const config = await readResponse(response);
+        if (isSameDraft(selected, { workflowId: state.workflowId, title: String(form.elements.title.value || ""), description: String(form.elements.description.value || "") })) {
+          state.workflowId = "";
+        }
+        renderDraftHistory(config.requirementDrafts || []);
+        restoreDraft(config.requirementDraft || config.requirementDrafts?.[0]);
+        setDraftStatus("warn", "已删除所选历史草稿。");
+      } catch (error) {
+        setDraftStatus("bad", error.message || String(error));
+      }
+    });
+
+    saveDraftButton.addEventListener("click", async () => {
+      try {
+        await saveDraft();
+        setDraftStatus("ok", "需求草稿已保存。");
+      } catch (error) {
+        setDraftStatus("bad", error.message || String(error));
+      }
     });
 
     projectButton.addEventListener("click", async () => {
@@ -476,6 +530,19 @@ export function renderIndexHtml(): string {
         updateSummary();
         renderActiveTab();
         setStatus("warn", "已停止当前治理流程。");
+      } catch (error) {
+        setStatus("bad", error.message || String(error));
+      }
+    });
+
+    clearDraftButton.addEventListener("click", async () => {
+      try {
+        const response = await fetch("/api/governance/draft", { method: "DELETE" });
+        const config = await readResponse(response);
+        state.workflowId = "";
+        renderDraftHistory(config.requirementDrafts || []);
+        setDraftStatus("warn", "需求草稿已清空。");
+        setStatus("ok", "需求草稿已清空。");
       } catch (error) {
         setStatus("bad", error.message || String(error));
       }
@@ -551,8 +618,6 @@ export function renderIndexHtml(): string {
     async function runStep(path, busyMessage, successMessage, nextTab) {
       setBusy(true, busyMessage);
       state.execution = null;
-      state.selectedDesignIndex = null;
-      state.selectedReviewIndex = null;
       let startedJob = false;
       try {
         const response = await fetch(path, {
@@ -573,6 +638,7 @@ export function renderIndexHtml(): string {
           return;
         }
         state.result = responseBody;
+        rememberWorkflowIdFromResult(responseBody);
         state.activeTab = nextTab;
         activateTab(nextTab);
         updateSummary();
@@ -621,12 +687,7 @@ export function renderIndexHtml(): string {
         if (state.job?.jobId !== job.jobId) return;
         state.job = job;
         if (job.result) state.result = job.result;
-        if (job.designs?.length && state.selectedDesignIndex === null) {
-          state.selectedDesignIndex = job.designs.length - 1;
-        }
-        if (job.reviews?.length && state.selectedReviewIndex === null) {
-          state.selectedReviewIndex = job.reviews.length - 1;
-        }
+        if (job.result) rememberWorkflowIdFromResult(job.result);
         updateSummary();
         renderActiveTab();
         if (job.status === "completed" || job.status === "failed") {
@@ -651,9 +712,11 @@ export function renderIndexHtml(): string {
         const response = await fetch("/api/projects");
         const config = await readResponse(response);
         renderProjects(config);
+        renderDraftHistory(config.requirementDrafts || []);
         if (config.selectedProjectRoot) {
           projectRootInput.value = config.selectedProjectRoot;
         }
+        restoreDraft(config.requirementDraft);
       } catch (error) {
         setStatus("bad", error.message || String(error));
       }
@@ -680,6 +743,7 @@ export function renderIndexHtml(): string {
       const config = await readResponse(response);
       projectRootInput.value = config.selectedProjectRoot || projectRoot;
       renderProjects(config);
+      renderDraftHistory(config.requirementDrafts || []);
     }
 
     function renderProjects(config) {
@@ -729,11 +793,41 @@ export function renderIndexHtml(): string {
       });
     }
 
+    function renderDraftHistory(drafts) {
+      state.requirementDrafts = drafts || [];
+      draftHistory.innerHTML = "";
+      if (!state.requirementDrafts.length) {
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = "暂无历史草稿";
+        draftHistory.appendChild(option);
+        draftHistory.disabled = true;
+        deleteDraftButton.disabled = true;
+        return;
+      }
+
+      draftHistory.disabled = false;
+      deleteDraftButton.disabled = false;
+      state.requirementDrafts.forEach((draft, index) => {
+        const option = document.createElement("option");
+        option.value = String(index);
+        option.textContent = formatDraftLabel(draft);
+        draftHistory.appendChild(option);
+      });
+    }
+
+    function formatDraftLabel(draft) {
+      const title = draft.title || "未命名需求";
+      const workflow = draft.workflowId ? " / " + draft.workflowId : "";
+      const updatedAt = draft.updatedAt ? " / " + draft.updatedAt : "";
+      return title + workflow + updatedAt;
+    }
+
     function buildGovernancePayload() {
       const formData = new FormData(form);
       return {
         projectRoot: getProjectRoot(),
-        workflowId: state.result?.workflow?.workflowId,
+        workflowId: state.workflowId || state.result?.workflow?.workflowId,
         title: String(formData.get("title") || ""),
         description: String(formData.get("description") || ""),
         discussion: String(formData.get("discussion") || ""),
@@ -751,6 +845,78 @@ export function renderIndexHtml(): string {
       return value.split(/\\r?\\n/).map((line) => line.trim()).filter(Boolean);
     }
 
+    function scheduleDraftSave() {
+      if (state.draftSaveTimer) clearTimeout(state.draftSaveTimer);
+      state.draftSaveTimer = setTimeout(() => {
+        state.draftSaveTimer = null;
+        saveDraft()
+          .then(() => setDraftStatus("ok", "需求草稿已自动保存。"))
+          .catch((error) => setDraftStatus("bad", error.message || String(error)));
+      }, 600);
+    }
+
+    async function saveDraft() {
+      const payload = buildGovernancePayload();
+      if (!payload.title && !payload.description && !payload.discussion) return;
+      const response = await fetch("/api/governance/draft", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const config = await readResponse(response);
+      renderDraftHistory(config.requirementDrafts || []);
+    }
+
+    function restoreDraft(draft) {
+      if (!draft) {
+        state.workflowId = "";
+        return;
+      }
+      state.workflowId = draft.workflowId || "";
+      setFieldValue("title", draft.title);
+      setFieldValue("projectRoot", draft.projectRoot || projectRootInput.value);
+      setFieldValue("description", draft.description);
+      setFieldValue("discussion", draft.discussion || "");
+      setFieldValue("acceptanceCriteria", draft.acceptanceCriteria || "");
+      setFieldValue("constraints", draft.constraints || "");
+      setFieldValue("maxDesignReviewRounds", String(draft.maxDesignReviewRounds || 3));
+      selectDraftInHistory(draft);
+      setDraftStatus("ok", "已恢复上次需求草稿" + (draft.updatedAt ? "，保存时间：" + draft.updatedAt : "") + "。");
+      setStatus("ok", "已恢复上次需求草稿。");
+    }
+
+    function selectDraftInHistory(draft) {
+      const key = getClientDraftKey(draft);
+      const index = state.requirementDrafts.findIndex((item) => {
+        return getClientDraftKey(item) === key;
+      });
+      if (index >= 0) {
+        draftHistory.value = String(index);
+      }
+    }
+
+    function isSameDraft(left, right) {
+      return getClientDraftKey(left) === getClientDraftKey(right);
+    }
+
+    function getClientDraftKey(draft) {
+      if (draft.draftKey) return draft.draftKey;
+      if (draft.workflowId) return "workflow:" + draft.workflowId;
+      return "draft:" + String(draft.title || "").trim().toLowerCase();
+    }
+
+    function setFieldValue(name, value) {
+      const field = form.elements[name];
+      if (field && value !== undefined) field.value = value;
+    }
+
+    function rememberWorkflowIdFromResult(result) {
+      const workflowId = result?.workflow?.workflowId;
+      if (!workflowId) return;
+      state.workflowId = workflowId;
+      saveDraft().catch((error) => setDraftStatus("bad", error.message || String(error)));
+    }
+
     async function readResponse(response) {
       const json = await response.json();
       if (!response.ok) {
@@ -763,16 +929,22 @@ export function renderIndexHtml(): string {
       reviewButton.disabled = busy;
       rerunButton.disabled = false;
       stopButton.disabled = !busy;
+      saveDraftButton.disabled = busy;
+      deleteDraftButton.disabled = busy || !state.requirementDrafts.length;
       planButton.disabled = busy || state.result?.workflow?.status !== "ready_for_planning";
       dryRunButton.disabled = busy || !state.result?.plan;
+      clearDraftButton.disabled = busy;
       if (message) setStatus("warn", message);
     }
 
     function setStatus(kind, message) {
       formStatus.className = "status " + kind;
-      headerStatus.className = "status " + kind;
       formStatus.textContent = message;
-      headerStatus.textContent = message || "本地治理控制台";
+    }
+
+    function setDraftStatus(kind, message) {
+      draftStatus.className = "status " + kind;
+      draftStatus.textContent = message;
     }
 
     function activateTab(tabName) {
@@ -792,12 +964,14 @@ export function renderIndexHtml(): string {
       reviewButton.disabled = running;
       rerunButton.disabled = false;
       stopButton.disabled = !running;
+      saveDraftButton.disabled = running;
+      clearDraftButton.disabled = running;
+      deleteDraftButton.disabled = running || !state.requirementDrafts.length;
       planButton.disabled = running || result?.workflow?.status !== "ready_for_planning";
       dryRunButton.disabled = running || !result?.plan;
     }
 
     function renderActiveTab() {
-      renderVersionControls();
       if (!state.result && !state.job) {
         output.textContent = "填写需求后点击生成。";
         return;
@@ -807,18 +981,11 @@ export function renderIndexHtml(): string {
         const timer = state.job ? ["当前步骤：" + state.job.currentStep, "已等待：" + state.job.elapsedSeconds + " 秒", ""].join("\\n") : "";
         output.textContent = timer + ((state.job?.logs || []).join("\\n") || "等待流程开始。");
       } else if (state.activeTab === "design") {
-        const designs = state.job?.designs || [];
-        if (designs.length > 0) {
-          const index = state.selectedDesignIndex ?? designs.length - 1;
-          output.textContent = designs[index]?.content || "";
-        } else {
-          output.textContent = state.result?.design || "";
-        }
+        output.textContent = state.job?.design?.content || state.result?.design || "";
       } else if (state.activeTab === "reviews") {
         const reviews = state.job?.reviews || state.result?.reviews || [];
         if (state.job?.reviews?.length) {
-          const index = state.selectedReviewIndex ?? reviews.length - 1;
-          output.textContent = JSON.stringify(reviews[index] || null, null, 2);
+          output.textContent = JSON.stringify(reviews[reviews.length - 1] || null, null, 2);
         } else {
           output.textContent = JSON.stringify(reviews, null, 2);
         }
@@ -826,41 +993,6 @@ export function renderIndexHtml(): string {
         output.textContent = JSON.stringify(state.result?.plan || state.job?.plan || null, null, 2);
       } else {
         output.textContent = JSON.stringify(state.execution || { message: "尚未执行预演。" }, null, 2);
-      }
-    }
-
-    function renderVersionControls() {
-      versionControls.innerHTML = "";
-      versionControls.style.display = "none";
-      if (state.activeTab === "design" && state.job?.designs?.length > 0) {
-        versionControls.style.display = "flex";
-        state.job.designs.forEach((design, index) => {
-          const button = document.createElement("button");
-          button.type = "button";
-          button.className = "secondary";
-          button.textContent = design.version;
-          button.disabled = index === (state.selectedDesignIndex ?? state.job.designs.length - 1);
-          button.addEventListener("click", () => {
-            state.selectedDesignIndex = index;
-            renderActiveTab();
-          });
-          versionControls.appendChild(button);
-        });
-      }
-      if (state.activeTab === "reviews" && state.job?.reviews?.length > 0) {
-        versionControls.style.display = "flex";
-        state.job.reviews.forEach((review, index) => {
-          const button = document.createElement("button");
-          button.type = "button";
-          button.className = "secondary";
-          button.textContent = "review-" + review.round;
-          button.disabled = index === (state.selectedReviewIndex ?? state.job.reviews.length - 1);
-          button.addEventListener("click", () => {
-            state.selectedReviewIndex = index;
-            renderActiveTab();
-          });
-          versionControls.appendChild(button);
-        });
       }
     }
   </script>

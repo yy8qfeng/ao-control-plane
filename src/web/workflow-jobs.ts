@@ -10,7 +10,7 @@ export interface WorkflowJobSnapshot {
   elapsedSeconds: number;
   currentStep: string;
   logs: string[];
-  designs: Array<{ version: string; content: string; path: string }>;
+  design?: { content: string; path: string };
   reviews: DesignReview[];
   plan?: TaskPlan;
   result?: RunWorkflowResult;
@@ -35,7 +35,6 @@ export class WorkflowJobStore {
       elapsedSeconds: 0,
       currentStep: "准备调用 Codex",
       logs: ["已创建治理流程任务，准备调用 Codex。"],
-      designs: [],
       reviews: []
     };
     if (this.activeJobId) {
@@ -89,21 +88,20 @@ export class WorkflowJobStore {
         job.logs.push(`流程已启动，产物目录：${event.artifactDir}`);
         break;
       case "design_started":
-        job.currentStep = `等待 Codex 生成 ${event.designVersion}`;
-        job.logs.push(`Codex 正在生成 ${event.designVersion}。`);
+        job.currentStep = "等待 Codex 更新设计稿";
+        job.logs.push("Codex 正在更新当前设计稿。");
         break;
       case "design_completed":
-        job.designs.push({
-          version: event.designVersion,
+        job.design = {
           content: event.design,
           path: event.path
-        });
-        job.currentStep = `${event.designVersion} 已生成`;
-        job.logs.push(`Codex 已生成 ${event.designVersion}：${event.path}`);
+        };
+        job.currentStep = "当前设计稿已更新";
+        job.logs.push(`Codex 已更新当前设计稿：${event.path}`);
         break;
       case "review_started":
         job.currentStep = `等待 ClaudeCode 审查第 ${event.round} 轮`;
-        job.logs.push(`ClaudeCode 正在审查第 ${event.round} 轮，对应 ${event.designVersion}。`);
+        job.logs.push(`ClaudeCode 正在审查第 ${event.round} 轮。`);
         break;
       case "review_completed":
         job.reviews.push(event.review);

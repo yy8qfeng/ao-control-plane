@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
@@ -18,7 +18,7 @@ describe("web server", () => {
       server = undefined;
     }
     if (tempDir) {
-      await rm(tempDir, { recursive: true, force: true });
+      await rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       tempDir = undefined;
     }
   });
@@ -158,9 +158,11 @@ describe("web server", () => {
     expect(result.taskPlanPath).toBe(
       join(projectRoot, ".ao-control-plane", "WF-WEB-REAL", "task-plan.json")
     );
-    await expect(
-      readFile(join(projectRoot, ".ao-control-plane", "WF-WEB-REAL", "design-v1.md"), "utf8")
-    ).resolves.toContain("# User permissions");
+    const workflowEntries = await readdir(join(projectRoot, ".ao-control-plane", "WF-WEB-REAL"));
+    expect(workflowEntries.filter((entry) => /^design-v\d+\.md$/.test(entry))).toEqual([]);
+    await expect(readFile(join(projectRoot, ".ao-control-plane", "WF-WEB-REAL", "design.md"), "utf8")).resolves.toContain(
+      "# User permissions"
+    );
   });
 
   it("stops a running governance job", async () => {
@@ -192,6 +194,344 @@ describe("web server", () => {
     expect(stopResponse.status).toBe(200);
     expect(stopped.status).toBe("stopped");
     expect(stopped.currentStep).toBe("已停止");
+  });
+
+  it("persists and clears requirement draft form data", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir
+    });
+
+    const saveResponse = await fetch(`${server.url}/api/governance/draft`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workflowId: "WF-DRAFT",
+        projectRoot: join(tempDir, "project"),
+        title: "Draft requirement",
+        description: "Persist this form.",
+        discussion: "Continue later.",
+        acceptanceCriteria: ["Draft restores"],
+        constraints: ["Keep workflow id"],
+        maxDesignReviewRounds: 5
+      })
+    });
+    expect(saveResponse.status).toBe(200);
+
+    const projectsResponse = await fetch(`${server.url}/api/projects`);
+    const projects = (await projectsResponse.json()) as {
+      requirementDraft: {
+        workflowId: string;
+        title: string;
+        acceptanceCriteria: string;
+        maxDesignReviewRounds: number;
+      };
+      requirementDrafts: Array<{ workflowId?: string; title: string }>;
+    };
+    expect(projects.requirementDraft.workflowId).toBe("WF-DRAFT");
+    expect(projects.requirementDraft.title).toBe("Draft requirement");
+    expect(projects.requirementDraft.acceptanceCriteria).toBe("Draft restores");
+    expect(projects.requirementDraft.maxDesignReviewRounds).toBe(5);
+    expect(projects.requirementDrafts).toHaveLength(1);
+
+    await fetch(`${server.url}/api/governance/draft`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workflowId: "WF-DRAFT",
+        title: "Draft requirement updated",
+        description: "Same workflow, latest only.",
+        maxDesignReviewRounds: 3
+      })
+    });
+    await fetch(`${server.url}/api/governance/draft`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workflowId: "WF-OTHER-DRAFT",
+        title: "Other draft",
+        description: "A different requirement.",
+        maxDesignReviewRounds: 3
+      })
+    });
+
+    const historyResponse = await fetch(`${server.url}/api/projects`);
+    const history = (await historyResponse.json()) as {
+      requirementDrafts: Array<{ workflowId?: string; title: string }>;
+    };
+    expect(history.requirementDrafts).toHaveLength(2);
+    expect(history.requirementDrafts.some((draft) => draft.title === "Draft requirement")).toBe(false);
+    expect(history.requirementDrafts.some((draft) => draft.title === "Draft requirement updated")).toBe(true);
+    expect(history.requirementDrafts.some((draft) => draft.title === "Other draft")).toBe(true);
+
+    const draftToDelete = history.requirementDrafts.find((draft) => draft.workflowId === "WF-DRAFT");
+    expect(draftToDelete).toBeTruthy();
+    const deleteResponse = await fetch(
+      `${server.url}/api/governance/drafts/${encodeURIComponent(`workflow:${draftToDelete?.workflowId}`)}`,
+      { method: "DELETE" }
+    );
+    expect(deleteResponse.status).toBe(200);
+
+    const deletedHistoryResponse = await fetch(`${server.url}/api/projects`);
+    const deletedHistory = (await deletedHistoryResponse.json()) as {
+      requirementDraft?: { workflowId?: string };
+      requirementDrafts: Array<{ workflowId?: string; title: string }>;
+    };
+    expect(deletedHistory.requirementDraft?.workflowId).toBe("WF-OTHER-DRAFT");
+    expect(deletedHistory.requirementDrafts).toHaveLength(1);
+    expect(deletedHistory.requirementDrafts[0]?.title).toBe("Other draft");
+
+    const clearResponse = await fetch(`${server.url}/api/governance/draft`, { method: "DELETE" });
+    expect(clearResponse.status).toBe(200);
+
+    const clearedResponse = await fetch(`${server.url}/api/projects`);
+    const cleared = (await clearedResponse.json()) as {
+      requirementDraft?: unknown;
+      requirementDrafts: unknown[];
+    };
+    expect(cleared.requirementDraft).toBeUndefined();
+    expect(cleared.requirementDrafts).toHaveLength(1);
+  });
+
+  it("uses title as the draft identity before a workflow id exists", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir
+    });
+
+    await fetch(`${server.url}/api/governance/draft`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        title: "Same draft title",
+        description: "Initial description.",
+        maxDesignReviewRounds: 3
+      })
+    });
+    await fetch(`${server.url}/api/governance/draft`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        title: "Same draft title",
+        description: "Updated description should replace the same draft.",
+        maxDesignReviewRounds: 3
+      })
+    });
+
+    const projectsResponse = await fetch(`${server.url}/api/projects`);
+    const projects = (await projectsResponse.json()) as {
+      requirementDrafts: Array<{ draftKey?: string; description: string }>;
+    };
+
+    expect(projects.requirementDrafts).toHaveLength(1);
+    expect(projects.requirementDrafts[0]?.draftKey).toBe("draft:same draft title");
+    expect(projects.requirementDrafts[0]?.description).toBe("Updated description should replace the same draft.");
+  });
+
+  it("merges the title draft into the generated workflow draft", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    const projectRoot = join(tempDir, "project");
+    await mkdir(projectRoot);
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir,
+      createCodexAdapter: () => fakeCodex,
+      createClaudeCodeAdapter: () => fakeClaudeCode
+    });
+
+    await fetch(`${server.url}/api/governance/draft`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectRoot,
+        title: "Generated merge draft",
+        description: "This title draft should be replaced by workflow identity.",
+        maxDesignReviewRounds: 3
+      })
+    });
+    const runResponse = await fetch(`${server.url}/api/governance/run`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectRoot,
+        title: "Generated merge draft",
+        description: "This title draft should be replaced by workflow identity.",
+        maxDesignReviewRounds: 3
+      })
+    });
+    const started = (await runResponse.json()) as { jobId: string };
+    const result = await waitForJob(server.url, started.jobId);
+
+    const projectsResponse = await fetch(`${server.url}/api/projects`);
+    const projects = (await projectsResponse.json()) as {
+      requirementDrafts: Array<{ workflowId?: string; draftKey?: string }>;
+    };
+
+    expect(projects.requirementDrafts).toHaveLength(1);
+    expect(projects.requirementDrafts[0]?.workflowId).toBe(result.workflow.workflowId);
+    expect(projects.requirementDrafts[0]?.draftKey).toBe(`workflow:${result.workflow.workflowId}`);
+  });
+
+  it("binds generated workflow artifacts to requirement history and deletes them with the draft", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    const projectRoot = join(tempDir, "project");
+    await mkdir(projectRoot);
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir,
+      createCodexAdapter: () => fakeCodex,
+      createClaudeCodeAdapter: () => fakeClaudeCode
+    });
+
+    const runResponse = await fetch(`${server.url}/api/governance/run`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectRoot,
+        title: "Generated workflow draft",
+        description: "Generate without manually supplying a workflow id.",
+        maxDesignReviewRounds: 3
+      })
+    });
+    const started = (await runResponse.json()) as { jobId: string; status: string };
+    expect(runResponse.status).toBe(202);
+    expect(started.status).toBe("running");
+
+    const result = await waitForJob(server.url, started.jobId);
+    const workflowId = result.workflow.workflowId;
+    const workflowDir = join(projectRoot, ".ao-control-plane", workflowId);
+    await expect(stat(workflowDir)).resolves.toMatchObject({ isDirectory: expect.any(Function) });
+
+    const projectsResponse = await fetch(`${server.url}/api/projects`);
+    const projects = (await projectsResponse.json()) as {
+      requirementDraft?: { workflowId?: string; draftKey?: string };
+      requirementDrafts: Array<{ workflowId?: string; draftKey?: string; title: string }>;
+    };
+    expect(projects.requirementDraft?.workflowId).toBe(workflowId);
+    expect(projects.requirementDrafts).toHaveLength(1);
+    expect(projects.requirementDrafts[0]?.workflowId).toBe(workflowId);
+
+    const otherWorkflowDir = join(projectRoot, ".ao-control-plane", "WF-OTHER");
+    await mkdir(otherWorkflowDir, { recursive: true });
+
+    const deleteResponse = await fetch(
+      `${server.url}/api/governance/drafts/${encodeURIComponent(projects.requirementDrafts[0]?.draftKey ?? "")}`,
+      { method: "DELETE" }
+    );
+    const deleted = (await deleteResponse.json()) as { requirementDrafts: unknown[] };
+    expect(deleteResponse.status).toBe(200);
+    expect(deleted.requirementDrafts).toHaveLength(0);
+    await expect(stat(workflowDir)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(otherWorkflowDir)).resolves.toMatchObject({ isDirectory: expect.any(Function) });
+  });
+
+  it("deletes artifacts from the selected project root when old drafts do not store projectRoot", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    const projectRoot = join(tempDir, "project");
+    await mkdir(projectRoot);
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir
+    });
+
+    await fetch(`${server.url}/api/projects/select`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ projectRoot })
+    });
+    await fetch(`${server.url}/api/governance/draft`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workflowId: "WF-OLD-DRAFT",
+        title: "Old draft",
+        description: "Saved before projectRoot was bound.",
+        maxDesignReviewRounds: 3
+      })
+    });
+    await fetch(`${server.url}/api/governance/draft`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workflowId: "WF-NEXT-DRAFT",
+        title: "Next draft",
+        description: "This draft should be selected after deletion.",
+        maxDesignReviewRounds: 3
+      })
+    });
+
+    const workflowDir = join(projectRoot, ".ao-control-plane", "WF-OLD-DRAFT");
+    await mkdir(workflowDir, { recursive: true });
+
+    const deleteResponse = await fetch(
+      `${server.url}/api/governance/drafts/${encodeURIComponent("workflow:WF-OLD-DRAFT")}`,
+      { method: "DELETE" }
+    );
+    const deleted = (await deleteResponse.json()) as {
+      requirementDraft?: { workflowId?: string; title?: string };
+      requirementDrafts: Array<{ workflowId?: string }>;
+    };
+
+    expect(deleteResponse.status).toBe(200);
+    expect(deleted.requirementDraft?.workflowId).toBe("WF-NEXT-DRAFT");
+    expect(deleted.requirementDrafts).toHaveLength(1);
+    await expect(stat(workflowDir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("deletes matching workflow artifacts for legacy drafts without workflowId", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    const projectRoot = join(tempDir, "project");
+    await mkdir(projectRoot);
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir
+    });
+
+    await fetch(`${server.url}/api/projects/select`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ projectRoot })
+    });
+    await fetch(`${server.url}/api/governance/draft`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectRoot,
+        title: "Legacy draft",
+        description: "This legacy draft only has content identity and no workflow id.",
+        discussion: "The generated workflow should still be removed.",
+        maxDesignReviewRounds: 3
+      })
+    });
+
+    const workflowDir = join(projectRoot, ".ao-control-plane", "WF-LEGACY-CONTENT");
+    await mkdir(workflowDir, { recursive: true });
+    await writeJson(join(workflowDir, "requirement.json"), {
+      id: "WF-LEGACY-CONTENT",
+      title: "Legacy draft updated title",
+      source: "web",
+      description: [
+        "This legacy draft only has content identity and no workflow id.",
+        "",
+        "讨论记录：",
+        "The generated workflow should still be removed."
+      ].join("\n")
+    });
+
+    const projectsResponse = await fetch(`${server.url}/api/projects`);
+    const projects = (await projectsResponse.json()) as {
+      requirementDrafts: Array<{ draftKey?: string }>;
+    };
+
+    const deleteResponse = await fetch(
+      `${server.url}/api/governance/drafts/${encodeURIComponent(projects.requirementDrafts[0]?.draftKey ?? "")}`,
+      { method: "DELETE" }
+    );
+
+    expect(deleteResponse.status).toBe(200);
+    await expect(stat(workflowDir)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("rejects public host binding unless explicitly allowed", async () => {
@@ -247,7 +587,7 @@ async function waitForJob(url: string, jobId: string) {
     const response = await fetch(`${url}/api/governance/jobs/${encodeURIComponent(jobId)}`);
     const job = (await response.json()) as {
       status: string;
-      designs: unknown[];
+      design?: unknown;
       reviews: unknown[];
       result?: {
         workflow: { workflowId: string; status: string };
@@ -258,9 +598,8 @@ async function waitForJob(url: string, jobId: string) {
       };
       error?: string;
     };
-    expect(job.designs.length).toBeGreaterThanOrEqual(0);
     if (job.status === "completed" && job.result) {
-      expect(job.designs).toHaveLength(1);
+      expect(job.design).toBeTruthy();
       expect(job.reviews).toHaveLength(1);
       return job.result;
     }
@@ -319,3 +658,7 @@ const slowCodex: CodexAdapter = {
     return "# never";
   }
 };
+
+async function writeJson(file: string, value: unknown): Promise<void> {
+  await writeFile(file, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}

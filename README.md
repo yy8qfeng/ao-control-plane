@@ -32,6 +32,48 @@ pnpm install
 pnpm build
 ```
 
+## 服务管理
+
+开发模式启动网页控制台：
+
+```bash
+pnpm dev serve --port 4317
+```
+
+停止网页控制台：
+
+```bash
+pnpm dev stop-service --port 4317
+```
+
+重启网页控制台：
+
+```bash
+pnpm dev restart-service --port 4317
+```
+
+打包编译后启动：
+
+```bash
+pnpm build
+pnpm start serve --port 4317
+```
+
+打包编译后停止：
+
+```bash
+pnpm start stop-service --port 4317
+```
+
+打包编译后重启：
+
+```bash
+pnpm build
+pnpm start restart-service --port 4317
+```
+
+如果页面没有变化，优先执行 `restart-service`，然后在浏览器中按 `Ctrl + F5` 强制刷新。`stop-service` 会自动过滤系统进程 `PID 0`，不会再尝试停止 Windows 的 `Idle (0)` 进程。
+
 ## 使用
 
 从 `requirement.json` 运行完整治理流程：
@@ -54,9 +96,9 @@ pnpm dev run-workflow examples/requirement.example.json --project-root C:\worksp
 }
 ```
 
-`id` 可省略，系统会自动生成；`maxDesignReviewRounds` 默认是 `3`。流程会调用 Codex 生成设计稿，调用 ClaudeCode 审查设计稿并输出结构化任务计划。生成文件会写入 `.ao-control-plane\<workflowId>`，包括每轮 `design-v*.md`、`review-*.json`、汇总 `reviews.json`、`workflow.json` 和最终 `task-plan.json`。
+`id` 可省略，系统会自动生成；`maxDesignReviewRounds` 默认是 `3`。流程会调用 Codex 生成设计稿，调用 ClaudeCode 审查设计稿并输出结构化任务计划。生成文件会写入 `.ao-control-plane\<workflowId>`，包括当前设计稿 `design.md`、每轮 `review-*.json`、汇总 `reviews.json`、`workflow.json` 和最终 `task-plan.json`。
 
-如果 ClaudeCode 输出不是合法 JSON，或不符合 schema，流程会失败并写入 `invalid-claude-output.txt` 和 `human-review-required.json`，需要人工复核后再继续。
+如果 ClaudeCode 审查输出不是合法 JSON，系统会先尝试自动修复；仍无法修复时，会把原始审查文本作为未解决意见纳入整改，避免设计审查流程因为格式问题直接中断。任务计划输出如果仍无法通过 schema 校验，会写入 `invalid-claude-output.txt` 和 `human-review-required.json`，需要人工复核后再继续。
 
 生成执行计划后，可以直接执行：
 
@@ -68,6 +110,18 @@ pnpm dev execute-plan .ao-control-plane\WF-001\task-plan.json --project-root C:\
 
 ```bash
 pnpm dev serve
+```
+
+重启网页控制台：
+
+```bash
+pnpm dev restart-service --port 4317
+```
+
+停止网页控制台：
+
+```bash
+pnpm dev stop-service --port 4317
 ```
 
 默认只绑定 `127.0.0.1`。控制台可以浏览本机目录并触发本地 Codex / ClaudeCode / AO 命令，不要暴露到公网；如确需绑定 `0.0.0.0`，必须显式添加 `--allow-public-host`。
@@ -82,6 +136,8 @@ pnpm dev serve
 4. `预演执行`：按任务计划预演 AO 下发。
 
 点击“选择”可以从弹框选择项目目录。最近使用过的目录会记录在 `.ao-control-plane\project-config.json`，服务重启后默认选择上一次目录。如果选择项目目录，生成文件会落盘到该目录下的 `.ao-control-plane\<workflowId>`，AO 执行也会在该目录下运行。最大设计审查轮次为手填数字，默认值为 `3`。
+
+需求表单草稿也会保存在 `.ao-control-plane\project-config.json`。页面会自动保存当前表单，也可以点击“保存草稿”手动保存；“历史草稿”下拉框可以恢复不同需求的最后一次草稿。同一个 `workflowId` 只保留最后一次记录，不保存同一需求的每次变更。重新生成同一个历史需求时，会继续更新该需求绑定的 `.ao-control-plane\<workflowId>` 目录，不会重复创建新的需求目录；点击历史草稿旁边的“删除”会删除所选历史记录，并同步删除对应的 `.ao-control-plane\<workflowId>` 生成文件夹；点击“清空草稿”只清空当前回显草稿，不删除历史草稿和生成文件。
 
 如果设计审查未通过，workflow 会进入 `blocked_for_human`，此时不会生成 `task-plan.json`；只有设计通过并完成任务拆解后，才会写入可供 `execute-plan` 使用的 `task-plan.json`。
 

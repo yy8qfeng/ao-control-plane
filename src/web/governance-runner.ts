@@ -28,11 +28,20 @@ export async function runDesignReviewStage(input: {
 }): Promise<GovernanceRunResult> {
   const requirement = buildRequirement(input.request);
   const maxDesignReviewRounds = input.request.maxDesignReviewRounds ?? 3;
+  const existing = await readExistingArtifacts(input.store, requirement.id);
+  const codex = new PlaceholderCodexAdapter();
+  const initialDesign = existing
+    ? await codex.reviseDesign({
+        currentDesign: existing.design,
+        review: createSupplementReview(requirement, existing.reviews.at(-1))
+      })
+    : undefined;
   const reviewLoop = await runDesignReviewLoop({
     requirement,
-    codex: new PlaceholderCodexAdapter(),
+    codex,
     claudeCode: new PlaceholderClaudeCodeAdapter(),
-    options: { maxDesignReviewRounds }
+    options: { maxDesignReviewRounds },
+    initialDesign
   });
   const workflow: Workflow = {
     ...createDraftWorkflow(requirement, maxDesignReviewRounds),
@@ -113,6 +122,43 @@ function createWorkflowId(): string {
     .replaceAll(":", "")
     .replace(/\.\d{3}Z$/, "Z");
   return `WF-${timestamp}`;
+}
+
+async function readExistingArtifacts(store: ArtifactStore, workflowId: string): Promise<GovernanceArtifacts | undefined> {
+  try {
+    return await store.readWorkflow(workflowId);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return undefined;
+    }
+    return undefined;
+  }
+}
+
+function createSupplementReview(requirement: Requirement, previousReview: DesignReview | undefined): DesignReview {
+  return {
+    workflowId: requirement.id,
+    round: previousReview?.round ?? 0,
+    designer: "codex",
+    reviewer: "claude-code",
+    designVersion: "design-current",
+    reviewDecision: "changes_requested",
+    findings: [
+      {
+        id: "DRF-SUPPLEMENT-001",
+        title: "根据最新需求补充更新设计稿",
+        body: "请在当前设计稿基础上吸收最新需求描述、讨论记录、验收标准和约束。",
+        severity: "major",
+        status: "unresolved",
+        rationale: requirement.description
+      },
+      ...(previousReview?.findings ?? [])
+    ]
+  };
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
 }
 
 function createDraftWorkflow(requirement: Requirement, maxDesignReviewRounds: number): Workflow {

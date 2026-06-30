@@ -33,6 +33,7 @@ export interface ClaudeCodeCliAdapterOptions {
   claudeBin?: string;
   model?: string;
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
+  structuredOutputRepairAttempts?: number;
 }
 
 export class ClaudeCodeCliAdapter implements ClaudeCodeAdapter {
@@ -80,7 +81,58 @@ export class ClaudeCodeCliAdapter implements ClaudeCodeAdapter {
       input.design
     ].join("\n"), options);
 
-    return parseStructuredOutput(rawOutput, designReviewSchema, "ClaudeCode review JSON is invalid");
+    try {
+      return await parseStructuredOutputWithRepair({
+        rawOutput,
+        schema: designReviewSchema,
+        errorMessage: `ClaudeCode review JSON is invalid for round ${input.round} (${input.designVersion})`,
+        repairAttempts: this.options.structuredOutputRepairAttempts ?? 1,
+        repair: async ({ error, rawOutput: invalidOutput }) =>
+          this.runClaude([
+            "你刚才作为 ClaudeCode 设计审查员的输出没有通过结构化 JSON 校验。",
+            "请把上一条审查输出修复为严格 JSON。只能输出 JSON 对象，不要使用 Markdown 代码块，不要输出解释文字。",
+            "",
+            "修复规则：",
+            "- 不要重新审查设计稿，只把上一条审查结论和 findings 转换为合法 JSON。",
+            "- 如果上一条输出表达仍需整改，reviewDecision 必须是 changes_requested。",
+            "- 如果上一条输出表达需要人工判断，reviewDecision 必须是 human_review_required。",
+            "- 非 approved 且存在 findings 时，至少一个 finding.status 必须是 unresolved。",
+            "- approved 时 findings 中不得包含 unresolved。",
+            "- 缺少字段时，使用下面提供的 workflowId、round、designVersion 补齐。",
+            "",
+            "JSON 必须符合以下 TypeScript 形状：",
+            "{",
+            '  "workflowId": "string",',
+            '  "round": number,',
+            '  "designer": "codex",',
+            '  "reviewer": "claude-code",',
+            '  "designVersion": "string",',
+            '  "reviewDecision": "approved" | "changes_requested" | "human_review_required",',
+            '  "findings": [{',
+            '    "id": "DRF-001",',
+            '    "title": "string",',
+            '    "body": "string",',
+            '    "severity": "blocking" | "major" | "minor" | "warning" | "observation",',
+            '    "status": "addressed" | "accepted_as_is" | "unresolved",',
+            '    "rationale": "optional string"',
+            "  }]",
+            "}",
+            "",
+            `workflowId: ${input.workflowId}`,
+            `round: ${input.round}`,
+            `designVersion: ${input.designVersion}`,
+            `校验错误：${error.message}`,
+            "",
+            "上一条无效输出：",
+            invalidOutput
+          ].join("\n"), options)
+      });
+    } catch (error) {
+      if (error instanceof StructuredOutputError) {
+        return createReviewFromUnstructuredOutput(input, error.rawOutput);
+      }
+      throw error;
+    }
   }
 
   async createTaskPlan(
@@ -123,7 +175,50 @@ export class ClaudeCodeCliAdapter implements ClaudeCodeAdapter {
       input.approvedDesign
     ].join("\n"), options);
 
-    return parseStructuredOutput(rawOutput, taskPlanSchema, "ClaudeCode task plan JSON is invalid");
+    return parseStructuredOutputWithRepair({
+      rawOutput,
+      schema: taskPlanSchema,
+      errorMessage: `ClaudeCode task plan JSON is invalid for workflow ${input.workflowId}`,
+      repairAttempts: this.options.structuredOutputRepairAttempts ?? 1,
+      repair: async ({ error, rawOutput: invalidOutput }) =>
+        this.runClaude([
+          "你刚才作为 ClaudeCode 任务拆解员的输出没有通过结构化 JSON 校验。",
+          "请把上一条任务拆解输出修复为严格 JSON。只能输出 JSON 对象，不要使用 Markdown 代码块，不要输出解释文字。",
+          "",
+          "修复规则：",
+          "- 不要重新设计需求，只把上一条任务拆解转换为合法 task-plan JSON。",
+          "- 任务只能指定 aoRole，禁止出现 agent、model、provider、codex、claudeCode 字段。",
+          "- aoPrompt 中禁止要求 AO worker 选择、切换或调用具体 agent 或 model。",
+          "- 每个 aoPrompt 必须包含 workflowId、taskId、任务名称、AO 角色、验收标准和上下文摘要。",
+          "- taskId 使用 TASK-001 递增。",
+          "- status 全部使用 pending。",
+          "",
+          "JSON 必须符合以下 TypeScript 形状：",
+          "{",
+          '  "workflowId": "string",',
+          '  "title": "string",',
+          '  "tasks": [{',
+          '    "taskId": "TASK-001",',
+          '    "workflowId": "string",',
+          '    "title": "string",',
+          '    "description": "string",',
+          '    "type": "design" | "implementation" | "test" | "refactor" | "review" | "docs" | "verification",',
+          '    "dependencies": ["TASK-001"],',
+          '    "dependencyCondition": "all_completed" | "any_completed" | "manual_gate",',
+          '    "aoRole": "architect" | "reviewer" | "ui-designer" | "frontend-senior" | "frontend-junior" | "backend-senior" | "backend-junior" | "qa" | "docs" | "second-opinion" | "frontend" | "backend",',
+          '    "acceptanceCriteria": ["string"],',
+          '    "aoPrompt": "string",',
+          '    "status": "pending"',
+          "  }]",
+          "}",
+          "",
+          `workflowId: ${input.workflowId}`,
+          `校验错误：${error.message}`,
+          "",
+          "上一条无效输出：",
+          invalidOutput
+        ].join("\n"), options)
+    });
   }
 
   private async runClaude(prompt: string, options: { signal?: AbortSignal }): Promise<string> {
@@ -269,6 +364,92 @@ export function parseStructuredOutput<T>(
   } catch (error) {
     throw new StructuredOutputError(errorMessage, rawOutput, error);
   }
+}
+
+export function createReviewFromUnstructuredOutput(
+  input: {
+    workflowId: string;
+    round: number;
+    designVersion: string;
+  },
+  rawOutput: string
+): DesignReview {
+  return {
+    workflowId: input.workflowId,
+    round: input.round,
+    designer: "codex",
+    reviewer: "claude-code",
+    designVersion: input.designVersion,
+    reviewDecision: "changes_requested",
+    findings: [
+      {
+        id: "DRF-UNSTRUCTURED-001",
+        title: "ClaudeCode 审查输出未符合结构化 JSON，已按原文纳入整改",
+        body: rawOutput.trim() || "ClaudeCode 审查输出为空或无法解析。",
+        severity: "major",
+        status: "unresolved",
+        rationale: "为避免审查流程因输出格式中断，将非结构化审查内容作为未解决意见交由 Codex 继续整改。"
+      }
+    ]
+  };
+}
+
+export async function parseStructuredOutputWithRepair<T>(input: {
+  rawOutput: string;
+  schema: { parse(value: unknown): T };
+  errorMessage: string;
+  repairAttempts?: number;
+  repair: (input: {
+    attempt: number;
+    rawOutput: string;
+    error: StructuredOutputError;
+  }) => Promise<string>;
+}): Promise<T> {
+  const repairAttempts = Math.max(0, input.repairAttempts ?? 0);
+  const outputs: Array<{ label: string; output: string }> = [
+    { label: "initial-output", output: input.rawOutput }
+  ];
+  let currentOutput = input.rawOutput;
+  let lastError: StructuredOutputError | undefined;
+
+  for (let attempt = 0; attempt <= repairAttempts; attempt += 1) {
+    try {
+      return parseStructuredOutput(currentOutput, input.schema, input.errorMessage);
+    } catch (error) {
+      if (!(error instanceof StructuredOutputError)) {
+        throw error;
+      }
+
+      lastError = error;
+      if (attempt === repairAttempts) {
+        throw new StructuredOutputError(
+          `${input.errorMessage} after ${outputs.length} attempt(s): ${error.message}`,
+          formatStructuredOutputAttempts(outputs),
+          error.causeDetail
+        );
+      }
+
+      currentOutput = await input.repair({
+        attempt: attempt + 1,
+        rawOutput: currentOutput,
+        error
+      });
+      outputs.push({
+        label: `repair-output-${attempt + 1}`,
+        output: currentOutput
+      });
+    }
+  }
+
+  throw new StructuredOutputError(
+    `${input.errorMessage}: ${lastError?.message ?? "unknown structured output error"}`,
+    formatStructuredOutputAttempts(outputs),
+    lastError?.causeDetail
+  );
+}
+
+function formatStructuredOutputAttempts(outputs: Array<{ label: string; output: string }>): string {
+  return outputs.map((entry) => `--- ${entry.label} ---\n${entry.output}`).join("\n\n");
 }
 
 function extractJsonObject(rawOutput: string): string {
