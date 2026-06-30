@@ -449,6 +449,7 @@ export function renderIndexHtml(): string {
       localTimer: null,
       execution: null,
       activeTab: "logs",
+      pendingRender: false,
       browsingPath: "",
       workflowId: "",
       draftSaveTimer: null,
@@ -604,6 +605,12 @@ export function renderIndexHtml(): string {
         activateTab(state.activeTab);
         renderActiveTab();
       });
+    });
+
+    document.addEventListener("selectionchange", () => {
+      if (!state.pendingRender || outputHasSelection()) return;
+      state.pendingRender = false;
+      renderActiveTab();
     });
 
     document.addEventListener("visibilitychange", () => {
@@ -987,6 +994,12 @@ export function renderIndexHtml(): string {
     }
 
     function renderActiveTab() {
+      if (outputHasSelection()) {
+        state.pendingRender = true;
+        return;
+      }
+      state.pendingRender = false;
+
       if (!state.result && !state.job) {
         output.textContent = "填写需求后点击生成。";
         return;
@@ -1009,6 +1022,14 @@ export function renderIndexHtml(): string {
       } else {
         output.textContent = JSON.stringify(state.execution || { message: "尚未执行预演。" }, null, 2);
       }
+    }
+
+    function outputHasSelection() {
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed || selection.rangeCount === 0) return false;
+      return Array.from({ length: selection.rangeCount }, (_, index) => selection.getRangeAt(index)).some((range) => {
+        return output.contains(range.commonAncestorContainer) || range.intersectsNode(output);
+      });
     }
   </script>
 </body>
