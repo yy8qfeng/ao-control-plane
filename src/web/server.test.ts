@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { ClaudeCodeAdapter } from "../adapters/claude-code.js";
 import type { CodexAdapter } from "../adapters/codex.js";
 import type { DesignReview } from "../schemas/design-review.js";
+import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
 import { startWebServer } from "./server.js";
 import { renderIndexHtml } from "./ui.js";
@@ -586,6 +587,12 @@ const fakeCodex: CodexAdapter = {
   },
   async reviseDesign() {
     throw new Error("should not revise approved design");
+  },
+  async createTaskPlan(input): Promise<TaskPlan> {
+    return createWebPlan(input.workflowId);
+  },
+  async reviseTaskPlan() {
+    throw new Error("should not revise approved task plan");
   }
 };
 
@@ -596,10 +603,12 @@ async function waitForJob(url: string, jobId: string) {
       status: string;
       design?: unknown;
       reviews: unknown[];
+      taskPlanReviews: unknown[];
       result?: {
         workflow: { workflowId: string; status: string };
         design: string;
         reviews: unknown[];
+        taskPlanReviews: unknown[];
         plan: { tasks: unknown[] };
         taskPlanPath: string;
       };
@@ -608,6 +617,7 @@ async function waitForJob(url: string, jobId: string) {
     if (job.status === "completed" && job.result) {
       expect(job.design).toBeTruthy();
       expect(job.reviews).toHaveLength(1);
+      expect(job.taskPlanReviews).toHaveLength(1);
       return job.result;
     }
     if (job.status === "failed") {
@@ -630,26 +640,15 @@ const fakeClaudeCode: ClaudeCodeAdapter = {
       findings: []
     };
   },
-  async createTaskPlan(input): Promise<TaskPlan> {
+  async reviewTaskPlan(input): Promise<TaskPlanReview> {
     return {
       workflowId: input.workflowId,
-      title: "Plan",
-      tasks: [
-        {
-          taskId: "TASK-001",
-          workflowId: input.workflowId,
-          title: "Implement permissions",
-          description: "Implement role-based permissions.",
-          type: "implementation",
-          dependencies: [],
-          dependencyCondition: "all_completed",
-          aoRole: "backend-senior",
-          acceptanceCriteria: ["Permissions are enforced"],
-          aoPrompt:
-            "[WF-WEB-REAL / TASK-001]\n任务名称：Implement permissions\nAO 角色：backend-senior\n验收标准：\n1. Permissions are enforced\n上下文摘要：Use existing middleware.",
-          status: "pending"
-        }
-      ]
+      round: input.round,
+      planner: "codex",
+      reviewer: "claude-code",
+      planVersion: input.planVersion,
+      reviewDecision: "approved",
+      findings: []
     };
   }
 };
@@ -663,8 +662,37 @@ const slowCodex: CodexAdapter = {
   },
   async reviseDesign() {
     return "# never";
+  },
+  async createTaskPlan() {
+    throw new Error("should not plan stopped workflow");
+  },
+  async reviseTaskPlan() {
+    throw new Error("should not revise task plan for stopped workflow");
   }
 };
+
+function createWebPlan(workflowId: string): TaskPlan {
+  return {
+    workflowId,
+    title: "Plan",
+    tasks: [
+      {
+        taskId: "TASK-001",
+        workflowId,
+        title: "Implement permissions",
+        description: "Implement role-based permissions.",
+        type: "implementation",
+        dependencies: [],
+        dependencyCondition: "all_completed",
+        aoRole: "backend-senior",
+        acceptanceCriteria: ["Permissions are enforced"],
+        aoPrompt:
+          `[${workflowId} / TASK-001]\n任务名称：Implement permissions\nAO 角色：backend-senior\n验收标准：\n1. Permissions are enforced\n上下文摘要：Use existing middleware.`,
+        status: "pending"
+      }
+    ]
+  };
+}
 
 async function writeJson(file: string, value: unknown): Promise<void> {
   await writeFile(file, `${JSON.stringify(value, null, 2)}\n`, "utf8");

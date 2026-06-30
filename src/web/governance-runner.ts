@@ -68,7 +68,7 @@ export async function createTaskPlanStage(input: {
     throw new Error(`Workflow ${input.workflowId} is not ready for planning`);
   }
 
-  const plan = await new PlaceholderClaudeCodeAdapter().createTaskPlan({
+  const plan = await new PlaceholderCodexAdapter().createTaskPlan({
     workflowId: artifacts.workflow.workflowId,
     approvedDesign: artifacts.design,
     deferredFindings: collectDeferredFindings(artifacts.reviews)

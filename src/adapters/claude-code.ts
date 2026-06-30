@@ -1,8 +1,9 @@
 import type { DesignReview } from "../schemas/design-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
+import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import { execa } from "execa";
 import { designReviewSchema } from "../schemas/design-review.js";
-import { taskPlanSchema } from "../schemas/task-plan.js";
+import { taskPlanReviewSchema } from "../schemas/task-plan-review.js";
 
 export class StructuredOutputError extends Error {
   constructor(
@@ -22,10 +23,13 @@ export interface ClaudeCodeAdapter {
     designVersion: string;
     design: string;
   }, options?: { signal?: AbortSignal }): Promise<DesignReview>;
-  createTaskPlan(
-    input: { workflowId: string; approvedDesign: string; deferredFindings?: DesignReview["findings"] },
-    options?: { signal?: AbortSignal }
-  ): Promise<TaskPlan>;
+  reviewTaskPlan(input: {
+    workflowId: string;
+    round: number;
+    planVersion: string;
+    plan: TaskPlan;
+    approvedDesign: string;
+  }, options?: { signal?: AbortSignal }): Promise<TaskPlanReview>;
 }
 
 export interface ClaudeCodeCliAdapterOptions {
@@ -138,46 +142,52 @@ export class ClaudeCodeCliAdapter implements ClaudeCodeAdapter {
     }
   }
 
-  async createTaskPlan(
-    input: { workflowId: string; approvedDesign: string; deferredFindings?: DesignReview["findings"] },
+  async reviewTaskPlan(
+    input: {
+      workflowId: string;
+      round: number;
+      planVersion: string;
+      plan: TaskPlan;
+      approvedDesign: string;
+    },
     options: { signal?: AbortSignal } = {}
-  ): Promise<TaskPlan> {
-    const deferredFindings = formatDeferredFindings(input.deferredFindings ?? []);
+  ): Promise<TaskPlanReview> {
     const rawOutput = await this.runClaude([
-      "你是需求治理层的 ClaudeCode 任务拆解员。请根据已批准设计稿输出 AO 执行层 task-plan。",
+      "你是需求治理层的 ClaudeCode 任务计划审查员。请审查 Codex 生成的 AO 执行层 task-plan。",
       "",
       "必须只输出一个 JSON 对象，不要使用 Markdown 代码块，不要输出解释文字。",
       "JSON 必须符合以下 TypeScript 形状：",
       "{",
       '  "workflowId": "string",',
-      '  "title": "string",',
-      '  "tasks": [{',
-      '    "taskId": "TASK-001",',
-      '    "workflowId": "string",',
+      '  "round": number,',
+      '  "planner": "codex",',
+      '  "reviewer": "claude-code",',
+      '  "planVersion": "string",',
+      '  "reviewDecision": "approved" | "changes_requested",',
+      '  "findings": [{',
+      '    "id": "TPF-001",',
       '    "title": "string",',
-      '    "description": "string",',
-      '    "type": "design" | "implementation" | "test" | "refactor" | "review" | "docs" | "verification",',
-      '    "dependencies": ["TASK-001"],',
-      '    "dependencyCondition": "all_completed" | "any_completed" | "manual_gate",',
-      '    "aoRole": "architect" | "reviewer" | "ui-designer" | "frontend-senior" | "frontend-junior" | "backend-senior" | "backend-junior" | "qa" | "docs" | "second-opinion" | "frontend" | "backend",',
-      '    "acceptanceCriteria": ["string"],',
-      '    "aoPrompt": "string",',
-      '    "status": "pending"',
+      '    "body": "string",',
+      '    "severity": "blocking" | "major" | "minor" | "warning" | "observation",',
+      '    "status": "addressed" | "accepted_as_is" | "unresolved",',
+      '    "rationale": "optional string"',
       "  }]",
       "}",
       "",
-      "硬性规则：",
-      "- 任务只能指定 aoRole，禁止出现 agent、model、provider、codex、claudeCode 字段。",
-      "- aoPrompt 中禁止要求 AO worker 选择、切换或调用具体 agent 或 model。",
-      "- 每个 aoPrompt 必须包含 workflowId、taskId、任务名称、AO 角色、验收标准和上下文摘要。",
-      "- taskId 使用 TASK-001 递增。",
-      "- status 全部使用 pending。",
-      "- 如果存在实施阶段遗留审查意见，必须在任务、验收标准或 aoPrompt 约束中体现，不能丢失。",
+      "审查规则：",
+      "- 只审查 task-plan 是否可安全下发给 AO 执行层，不重新设计需求。",
+      "- 如果任务计划缺少关键任务、依赖错误、验收标准不可验证、AO 角色不合适、aoPrompt 缺少上下文，输出 changes_requested。",
+      "- 如果 task-plan 中出现 agent、model、provider、codex、claudeCode 字段，或 aoPrompt 要求 worker 选择具体 agent/model，输出 changes_requested。",
+      "- 如果 task-plan 已可执行且符合 AO 内置角色约束，输出 approved。",
+      "- approved 时不得包含 unresolved finding。",
+      "- changes_requested 时至少包含一个 unresolved finding。",
       "",
       `workflowId: ${input.workflowId}`,
+      `round: ${input.round}`,
+      `planVersion: ${input.planVersion}`,
       "",
-      "实施阶段遗留审查意见：",
-      deferredFindings,
+      "task-plan JSON：",
+      JSON.stringify(input.plan, null, 2),
       "",
       "已批准设计稿：",
       input.approvedDesign
@@ -185,43 +195,43 @@ export class ClaudeCodeCliAdapter implements ClaudeCodeAdapter {
 
     return parseStructuredOutputWithRepair({
       rawOutput,
-      schema: taskPlanSchema,
-      errorMessage: `ClaudeCode task plan JSON is invalid for workflow ${input.workflowId}`,
+      schema: taskPlanReviewSchema,
+      errorMessage: `ClaudeCode task plan review JSON is invalid for round ${input.round} (${input.planVersion})`,
       repairAttempts: this.options.structuredOutputRepairAttempts ?? 1,
       repair: async ({ error, rawOutput: invalidOutput }) =>
         this.runClaude([
-          "你刚才作为 ClaudeCode 任务拆解员的输出没有通过结构化 JSON 校验。",
-          "请把上一条任务拆解输出修复为严格 JSON。只能输出 JSON 对象，不要使用 Markdown 代码块，不要输出解释文字。",
+          "你刚才作为 ClaudeCode 任务计划审查员的输出没有通过结构化 JSON 校验。",
+          "请把上一条审查输出修复为严格 JSON。只能输出 JSON 对象，不要使用 Markdown 代码块，不要输出解释文字。",
           "",
           "修复规则：",
-          "- 不要重新设计需求，只把上一条任务拆解转换为合法 task-plan JSON。",
-          "- 任务只能指定 aoRole，禁止出现 agent、model、provider、codex、claudeCode 字段。",
-          "- aoPrompt 中禁止要求 AO worker 选择、切换或调用具体 agent 或 model。",
-          "- 每个 aoPrompt 必须包含 workflowId、taskId、任务名称、AO 角色、验收标准和上下文摘要。",
-          "- taskId 使用 TASK-001 递增。",
-          "- status 全部使用 pending。",
-          "- 如果上一条输入包含实施阶段遗留审查意见，必须在任务、验收标准或 aoPrompt 约束中体现。",
+          "- 不要重新审查 task-plan，只把上一条审查结论和 findings 转换为合法 JSON。",
+          "- 如果上一条输出表达仍需整改，reviewDecision 必须是 changes_requested。",
+          "- 如果上一条输出表达计划可执行，reviewDecision 必须是 approved。",
+          "- changes_requested 时至少包含一个 finding.status 为 unresolved 的 finding。",
+          "- approved 时 findings 中不得包含 unresolved。",
+          "- 缺少字段时，使用下面提供的 workflowId、round、planVersion 补齐。",
           "",
           "JSON 必须符合以下 TypeScript 形状：",
           "{",
           '  "workflowId": "string",',
-          '  "title": "string",',
-          '  "tasks": [{',
-          '    "taskId": "TASK-001",',
-          '    "workflowId": "string",',
+          '  "round": number,',
+          '  "planner": "codex",',
+          '  "reviewer": "claude-code",',
+          '  "planVersion": "string",',
+          '  "reviewDecision": "approved" | "changes_requested",',
+          '  "findings": [{',
+          '    "id": "TPF-001",',
           '    "title": "string",',
-          '    "description": "string",',
-          '    "type": "design" | "implementation" | "test" | "refactor" | "review" | "docs" | "verification",',
-          '    "dependencies": ["TASK-001"],',
-          '    "dependencyCondition": "all_completed" | "any_completed" | "manual_gate",',
-          '    "aoRole": "architect" | "reviewer" | "ui-designer" | "frontend-senior" | "frontend-junior" | "backend-senior" | "backend-junior" | "qa" | "docs" | "second-opinion" | "frontend" | "backend",',
-          '    "acceptanceCriteria": ["string"],',
-          '    "aoPrompt": "string",',
-          '    "status": "pending"',
+          '    "body": "string",',
+          '    "severity": "blocking" | "major" | "minor" | "warning" | "observation",',
+          '    "status": "addressed" | "accepted_as_is" | "unresolved",',
+          '    "rationale": "optional string"',
           "  }]",
           "}",
           "",
           `workflowId: ${input.workflowId}`,
+          `round: ${input.round}`,
+          `planVersion: ${input.planVersion}`,
           `校验错误：${error.message}`,
           "",
           "上一条无效输出：",
@@ -313,74 +323,42 @@ export class PlaceholderClaudeCodeAdapter implements ClaudeCodeAdapter {
     };
   }
 
-  async createTaskPlan(input: {
+  async reviewTaskPlan(input: {
     workflowId: string;
-    approvedDesign: string;
-    deferredFindings?: DesignReview["findings"];
-  }): Promise<TaskPlan> {
-    const deferredCriteria = (input.deferredFindings ?? []).map(
-      (finding) => `处理或明确遗留审查意见 ${finding.id}：${finding.title}`
-    );
+    round: number;
+    planVersion: string;
+    plan: TaskPlan;
+  }): Promise<TaskPlanReview> {
+    if (input.plan.workflowId !== input.workflowId) {
+      return {
+        workflowId: input.workflowId,
+        round: input.round,
+        planner: "codex",
+        reviewer: "claude-code",
+        planVersion: input.planVersion,
+        reviewDecision: "changes_requested",
+        findings: [
+          {
+            id: "TPF-001",
+            title: "任务计划 workflowId 不一致",
+            body: "task-plan.workflowId 必须与当前 workflowId 一致。",
+            severity: "blocking",
+            status: "unresolved"
+          }
+        ]
+      };
+    }
+
     return {
       workflowId: input.workflowId,
-      title: "结构化执行计划",
-      tasks: [
-        {
-          taskId: "TASK-001",
-          workflowId: input.workflowId,
-          title: "根据已批准设计实现功能",
-          description: "根据最终设计稿完成代码、测试或文档变更。",
-          type: "implementation",
-          dependencies: [],
-          dependencyCondition: "all_completed",
-          aoRole: "backend-senior",
-          acceptanceCriteria: ["实现内容符合最终设计稿", "相关测试通过", ...deferredCriteria],
-          aoPrompt: [
-            `[${input.workflowId} / TASK-001]`,
-            "任务名称：根据已批准设计实现功能",
-            "AO 角色：backend-senior",
-            "验收标准：",
-            "1. 实现内容符合最终设计稿。",
-            "2. 相关测试通过。",
-            ...deferredCriteria.map((criterion, index) => `${index + 3}. ${criterion}。`),
-            "上下文摘要：",
-            summarizeDesignForAoPrompt(input.approvedDesign),
-            formatDeferredFindingsForAoPrompt(input.deferredFindings ?? [])
-          ].join("\n"),
-          status: "pending"
-        }
-      ]
+      round: input.round,
+      planner: "codex",
+      reviewer: "claude-code",
+      planVersion: input.planVersion,
+      reviewDecision: "approved",
+      findings: []
     };
   }
-}
-
-function summarizeDesignForAoPrompt(design: string): string {
-  const title = design.split("\n").find((line) => line.startsWith("# "))?.replace(/^#\s+/, "").trim();
-  return title
-    ? `已批准设计：${title}。请参考已落盘最终设计稿完成实现。`
-    : "请参考已落盘最终设计稿完成实现。";
-}
-
-function formatDeferredFindings(findings: DesignReview["findings"]): string {
-  const unresolvedFindings = findings.filter((finding) => finding.status === "unresolved");
-  if (unresolvedFindings.length === 0) {
-    return "无。";
-  }
-
-  return unresolvedFindings
-    .map((finding) =>
-      [
-        `- ${finding.id}｜${finding.severity}｜${finding.title}`,
-        `  内容：${finding.body}`,
-        finding.rationale ? `  理由：${finding.rationale}` : undefined
-      ].filter(Boolean).join("\n")
-    )
-    .join("\n");
-}
-
-function formatDeferredFindingsForAoPrompt(findings: DesignReview["findings"]): string {
-  const formatted = formatDeferredFindings(findings);
-  return formatted === "无。" ? "" : `实施阶段遗留审查意见：\n${formatted}`;
 }
 
 export function parseStructuredOutput<T>(

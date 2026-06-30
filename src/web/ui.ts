@@ -462,7 +462,7 @@ export function renderIndexHtml(): string {
       event.preventDefault();
       await runStep(
         "/api/governance/run",
-        "正在执行完整治理流程：Codex 生成设计、ClaudeCode 审查、Codex 整改，并生成任务计划...",
+        "正在执行完整治理流程：Codex 生成设计和任务计划，ClaudeCode 审查，Codex 根据意见整改...",
         "后台任务已结束。若补充需求后重新审查，审查轮次会从 1 开始。",
         "logs"
       );
@@ -551,7 +551,7 @@ export function renderIndexHtml(): string {
 
     planButton.addEventListener("click", async () => {
       if (!state.result?.workflow?.workflowId) return;
-      setBusy(true, "正在生成任务计划...");
+      setBusy(true, "正在生成并审查任务计划...");
       try {
         const response = await fetch("/api/governance/plan", {
           method: "POST",
@@ -954,7 +954,7 @@ export function renderIndexHtml(): string {
       saveDraftButton.disabled = busy;
       deleteDraftButton.disabled = busy || !state.requirementDrafts.length;
       planButton.disabled = busy || state.result?.workflow?.status !== "ready_for_planning";
-      dryRunButton.disabled = busy || !state.result?.plan;
+      dryRunButton.disabled = busy || state.result?.workflow?.status !== "executing" || !state.result?.plan;
       clearDraftButton.disabled = busy;
       if (message) setStatus("warn", message);
     }
@@ -990,7 +990,7 @@ export function renderIndexHtml(): string {
       clearDraftButton.disabled = running;
       deleteDraftButton.disabled = running || !state.requirementDrafts.length;
       planButton.disabled = running || result?.workflow?.status !== "ready_for_planning";
-      dryRunButton.disabled = running || !result?.plan;
+      dryRunButton.disabled = running || result?.workflow?.status !== "executing" || !result?.plan;
     }
 
     function renderActiveTab() {

@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { ClaudeCodeAdapter } from "../adapters/claude-code.js";
 import type { CodexAdapter } from "../adapters/codex.js";
+import type { TaskPlanReview } from "../schemas/task-plan-review.js";
+import type { TaskPlan } from "../schemas/task-plan.js";
 import { runDesignReviewLoop } from "./design-review-loop.js";
 
 describe("runDesignReviewLoop", () => {
   it("blocks for human when max design review rounds are exhausted", async () => {
     let reviseDesignCalls = 0;
     const codex: CodexAdapter = {
+      ...unusedTaskPlanMethods(),
       async createDesign() {
         return "draft";
       },
@@ -35,7 +38,7 @@ describe("runDesignReviewLoop", () => {
           ]
         };
       },
-      async createTaskPlan() {
+      async reviewTaskPlan(): Promise<TaskPlanReview> {
         throw new Error("should not plan before approval");
       }
     };
@@ -63,6 +66,7 @@ describe("runDesignReviewLoop", () => {
   it("keeps revising changes_requested reviews until a later round approves", async () => {
     let reviseDesignCalls = 0;
     const codex: CodexAdapter = {
+      ...unusedTaskPlanMethods(),
       async createDesign() {
         return "draft";
       },
@@ -94,7 +98,7 @@ describe("runDesignReviewLoop", () => {
               : []
         };
       },
-      async createTaskPlan() {
+      async reviewTaskPlan(): Promise<TaskPlanReview> {
         throw new Error("should not plan inside review loop");
       }
     };
@@ -121,6 +125,7 @@ describe("runDesignReviewLoop", () => {
 
   it("treats deferred implementation findings as approved with deferred context", async () => {
     const codex: CodexAdapter = {
+      ...unusedTaskPlanMethods(),
       async createDesign() {
         return "draft";
       },
@@ -148,7 +153,7 @@ describe("runDesignReviewLoop", () => {
           ]
         };
       },
-      async createTaskPlan() {
+      async reviewTaskPlan(): Promise<TaskPlanReview> {
         throw new Error("should not plan inside review loop");
       }
     };
@@ -173,3 +178,14 @@ describe("runDesignReviewLoop", () => {
     expect(result.deferredFindings).toHaveLength(1);
   });
 });
+
+function unusedTaskPlanMethods(): Pick<CodexAdapter, "createTaskPlan" | "reviseTaskPlan"> {
+  return {
+    async createTaskPlan(): Promise<TaskPlan> {
+      throw new Error("should not create task plan inside design review loop");
+    },
+    async reviseTaskPlan(): Promise<TaskPlan> {
+      throw new Error("should not revise task plan inside design review loop");
+    }
+  };
+}

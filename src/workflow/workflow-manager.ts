@@ -5,6 +5,7 @@ import type { TaskPlan } from "../schemas/task-plan.js";
 import type { Workflow } from "../schemas/workflow.js";
 import { taskPlanSchema } from "../schemas/task-plan.js";
 import { runDesignReviewLoop } from "./design-review-loop.js";
+import { runTaskPlanReviewLoop } from "./task-plan-review-loop.js";
 
 export interface PlanningWorkflowResult {
   workflow: Workflow;
@@ -50,13 +51,26 @@ export async function runPlanningWorkflow(input: {
   workflow.status = "planning";
   workflow.approvedDesignVersion = reviewLoop.designVersion;
 
-  const plan = taskPlanSchema.parse(
-    await input.claudeCode.createTaskPlan({
-      workflowId: workflow.workflowId,
-      approvedDesign: reviewLoop.design,
-      deferredFindings: reviewLoop.deferredFindings
-    })
-  );
+  const planLoop = await runTaskPlanReviewLoop({
+    workflowId: workflow.workflowId,
+    approvedDesign: reviewLoop.design,
+    deferredFindings: reviewLoop.deferredFindings,
+    codex: input.codex,
+    claudeCode: input.claudeCode,
+    options: { maxTaskPlanReviewRounds: input.maxDesignReviewRounds }
+  });
+
+  if (!planLoop.approved) {
+    workflow.status = "blocked_for_human";
+    return {
+      workflow,
+      design: reviewLoop.design,
+      reviews: reviewLoop.reviews,
+      plan: planLoop.plan
+    };
+  }
+
+  const plan = taskPlanSchema.parse(planLoop.plan);
 
   workflow.status = "executing";
   workflow.tasks = plan.tasks.map((task) => task.taskId);

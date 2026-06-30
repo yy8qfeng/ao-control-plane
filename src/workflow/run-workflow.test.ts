@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { StructuredOutputError, type ClaudeCodeAdapter } from "../adapters/claude-code.js";
 import type { CodexAdapter } from "../adapters/codex.js";
 import type { DesignReview } from "../schemas/design-review.js";
+import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
 import { runWorkflow } from "./run-workflow.js";
 
@@ -32,7 +33,11 @@ describe("runWorkflow", () => {
       },
       async reviseDesign() {
         throw new Error("should not revise approved design");
-      }
+      },
+      async createTaskPlan(input): Promise<TaskPlan> {
+        return createPlan(input.workflowId, "Feature works");
+      },
+      reviseTaskPlan: unusedTaskPlanRevision
     };
     const claudeCode: ClaudeCodeAdapter = {
       async reviewDesign(input): Promise<DesignReview> {
@@ -46,26 +51,8 @@ describe("runWorkflow", () => {
           findings: []
         };
       },
-      async createTaskPlan(input): Promise<TaskPlan> {
-        return {
-          workflowId: input.workflowId,
-          title: "Plan",
-          tasks: [
-            {
-              taskId: "TASK-001",
-              workflowId: input.workflowId,
-              title: "Implement feature",
-              description: "Implement the feature.",
-              type: "implementation",
-              dependencies: [],
-              dependencyCondition: "all_completed",
-              aoRole: "backend-senior",
-              acceptanceCriteria: ["Feature works"],
-              aoPrompt: "[WF-001 / TASK-001]\n任务名称：Implement feature\nAO 角色：backend-senior\n验收标准：\n1. Feature works\n上下文摘要：Follow the approved design.",
-              status: "pending"
-            }
-          ]
-        };
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return approveTaskPlan(input);
       }
     };
 
@@ -87,6 +74,12 @@ describe("runWorkflow", () => {
     await expect(readFile(join(root, "artifacts", "WF-001", "task-plan.json"), "utf8")).resolves.toContain(
       '"taskId": "TASK-001"'
     );
+    await expect(
+      readFile(join(root, "artifacts", "WF-001", "task-plan-review-1.json"), "utf8")
+    ).resolves.toContain('"reviewDecision": "approved"');
+    await expect(
+      readFile(join(root, "artifacts", "WF-001", "task-plan-reviews.json"), "utf8")
+    ).resolves.toContain('"planVersion": "task-plan-current"');
   });
 
   it("plans deferred implementation findings instead of blocking for human", async () => {
@@ -110,7 +103,12 @@ describe("runWorkflow", () => {
       },
       async reviseDesign() {
         throw new Error("should not revise deferred implementation findings");
-      }
+      },
+      async createTaskPlan(input): Promise<TaskPlan> {
+        expect(input.deferredFindings?.[0]?.id).toBe("DRF-ROLLBACK");
+        return createPlan(input.workflowId, "处理 DRF-ROLLBACK 遗留审查意见");
+      },
+      reviseTaskPlan: unusedTaskPlanRevision
     };
     const claudeCode: ClaudeCodeAdapter = {
       async reviewDesign(input): Promise<DesignReview> {
@@ -132,28 +130,8 @@ describe("runWorkflow", () => {
           ]
         };
       },
-      async createTaskPlan(input): Promise<TaskPlan> {
-        expect(input.deferredFindings?.[0]?.id).toBe("DRF-ROLLBACK");
-        return {
-          workflowId: input.workflowId,
-          title: "Plan",
-          tasks: [
-            {
-              taskId: "TASK-001",
-              workflowId: input.workflowId,
-              title: "Implement feature",
-              description: "Implement the feature and deferred review finding.",
-              type: "implementation",
-              dependencies: [],
-              dependencyCondition: "all_completed",
-              aoRole: "backend-senior",
-              acceptanceCriteria: ["处理 DRF-ROLLBACK 遗留审查意见"],
-              aoPrompt:
-                "[WF-DEFER / TASK-001]\n任务名称：Implement feature\nAO 角色：backend-senior\n验收标准：\n1. 处理 DRF-ROLLBACK 遗留审查意见\n上下文摘要：Follow the approved design.",
-              status: "pending"
-            }
-          ]
-        };
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return approveTaskPlan(input);
       }
     };
 
@@ -193,13 +171,17 @@ describe("runWorkflow", () => {
       },
       async reviseDesign() {
         return "# Feature revised";
-      }
+      },
+      async createTaskPlan(): Promise<TaskPlan> {
+        throw new Error("should not plan after failed review");
+      },
+      reviseTaskPlan: unusedTaskPlanRevision
     };
     const claudeCode: ClaudeCodeAdapter = {
       async reviewDesign(): Promise<DesignReview> {
         throw new StructuredOutputError("invalid review", "not json");
       },
-      async createTaskPlan(): Promise<TaskPlan> {
+      async reviewTaskPlan(): Promise<TaskPlanReview> {
         throw new Error("should not plan after failed review");
       }
     };
@@ -246,7 +228,11 @@ describe("runWorkflow", () => {
       async reviseDesign(input) {
         reviseDesignCalls += 1;
         return `${input.currentDesign}\n\n## 续跑更新\n${input.review.findings[0]?.title ?? ""}`;
-      }
+      },
+      async createTaskPlan(input): Promise<TaskPlan> {
+        return createPlan(input.workflowId, "Feature works");
+      },
+      reviseTaskPlan: unusedTaskPlanRevision
     };
     const claudeCode: ClaudeCodeAdapter = {
       async reviewDesign(input): Promise<DesignReview> {
@@ -260,27 +246,8 @@ describe("runWorkflow", () => {
           findings: []
         };
       },
-      async createTaskPlan(input): Promise<TaskPlan> {
-        return {
-          workflowId: input.workflowId,
-          title: "Plan",
-          tasks: [
-            {
-              taskId: "TASK-001",
-              workflowId: input.workflowId,
-              title: "Implement feature",
-              description: "Implement the feature.",
-              type: "implementation",
-              dependencies: [],
-              dependencyCondition: "all_completed",
-              aoRole: "backend-senior",
-              acceptanceCriteria: ["Feature works"],
-              aoPrompt:
-                "[WF-CONTINUE / TASK-001]\n任务名称：Implement feature\nAO 角色：backend-senior\n验收标准：\n1. Feature works\n上下文摘要：Follow the approved design.",
-              status: "pending"
-            }
-          ]
-        };
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return approveTaskPlan(input);
       }
     };
 
@@ -306,6 +273,84 @@ describe("runWorkflow", () => {
     await expect(readFile(join(artifactRoot, "WF-CONTINUE", "review-2.json"), "utf8")).resolves.toContain(
       '"round": 2'
     );
+  });
+
+  it("blocks without writing final task-plan when task-plan review rounds are exhausted", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ao-control-plane-workflow-"));
+    const requirementFile = join(root, "requirement.json");
+    await writeFile(
+      requirementFile,
+      JSON.stringify({
+        id: "WF-PLAN-BLOCKED",
+        title: "Feature",
+        source: "test",
+        description: "Build the feature.",
+        maxDesignReviewRounds: 1
+      }),
+      "utf8"
+    );
+
+    const codex: CodexAdapter = {
+      async createDesign() {
+        return "# Feature\n\n## 背景与问题定义\nBuild it.";
+      },
+      async reviseDesign() {
+        throw new Error("should not revise approved design");
+      },
+      async createTaskPlan(input): Promise<TaskPlan> {
+        return createPlan(input.workflowId, "Feature works");
+      },
+      reviseTaskPlan: unusedTaskPlanRevision
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      async reviewDesign(input): Promise<DesignReview> {
+        return {
+          workflowId: input.workflowId,
+          round: input.round,
+          designer: "codex",
+          reviewer: "claude-code",
+          designVersion: input.designVersion,
+          reviewDecision: "approved",
+          findings: []
+        };
+      },
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return {
+          workflowId: input.workflowId,
+          round: input.round,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: input.planVersion,
+          reviewDecision: "changes_requested",
+          findings: [
+            {
+              id: "TPF-001",
+              title: "任务计划仍需整改",
+              body: "任务计划缺少关键约束。",
+              severity: "blocking",
+              status: "unresolved"
+            }
+          ]
+        };
+      }
+    };
+
+    const result = await runWorkflow({
+      requirementFile,
+      artifactRoot: join(root, "artifacts"),
+      codex,
+      claudeCode
+    });
+
+    expect(result.workflow.status).toBe("blocked_for_human");
+    expect(result.taskPlanPath).toBeUndefined();
+    expect(result.taskPlanReviews).toHaveLength(1);
+    await expect(
+      readFile(join(root, "artifacts", "WF-PLAN-BLOCKED", "task-plan-draft.json"), "utf8")
+    ).resolves.toContain('"taskId": "TASK-001"');
+    await expect(
+      readFile(join(root, "artifacts", "WF-PLAN-BLOCKED", "task-plan.json"), "utf8")
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("persists stopped workflow status when the user aborts the run", async () => {
@@ -335,13 +380,17 @@ describe("runWorkflow", () => {
       },
       async reviseDesign() {
         throw new Error("should not revise stopped workflow");
-      }
+      },
+      async createTaskPlan(): Promise<TaskPlan> {
+        throw new Error("should not plan stopped workflow");
+      },
+      reviseTaskPlan: unusedTaskPlanRevision
     };
     const claudeCode: ClaudeCodeAdapter = {
       async reviewDesign(): Promise<DesignReview> {
         throw new Error("should not review stopped workflow");
       },
-      async createTaskPlan(): Promise<TaskPlan> {
+      async reviewTaskPlan(): Promise<TaskPlanReview> {
         throw new Error("should not plan stopped workflow");
       }
     };
@@ -361,3 +410,45 @@ describe("runWorkflow", () => {
     );
   });
 });
+
+function createPlan(workflowId: string, criterion: string): TaskPlan {
+  return {
+    workflowId,
+    title: "Plan",
+    tasks: [
+      {
+        taskId: "TASK-001",
+        workflowId,
+        title: "Implement feature",
+        description: "Implement the feature.",
+        type: "implementation",
+        dependencies: [],
+        dependencyCondition: "all_completed",
+        aoRole: "backend-senior",
+        acceptanceCriteria: [criterion],
+        aoPrompt: `[${workflowId} / TASK-001]\n任务名称：Implement feature\nAO 角色：backend-senior\n验收标准：\n1. ${criterion}\n上下文摘要：Follow the approved design.`,
+        status: "pending"
+      }
+    ]
+  };
+}
+
+function approveTaskPlan(input: {
+  workflowId: string;
+  round: number;
+  planVersion: string;
+}): TaskPlanReview {
+  return {
+    workflowId: input.workflowId,
+    round: input.round,
+    planner: "codex",
+    reviewer: "claude-code",
+    planVersion: input.planVersion,
+    reviewDecision: "approved",
+    findings: []
+  };
+}
+
+async function unusedTaskPlanRevision(): Promise<TaskPlan> {
+  throw new Error("should not revise approved task plan");
+}

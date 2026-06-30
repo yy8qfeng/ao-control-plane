@@ -6,10 +6,12 @@ import type { CodexAdapter } from "../adapters/codex.js";
 import type { DesignReview } from "../schemas/design-review.js";
 import { requirementInputSchema, buildRequirementFromInput } from "../schemas/requirement-input.js";
 import type { Requirement } from "../schemas/requirement.js";
+import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
 import { taskPlanSchema } from "../schemas/task-plan.js";
 import type { Workflow } from "../schemas/workflow.js";
 import { runDesignReviewLoop } from "./design-review-loop.js";
+import { runTaskPlanReviewLoop } from "./task-plan-review-loop.js";
 
 export interface RunWorkflowResult {
   workflow: Workflow;
@@ -17,8 +19,10 @@ export interface RunWorkflowResult {
   artifactDir: string;
   design?: string;
   reviews: DesignReview[];
+  taskPlanReviews: TaskPlanReview[];
   designPath?: string;
   reviewsPath: string;
+  taskPlanReviewsPath?: string;
   taskPlanPath?: string;
   plan?: TaskPlan;
 }
@@ -31,6 +35,10 @@ export type RunWorkflowEvent =
   | { type: "review_completed"; review: DesignReview; path: string }
   | { type: "revision_started"; round: number }
   | { type: "planning_started"; deferredFindings: DesignReview["findings"] }
+  | { type: "task_plan_generated"; round: number; planVersion: string; plan: TaskPlan; path: string }
+  | { type: "task_plan_review_started"; round: number; planVersion: string }
+  | { type: "task_plan_review_completed"; review: TaskPlanReview; path: string }
+  | { type: "task_plan_revision_started"; round: number }
   | { type: "planning_completed"; plan: TaskPlan; path: string }
   | { type: "workflow_completed"; result: RunWorkflowResult }
   | { type: "workflow_failed"; message: string };
@@ -60,6 +68,7 @@ export async function runWorkflow(input: {
   const existingState = await readExistingWorkflowState(artifactDir);
   const startingRound = existingState.reviews.length + 1;
   const reviews: DesignReview[] = [...existingState.reviews];
+  const taskPlanReviews: TaskPlanReview[] = [];
 
   await writeJson(join(artifactDir, "requirement.json"), requirement);
   await writeJson(join(artifactDir, "workflow.json"), workflow);
@@ -130,6 +139,7 @@ export async function runWorkflow(input: {
         artifactDir,
         design: reviewLoop.design,
         reviews,
+        taskPlanReviews,
         designPath: join(artifactDir, "design.md"),
         reviewsPath: join(artifactDir, "reviews.json")
       };
@@ -141,13 +151,62 @@ export async function runWorkflow(input: {
     await writeJson(join(artifactDir, "workflow.json"), workflow);
     await input.onEvent?.({ type: "planning_started", deferredFindings: reviewLoop.deferredFindings });
 
-    const plan = taskPlanSchema.parse(
-      await input.claudeCode.createTaskPlan({
-        workflowId: workflow.workflowId,
-        approvedDesign: reviewLoop.design,
-        deferredFindings: reviewLoop.deferredFindings
-      }, { signal: input.signal })
-    );
+    const planLoop = await runTaskPlanReviewLoop({
+      workflowId: workflow.workflowId,
+      approvedDesign: reviewLoop.design,
+      deferredFindings: reviewLoop.deferredFindings,
+      codex: input.codex,
+      claudeCode: input.claudeCode,
+      options: { maxTaskPlanReviewRounds: requirementInput.maxDesignReviewRounds },
+      signal: input.signal,
+      hooks: {
+        onPlan: async ({ round, planVersion, plan }) => {
+          const draftPath = join(artifactDir, "task-plan-draft.json");
+          await writeJson(draftPath, plan);
+          await input.onEvent?.({
+            type: "task_plan_generated",
+            round,
+            planVersion,
+            plan,
+            path: draftPath
+          });
+        },
+        onReviewStart: async ({ round, planVersion }) => {
+          await input.onEvent?.({ type: "task_plan_review_started", round, planVersion });
+        },
+        onReview: async ({ review }) => {
+          taskPlanReviews.push(review);
+          const reviewPath = join(artifactDir, `task-plan-review-${review.round}.json`);
+          await writeJson(reviewPath, review);
+          await writeJson(join(artifactDir, "task-plan-reviews.json"), taskPlanReviews);
+          await input.onEvent?.({ type: "task_plan_review_completed", review, path: reviewPath });
+        },
+        onRevisionStart: async ({ round }) => {
+          await input.onEvent?.({ type: "task_plan_revision_started", round });
+        }
+      }
+    });
+
+    if (!planLoop.approved) {
+      workflow.status = "blocked_for_human";
+      await writeJson(join(artifactDir, "workflow.json"), workflow);
+      const result = {
+        workflow,
+        requirement,
+        artifactDir,
+        design: reviewLoop.design,
+        reviews,
+        taskPlanReviews,
+        designPath: join(artifactDir, "design.md"),
+        reviewsPath: join(artifactDir, "reviews.json"),
+        taskPlanReviewsPath: join(artifactDir, "task-plan-reviews.json"),
+        plan: planLoop.plan
+      };
+      await input.onEvent?.({ type: "workflow_completed", result });
+      return result;
+    }
+
+    const plan = taskPlanSchema.parse(planLoop.plan);
 
     workflow.status = "executing";
     workflow.tasks = plan.tasks.map((task) => task.taskId);
@@ -162,8 +221,10 @@ export async function runWorkflow(input: {
       artifactDir,
       design: reviewLoop.design,
       reviews,
+      taskPlanReviews,
       designPath: join(artifactDir, "design.md"),
       reviewsPath: join(artifactDir, "reviews.json"),
+      taskPlanReviewsPath: join(artifactDir, "task-plan-reviews.json"),
       taskPlanPath,
       plan
     };

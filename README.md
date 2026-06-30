@@ -96,9 +96,9 @@ pnpm dev run-workflow examples/requirement.example.json --project-root C:\worksp
 }
 ```
 
-`id` 可省略，系统会自动生成；`maxDesignReviewRounds` 默认是 `3`。流程会调用 Codex 生成设计稿，调用 ClaudeCode 审查设计稿并输出结构化任务计划。生成文件会写入 `.ao-control-plane\<workflowId>`，包括当前设计稿 `design.md`、每轮 `review-*.json`、汇总 `reviews.json`、`workflow.json` 和最终 `task-plan.json`。
+`id` 可省略，系统会自动生成；`maxDesignReviewRounds` 默认是 `3`。流程会调用 Codex 生成设计稿，调用 ClaudeCode 审查设计稿；设计通过后由 Codex 生成结构化任务计划，再由 ClaudeCode 审查任务计划并要求 Codex 整改，直到通过或轮次用完。生成文件会写入 `.ao-control-plane\<workflowId>`，包括当前设计稿 `design.md`、每轮 `review-*.json`、汇总 `reviews.json`、`workflow.json`、任务计划草稿 `task-plan-draft.json`、每轮任务计划审查 `task-plan-review-*.json`、汇总 `task-plan-reviews.json` 和最终 `task-plan.json`。
 
-如果 ClaudeCode 审查输出不是合法 JSON，系统会先尝试自动修复；仍无法修复时，会把原始审查文本作为未解决意见纳入整改，避免设计审查流程因为格式问题直接中断。任务计划输出如果仍无法通过 schema 校验，会写入 `invalid-claude-output.txt` 和 `human-review-required.json`，需要人工复核后再继续。
+如果 ClaudeCode 设计审查输出不是合法 JSON，系统会先尝试自动修复；仍无法修复时，会把原始审查文本作为未解决意见纳入整改，避免设计审查流程因为格式问题直接中断。任务计划阶段由 Codex 输出 `task-plan` JSON，并由 ClaudeCode 输出结构化任务计划审查 JSON；最终仍无法通过 schema 校验时，会写入 `invalid-claude-output.txt` 和 `human-review-required.json`，需要人工复核后再继续。
 
 生成执行计划后，可以直接执行：
 
@@ -130,16 +130,16 @@ pnpm dev stop-service --port 4317
 
 网页控制台支持暂停补充：
 
-1. `生成需求设计并审查`：调用真实 Codex / ClaudeCode 流程，Codex 生成需求设计，ClaudeCode 审查，Codex 根据意见整改并重新审查，通过后生成结构化任务计划。
+1. `生成需求设计并审查`：调用真实 Codex / ClaudeCode 流程，Codex 生成需求设计和任务计划，ClaudeCode 分别审查，Codex 根据意见整改并重新审查，通过后输出最终结构化任务计划。
 2. `补充需求并重新审查`：在当前 workflow 中更新需求内容，重新生成设计并从第 1 轮开始计数，通过后重新生成任务计划。
-3. `生成任务计划`：保留分阶段流程入口，基于已通过的设计生成结构化任务计划。
+3. `生成任务计划`：保留分阶段流程入口，基于已通过的设计由 Codex 生成结构化任务计划。
 4. `预演执行`：按任务计划预演 AO 下发。
 
 点击“选择”可以从弹框选择项目目录。最近使用过的目录会记录在 `.ao-control-plane\project-config.json`，服务重启后默认选择上一次目录。如果选择项目目录，生成文件会落盘到该目录下的 `.ao-control-plane\<workflowId>`，AO 执行也会在该目录下运行。最大设计审查轮次为手填数字，默认值为 `3`。
 
 需求表单草稿也会保存在 `.ao-control-plane\project-config.json`。页面会自动保存当前表单，也可以点击“保存草稿”手动保存；“历史草稿”下拉框可以恢复不同需求的最后一次草稿。同一个 `workflowId` 只保留最后一次记录，不保存同一需求的每次变更。重新生成同一个历史需求时，会继续更新该需求绑定的 `.ao-control-plane\<workflowId>` 目录，不会重复创建新的需求目录；点击历史草稿旁边的“删除”会删除所选历史记录，并同步删除对应的 `.ao-control-plane\<workflowId>` 生成文件夹；点击“清空草稿”只清空当前回显草稿，不删除历史草稿和生成文件。
 
-如果设计审查未通过，系统会继续让 Codex 按 ClaudeCode 意见整改并复审，直到审查通过、达到可实施标准，或审查轮次用完。只有达到最大审查轮次后仍存在设计阶段未解决问题时，workflow 才会进入 `blocked_for_human`，此时不会生成 `task-plan.json`。如果 ClaudeCode 判断为 `defer_to_implementation`，系统会生成 `task-plan.json`，并把遗留审查意见带入实施任务、验收标准或 AO 提示约束中。
+如果设计审查未通过，系统会继续让 Codex 按 ClaudeCode 意见整改并复审，直到审查通过、达到可实施标准，或审查轮次用完。设计通过后，任务计划也会进入 Codex 生成、ClaudeCode 审查、Codex 整改的循环。只有达到最大审查轮次后仍存在设计阶段或任务计划阶段未解决问题时，workflow 才会进入 `blocked_for_human`；任务计划审查通过后才会输出最终 `task-plan.json`。如果 ClaudeCode 在设计阶段判断为 `defer_to_implementation`，系统会把遗留审查意见带入后续任务计划、验收标准或 AO 提示约束中。
 
 校验任务计划：
 

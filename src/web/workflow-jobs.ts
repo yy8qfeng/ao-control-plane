@@ -1,5 +1,6 @@
 import type { RunWorkflowEvent, RunWorkflowResult } from "../workflow/run-workflow.js";
 import type { DesignReview } from "../schemas/design-review.js";
+import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
 
 export interface WorkflowJobSnapshot {
@@ -12,6 +13,7 @@ export interface WorkflowJobSnapshot {
   logs: string[];
   design?: { content: string; path: string };
   reviews: DesignReview[];
+  taskPlanReviews: TaskPlanReview[];
   plan?: TaskPlan;
   result?: RunWorkflowResult;
   error?: string;
@@ -35,7 +37,8 @@ export class WorkflowJobStore {
       elapsedSeconds: 0,
       currentStep: "准备调用 Codex",
       logs: ["已创建治理流程任务，准备调用 Codex。"],
-      reviews: []
+      reviews: [],
+      taskPlanReviews: []
     };
     if (this.activeJobId) {
       const previous = this.jobs.get(this.activeJobId);
@@ -113,12 +116,30 @@ export class WorkflowJobStore {
         job.logs.push(`Codex 正在根据第 ${event.round} 轮审查意见整改设计稿。`);
         break;
       case "planning_started":
-        job.currentStep = "等待 ClaudeCode 生成任务计划";
+        job.currentStep = "等待 Codex 生成任务计划";
         if (event.deferredFindings.length > 0) {
-          job.logs.push("设计已达到可实施标准，部分问题将进入实施阶段处理。");
+          job.logs.push("设计已达到可实施标准，Codex 正在把实施阶段遗留问题纳入任务计划。");
         } else {
-          job.logs.push("设计审查已通过，正在生成任务计划。");
+          job.logs.push("设计审查已通过，Codex 正在生成任务计划。");
         }
+        break;
+      case "task_plan_generated":
+        job.plan = event.plan;
+        job.currentStep = `任务计划草稿第 ${event.round} 轮已生成`;
+        job.logs.push(`Codex 已生成任务计划草稿：${event.path}`);
+        break;
+      case "task_plan_review_started":
+        job.currentStep = `等待 ClaudeCode 审查任务计划第 ${event.round} 轮`;
+        job.logs.push(`ClaudeCode 正在审查任务计划第 ${event.round} 轮。`);
+        break;
+      case "task_plan_review_completed":
+        job.taskPlanReviews.push(event.review);
+        job.currentStep = `任务计划第 ${event.review.round} 轮审查已完成`;
+        job.logs.push(`ClaudeCode 任务计划第 ${event.review.round} 轮结论：${event.review.reviewDecision}。`);
+        break;
+      case "task_plan_revision_started":
+        job.currentStep = `等待 Codex 整改任务计划第 ${event.round} 轮意见`;
+        job.logs.push(`Codex 正在根据第 ${event.round} 轮任务计划审查意见整改。`);
         break;
       case "planning_completed":
         job.plan = event.plan;

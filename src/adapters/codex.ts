@@ -1,5 +1,8 @@
 import type { DesignReview } from "../schemas/design-review.js";
 import type { Requirement } from "../schemas/requirement.js";
+import type { TaskPlanReview } from "../schemas/task-plan-review.js";
+import type { TaskPlan } from "../schemas/task-plan.js";
+import { taskPlanSchema } from "../schemas/task-plan.js";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +14,14 @@ export interface CodexAdapter {
     input: { currentDesign: string; review: DesignReview },
     options?: { signal?: AbortSignal }
   ): Promise<string>;
+  createTaskPlan(
+    input: { workflowId: string; approvedDesign: string; deferredFindings?: DesignReview["findings"] },
+    options?: { signal?: AbortSignal }
+  ): Promise<TaskPlan>;
+  reviseTaskPlan(
+    input: { currentPlan: TaskPlan; review: TaskPlanReview; approvedDesign: string },
+    options?: { signal?: AbortSignal }
+  ): Promise<TaskPlan>;
 }
 
 export interface CodexCliAdapterOptions {
@@ -57,6 +68,83 @@ export class CodexCliAdapter implements CodexAdapter {
       "ClaudeCode 审查 JSON：",
       JSON.stringify(input.review, null, 2)
     ].join("\n"), options);
+  }
+
+  async createTaskPlan(
+    input: { workflowId: string; approvedDesign: string; deferredFindings?: DesignReview["findings"] },
+    options: { signal?: AbortSignal } = {}
+  ): Promise<TaskPlan> {
+    const deferredFindings = formatDeferredFindings(input.deferredFindings ?? []);
+    const rawOutput = await this.runCodex([
+      "你是需求治理层的 Codex 任务拆解负责人。请根据已批准设计稿输出 AO 执行层 task-plan。",
+      "",
+      "必须只输出一个 JSON 对象，不要使用 Markdown 代码块，不要输出解释文字，不要修改文件。",
+      "JSON 必须符合以下 TypeScript 形状：",
+      "{",
+      '  "workflowId": "string",',
+      '  "title": "string",',
+      '  "tasks": [{',
+      '    "taskId": "TASK-001",',
+      '    "workflowId": "string",',
+      '    "title": "string",',
+      '    "description": "string",',
+      '    "type": "design" | "implementation" | "test" | "refactor" | "review" | "docs" | "verification",',
+      '    "dependencies": ["TASK-001"],',
+      '    "dependencyCondition": "all_completed" | "any_completed" | "manual_gate",',
+      '    "aoRole": "architect" | "reviewer" | "ui-designer" | "frontend-senior" | "frontend-junior" | "backend-senior" | "backend-junior" | "qa" | "docs" | "second-opinion" | "frontend" | "backend",',
+      '    "acceptanceCriteria": ["string"],',
+      '    "aoPrompt": "string",',
+      '    "status": "pending"',
+      "  }]",
+      "}",
+      "",
+      "硬性规则：",
+      "- 任务只能指定 aoRole，禁止出现 agent、model、provider、codex、claudeCode 字段。",
+      "- aoPrompt 中禁止要求 AO worker 选择、切换或调用具体 agent 或 model。",
+      "- 每个 aoPrompt 必须包含 workflowId、taskId、任务名称、AO 角色、验收标准和上下文摘要。",
+      "- taskId 使用 TASK-001 递增。",
+      "- status 全部使用 pending。",
+      "- 如果存在实施阶段遗留审查意见，必须在任务、验收标准或 aoPrompt 约束中体现，不能丢失。",
+      "",
+      `workflowId: ${input.workflowId}`,
+      "",
+      "实施阶段遗留审查意见：",
+      deferredFindings,
+      "",
+      "已批准设计稿：",
+      input.approvedDesign
+    ].join("\n"), options);
+
+    return parseTaskPlanOutput(rawOutput, `Codex task plan JSON is invalid for workflow ${input.workflowId}`);
+  }
+
+  async reviseTaskPlan(
+    input: { currentPlan: TaskPlan; review: TaskPlanReview; approvedDesign: string },
+    options: { signal?: AbortSignal } = {}
+  ): Promise<TaskPlan> {
+    const rawOutput = await this.runCodex([
+      "你是需求治理层的 Codex 任务拆解负责人。请根据 ClaudeCode 的结构化审查意见整改 task-plan。",
+      "",
+      "必须只输出完整新版 task-plan JSON 对象，不要使用 Markdown 代码块，不要输出解释文字，不要修改文件。",
+      "",
+      "整改规则：",
+      "- 保留合理任务，并逐条修复 unresolved finding。",
+      "- 任务只能指定 aoRole，禁止出现 agent、model、provider、codex、claudeCode 字段。",
+      "- aoPrompt 中禁止要求 AO worker 选择、切换或调用具体 agent 或 model。",
+      "- 每个 aoPrompt 必须包含 workflowId、taskId、任务名称、AO 角色、验收标准和上下文摘要。",
+      "- status 全部使用 pending。",
+      "",
+      "当前 task-plan JSON：",
+      JSON.stringify(input.currentPlan, null, 2),
+      "",
+      "ClaudeCode 任务计划审查 JSON：",
+      JSON.stringify(input.review, null, 2),
+      "",
+      "已批准设计稿：",
+      input.approvedDesign
+    ].join("\n"), options);
+
+    return parseTaskPlanOutput(rawOutput, `Codex revised task plan JSON is invalid for workflow ${input.currentPlan.workflowId}`);
   }
 
   private async runCodex(prompt: string, options: { signal?: AbortSignal }): Promise<string> {
@@ -168,4 +256,129 @@ export class PlaceholderCodexAdapter implements CodexAdapter {
       "- 风险与替代方案：若审查仍不接受，进入下一轮审查或人工复核。"
     ].join("\n");
   }
+
+  async createTaskPlan(input: {
+    workflowId: string;
+    approvedDesign: string;
+    deferredFindings?: DesignReview["findings"];
+  }): Promise<TaskPlan> {
+    const deferredCriteria = (input.deferredFindings ?? []).map(
+      (finding) => `处理或明确遗留审查意见 ${finding.id}：${finding.title}`
+    );
+    return {
+      workflowId: input.workflowId,
+      title: "结构化执行计划",
+      tasks: [
+        {
+          taskId: "TASK-001",
+          workflowId: input.workflowId,
+          title: "根据已批准设计实现功能",
+          description: "根据最终设计稿完成代码、测试或文档变更。",
+          type: "implementation",
+          dependencies: [],
+          dependencyCondition: "all_completed",
+          aoRole: "backend-senior",
+          acceptanceCriteria: ["实现内容符合最终设计稿", "相关测试通过", ...deferredCriteria],
+          aoPrompt: [
+            `[${input.workflowId} / TASK-001]`,
+            "任务名称：根据已批准设计实现功能",
+            "AO 角色：backend-senior",
+            "验收标准：",
+            "1. 实现内容符合最终设计稿。",
+            "2. 相关测试通过。",
+            ...deferredCriteria.map((criterion, index) => `${index + 3}. ${criterion}。`),
+            "上下文摘要：",
+            summarizeDesignForAoPrompt(input.approvedDesign),
+            formatDeferredFindingsForAoPrompt(input.deferredFindings ?? [])
+          ].join("\n"),
+          status: "pending"
+        }
+      ]
+    };
+  }
+
+  async reviseTaskPlan(input: { currentPlan: TaskPlan; review: TaskPlanReview }): Promise<TaskPlan> {
+    const unresolved = input.review.findings.filter((finding) => finding.status === "unresolved");
+    if (unresolved.length === 0) {
+      return input.currentPlan;
+    }
+
+    return {
+      ...input.currentPlan,
+      tasks: input.currentPlan.tasks.map((task) => ({
+        ...task,
+        acceptanceCriteria: [
+          ...task.acceptanceCriteria,
+          ...unresolved.map((finding) => `已整改任务计划审查意见 ${finding.id}：${finding.title}`)
+        ],
+        aoPrompt: [
+          task.aoPrompt,
+          "",
+          "任务计划审查整改：",
+          ...unresolved.map((finding) => `- ${finding.id}：${finding.body}`)
+        ].join("\n")
+      }))
+    };
+  }
+}
+
+function parseTaskPlanOutput(rawOutput: string, errorMessage: string): TaskPlan {
+  const jsonText = extractJsonObject(rawOutput, errorMessage);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch (error) {
+    throw new Error(`${errorMessage}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  return taskPlanSchema.parse(parsed);
+}
+
+function extractJsonObject(rawOutput: string, errorMessage: string): string {
+  const trimmed = rawOutput.trim();
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    return trimmed;
+  }
+
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenced?.[1]) {
+    return fenced[1].trim();
+  }
+
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    return trimmed.slice(start, end + 1);
+  }
+
+  throw new Error(errorMessage);
+}
+
+function summarizeDesignForAoPrompt(design: string): string {
+  const title = design.split("\n").find((line) => line.startsWith("# "))?.replace(/^#\s+/, "").trim();
+  return title
+    ? `已批准设计：${title}。请参考已落盘最终设计稿完成实现。`
+    : "请参考已落盘最终设计稿完成实现。";
+}
+
+function formatDeferredFindings(findings: DesignReview["findings"]): string {
+  const unresolvedFindings = findings.filter((finding) => finding.status === "unresolved");
+  if (unresolvedFindings.length === 0) {
+    return "无。";
+  }
+
+  return unresolvedFindings
+    .map((finding) =>
+      [
+        `- ${finding.id}｜${finding.severity}｜${finding.title}`,
+        `  内容：${finding.body}`,
+        finding.rationale ? `  理由：${finding.rationale}` : undefined
+      ].filter(Boolean).join("\n")
+    )
+    .join("\n");
+}
+
+function formatDeferredFindingsForAoPrompt(findings: DesignReview["findings"]): string {
+  const formatted = formatDeferredFindings(findings);
+  return formatted === "无。" ? "" : `实施阶段遗留审查意见：\n${formatted}`;
 }
