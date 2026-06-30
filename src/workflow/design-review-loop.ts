@@ -5,6 +5,7 @@ import type { Requirement } from "../schemas/requirement.js";
 
 export interface DesignReviewLoopOptions {
   maxDesignReviewRounds: number;
+  startingRound?: number;
 }
 
 export interface DesignReviewLoopHooks {
@@ -20,6 +21,8 @@ export interface DesignReviewLoopResult {
   designVersion: string;
   reviews: DesignReview[];
   blockedForHuman: boolean;
+  finalReviewDecision?: DesignReview["reviewDecision"];
+  deferredFindings: DesignReview["findings"];
 }
 
 export async function runDesignReviewLoop(input: {
@@ -39,7 +42,10 @@ export async function runDesignReviewLoop(input: {
   const reviews: DesignReview[] = [];
   const designVersion = "design-current";
 
-  for (let round = 1; round <= input.options.maxDesignReviewRounds; round += 1) {
+  const startingRound = input.options.startingRound ?? 1;
+  const finalRound = startingRound + input.options.maxDesignReviewRounds - 1;
+
+  for (let round = startingRound; round <= finalRound; round += 1) {
     throwIfAborted(input.signal);
     await input.hooks?.onDesign?.({ designVersion, design });
     await input.hooks?.onReviewStart?.({ round, designVersion });
@@ -53,27 +59,22 @@ export async function runDesignReviewLoop(input: {
     reviews.push(review);
     await input.hooks?.onReview?.({ review });
 
-    if (review.reviewDecision === "approved") {
+    if (review.reviewDecision === "approved" || review.reviewDecision === "defer_to_implementation") {
       return {
         approved: true,
         design,
         designVersion,
         reviews,
-        blockedForHuman: false
+        blockedForHuman: false,
+        finalReviewDecision: review.reviewDecision,
+        deferredFindings:
+          review.reviewDecision === "defer_to_implementation"
+            ? review.findings.filter((finding) => finding.status === "unresolved")
+            : []
       };
     }
 
-    if (review.reviewDecision === "human_review_required") {
-      return {
-        approved: false,
-        design,
-        designVersion,
-        reviews,
-        blockedForHuman: true
-      };
-    }
-
-    if (round === input.options.maxDesignReviewRounds) {
+    if (round === finalRound) {
       break;
     }
 
@@ -89,7 +90,9 @@ export async function runDesignReviewLoop(input: {
     design,
     designVersion,
     reviews,
-    blockedForHuman: true
+    blockedForHuman: true,
+    finalReviewDecision: reviews.at(-1)?.reviewDecision,
+    deferredFindings: []
   };
 }
 

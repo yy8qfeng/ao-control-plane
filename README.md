@@ -139,7 +139,7 @@ pnpm dev stop-service --port 4317
 
 需求表单草稿也会保存在 `.ao-control-plane\project-config.json`。页面会自动保存当前表单，也可以点击“保存草稿”手动保存；“历史草稿”下拉框可以恢复不同需求的最后一次草稿。同一个 `workflowId` 只保留最后一次记录，不保存同一需求的每次变更。重新生成同一个历史需求时，会继续更新该需求绑定的 `.ao-control-plane\<workflowId>` 目录，不会重复创建新的需求目录；点击历史草稿旁边的“删除”会删除所选历史记录，并同步删除对应的 `.ao-control-plane\<workflowId>` 生成文件夹；点击“清空草稿”只清空当前回显草稿，不删除历史草稿和生成文件。
 
-如果设计审查未通过，workflow 会进入 `blocked_for_human`，此时不会生成 `task-plan.json`；只有设计通过并完成任务拆解后，才会写入可供 `execute-plan` 使用的 `task-plan.json`。
+如果设计审查未通过，系统会继续让 Codex 按 ClaudeCode 意见整改并复审，直到审查通过、达到可实施标准，或审查轮次用完。只有达到最大审查轮次后仍存在设计阶段未解决问题时，workflow 才会进入 `blocked_for_human`，此时不会生成 `task-plan.json`。如果 ClaudeCode 判断为 `defer_to_implementation`，系统会生成 `task-plan.json`，并把遗留审查意见带入实施任务、验收标准或 AO 提示约束中。
 
 校验任务计划：
 

@@ -30,7 +30,7 @@ export type RunWorkflowEvent =
   | { type: "review_started"; round: number; designVersion: string }
   | { type: "review_completed"; review: DesignReview; path: string }
   | { type: "revision_started"; round: number }
-  | { type: "planning_started" }
+  | { type: "planning_started"; deferredFindings: DesignReview["findings"] }
   | { type: "planning_completed"; plan: TaskPlan; path: string }
   | { type: "workflow_completed"; result: RunWorkflowResult }
   | { type: "workflow_failed"; message: string };
@@ -57,8 +57,9 @@ export async function runWorkflow(input: {
     maxDesignReviewRounds: requirementInput.maxDesignReviewRounds,
     tasks: []
   };
-  const reviews: DesignReview[] = [];
   const existingState = await readExistingWorkflowState(artifactDir);
+  const startingRound = existingState.reviews.length + 1;
+  const reviews: DesignReview[] = [...existingState.reviews];
 
   await writeJson(join(artifactDir, "requirement.json"), requirement);
   await writeJson(join(artifactDir, "workflow.json"), workflow);
@@ -80,7 +81,7 @@ export async function runWorkflow(input: {
       requirement,
       codex: input.codex,
       claudeCode: input.claudeCode,
-      options: { maxDesignReviewRounds: requirementInput.maxDesignReviewRounds },
+      options: { maxDesignReviewRounds: requirementInput.maxDesignReviewRounds, startingRound },
       signal: input.signal,
       initialDesign,
       hooks: {
@@ -117,7 +118,7 @@ export async function runWorkflow(input: {
       }
     });
 
-    workflow.designRounds = reviewLoop.reviews.length;
+    workflow.designRounds = reviews.length;
     workflow.approvedDesignVersion = reviewLoop.approved ? reviewLoop.designVersion : undefined;
 
     if (!reviewLoop.approved) {
@@ -138,12 +139,13 @@ export async function runWorkflow(input: {
 
     workflow.status = "planning";
     await writeJson(join(artifactDir, "workflow.json"), workflow);
-    await input.onEvent?.({ type: "planning_started" });
+    await input.onEvent?.({ type: "planning_started", deferredFindings: reviewLoop.deferredFindings });
 
     const plan = taskPlanSchema.parse(
       await input.claudeCode.createTaskPlan({
         workflowId: workflow.workflowId,
-        approvedDesign: reviewLoop.design
+        approvedDesign: reviewLoop.design,
+        deferredFindings: reviewLoop.deferredFindings
       }, { signal: input.signal })
     );
 
@@ -168,7 +170,7 @@ export async function runWorkflow(input: {
     await input.onEvent?.({ type: "workflow_completed", result });
     return result;
   } catch (error) {
-    workflow.status = "failed";
+    workflow.status = input.signal?.aborted ? "stopped" : "failed";
     await writeJson(join(artifactDir, "workflow.json"), workflow);
 
     if (error instanceof StructuredOutputError) {

@@ -89,6 +89,91 @@ describe("runWorkflow", () => {
     );
   });
 
+  it("plans deferred implementation findings instead of blocking for human", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ao-control-plane-workflow-"));
+    const requirementFile = join(root, "requirement.json");
+    await writeFile(
+      requirementFile,
+      JSON.stringify({
+        id: "WF-DEFER",
+        title: "Feature",
+        source: "test",
+        description: "Build the feature.",
+        maxDesignReviewRounds: 2
+      }),
+      "utf8"
+    );
+
+    const codex: CodexAdapter = {
+      async createDesign() {
+        return "# Feature\n\n## 背景与问题定义\nBuild it.";
+      },
+      async reviseDesign() {
+        throw new Error("should not revise deferred implementation findings");
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      async reviewDesign(input): Promise<DesignReview> {
+        return {
+          workflowId: input.workflowId,
+          round: input.round,
+          designer: "codex",
+          reviewer: "claude-code",
+          designVersion: input.designVersion,
+          reviewDecision: "defer_to_implementation",
+          findings: [
+            {
+              id: "DRF-ROLLBACK",
+              title: "补充回滚校验",
+              body: "实施阶段需要增加回滚校验任务。",
+              severity: "major",
+              status: "unresolved"
+            }
+          ]
+        };
+      },
+      async createTaskPlan(input): Promise<TaskPlan> {
+        expect(input.deferredFindings?.[0]?.id).toBe("DRF-ROLLBACK");
+        return {
+          workflowId: input.workflowId,
+          title: "Plan",
+          tasks: [
+            {
+              taskId: "TASK-001",
+              workflowId: input.workflowId,
+              title: "Implement feature",
+              description: "Implement the feature and deferred review finding.",
+              type: "implementation",
+              dependencies: [],
+              dependencyCondition: "all_completed",
+              aoRole: "backend-senior",
+              acceptanceCriteria: ["处理 DRF-ROLLBACK 遗留审查意见"],
+              aoPrompt:
+                "[WF-DEFER / TASK-001]\n任务名称：Implement feature\nAO 角色：backend-senior\n验收标准：\n1. 处理 DRF-ROLLBACK 遗留审查意见\n上下文摘要：Follow the approved design.",
+              status: "pending"
+            }
+          ]
+        };
+      }
+    };
+
+    const result = await runWorkflow({
+      requirementFile,
+      artifactRoot: join(root, "artifacts"),
+      codex,
+      claudeCode
+    });
+
+    expect(result.workflow.status).toBe("executing");
+    expect(result.taskPlanPath).toBe(join(root, "artifacts", "WF-DEFER", "task-plan.json"));
+    await expect(readFile(join(root, "artifacts", "WF-DEFER", "review-1.json"), "utf8")).resolves.toContain(
+      '"reviewDecision": "defer_to_implementation"'
+    );
+    await expect(readFile(join(root, "artifacts", "WF-DEFER", "task-plan.json"), "utf8")).resolves.toContain(
+      "DRF-ROLLBACK"
+    );
+  });
+
   it("fails and writes human review artifacts when ClaudeCode returns invalid structured output", async () => {
     const root = await mkdtemp(join(tmpdir(), "ao-control-plane-workflow-"));
     const requirementFile = join(root, "requirement.json");
@@ -136,7 +221,7 @@ describe("runWorkflow", () => {
     ).resolves.toContain("invalid review");
   });
 
-  it("continues an existing workflow by revising the current design instead of creating a new draft", async () => {
+  it("continues an existing workflow by revising the current design and appending review rounds", async () => {
     const root = await mkdtemp(join(tmpdir(), "ao-control-plane-workflow-"));
     const requirementFile = join(root, "requirement.json");
     await writeFile(
@@ -207,8 +292,72 @@ describe("runWorkflow", () => {
     expect(reviseDesignCalls).toBe(1);
     const artifactEntries = await readdir(join(artifactRoot, "WF-CONTINUE"));
     expect(artifactEntries.filter((entry) => /^design-v\d+\.md$/.test(entry))).toEqual([]);
+    expect(artifactEntries).toContain("review-1.json");
+    expect(artifactEntries).toContain("review-2.json");
+    await expect(readFile(join(artifactRoot, "WF-CONTINUE", "reviews.json"), "utf8")).resolves.toContain(
+      '"round": 2'
+    );
+    await expect(readFile(join(artifactRoot, "WF-CONTINUE", "workflow.json"), "utf8")).resolves.toContain(
+      '"designRounds": 2'
+    );
     await expect(readFile(join(artifactRoot, "WF-CONTINUE", "design.md"), "utf8")).resolves.toContain(
       "续跑更新"
+    );
+    await expect(readFile(join(artifactRoot, "WF-CONTINUE", "review-2.json"), "utf8")).resolves.toContain(
+      '"round": 2'
+    );
+  });
+
+  it("persists stopped workflow status when the user aborts the run", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ao-control-plane-workflow-"));
+    const requirementFile = join(root, "requirement.json");
+    await writeFile(
+      requirementFile,
+      JSON.stringify({
+        id: "WF-STOPPED",
+        title: "Feature",
+        source: "test",
+        description: "Build the feature.",
+        maxDesignReviewRounds: 2
+      }),
+      "utf8"
+    );
+
+    const controller = new AbortController();
+    const codex: CodexAdapter = {
+      async createDesign(_requirement, options) {
+        await new Promise((_resolve, reject) => {
+          options?.signal?.addEventListener("abort", () => reject(new Error("Workflow was stopped by user")), {
+            once: true
+          });
+        });
+        return "# never";
+      },
+      async reviseDesign() {
+        throw new Error("should not revise stopped workflow");
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      async reviewDesign(): Promise<DesignReview> {
+        throw new Error("should not review stopped workflow");
+      },
+      async createTaskPlan(): Promise<TaskPlan> {
+        throw new Error("should not plan stopped workflow");
+      }
+    };
+
+    const promise = runWorkflow({
+      requirementFile,
+      artifactRoot: join(root, "artifacts"),
+      codex,
+      claudeCode,
+      signal: controller.signal
+    });
+    controller.abort();
+
+    await expect(promise).rejects.toThrow("Workflow was stopped by user");
+    await expect(readFile(join(root, "artifacts", "WF-STOPPED", "workflow.json"), "utf8")).resolves.toContain(
+      '"status": "stopped"'
     );
   });
 });

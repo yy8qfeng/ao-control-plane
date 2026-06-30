@@ -114,7 +114,11 @@ export class WorkflowJobStore {
         break;
       case "planning_started":
         job.currentStep = "等待 ClaudeCode 生成任务计划";
-        job.logs.push("设计已通过，ClaudeCode 正在生成结构化任务计划。");
+        if (event.deferredFindings.length > 0) {
+          job.logs.push("设计已达到可实施标准，部分问题将进入实施阶段处理。");
+        } else {
+          job.logs.push("设计审查已通过，正在生成任务计划。");
+        }
         break;
       case "planning_completed":
         job.plan = event.plan;
@@ -123,10 +127,15 @@ export class WorkflowJobStore {
         break;
       case "workflow_completed":
         job.status = "completed";
-        job.currentStep = "流程已完成";
+        job.currentStep =
+          event.result.workflow.status === "blocked_for_human" ? "等待人工补充" : "后台任务已结束";
         job.result = event.result;
         job.plan = event.result.plan;
-        job.logs.push(`流程已完成，状态：${event.result.workflow.status}。`);
+        if (event.result.workflow.status === "blocked_for_human") {
+          job.logs.push("审查轮次已用完，仍存在设计阶段未解决问题，等待人工补充或提高轮次后继续。");
+        } else {
+          job.logs.push(`后台任务已结束，状态：${event.result.workflow.status}。`);
+        }
         break;
       case "workflow_failed":
         job.status = "failed";

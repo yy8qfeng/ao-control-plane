@@ -23,7 +23,7 @@ export interface ClaudeCodeAdapter {
     design: string;
   }, options?: { signal?: AbortSignal }): Promise<DesignReview>;
   createTaskPlan(
-    input: { workflowId: string; approvedDesign: string },
+    input: { workflowId: string; approvedDesign: string; deferredFindings?: DesignReview["findings"] },
     options?: { signal?: AbortSignal }
   ): Promise<TaskPlan>;
 }
@@ -56,7 +56,7 @@ export class ClaudeCodeCliAdapter implements ClaudeCodeAdapter {
       '  "designer": "codex",',
       '  "reviewer": "claude-code",',
       '  "designVersion": "string",',
-      '  "reviewDecision": "approved" | "changes_requested" | "human_review_required",',
+      '  "reviewDecision": "approved" | "changes_requested" | "defer_to_implementation",',
       '  "findings": [{',
       '    "id": "DRF-001",',
       '    "title": "string",',
@@ -69,9 +69,11 @@ export class ClaudeCodeCliAdapter implements ClaudeCodeAdapter {
       "",
       "审查规则：",
       "- 如果设计缺少关键章节、风险、验收或可实施性信息，输出 changes_requested。",
-      "- 如果存在无法自动判断的问题，输出 human_review_required。",
+      "- 如果设计整体可实施，但仍有适合在实施阶段解决的问题，输出 defer_to_implementation。",
+      "- 只能输出上面列出的三种 reviewDecision；人工介入由系统根据轮次控制。",
       "- approved 时不得包含 unresolved finding。",
-      "- 非 approved 且存在 findings 时，至少一个 finding 必须是 unresolved。",
+      "- changes_requested 时至少包含一个 unresolved finding。",
+      "- defer_to_implementation 时可以包含 unresolved finding，但 finding 必须描述应进入实施阶段处理的问题。",
       "",
       `workflowId: ${input.workflowId}`,
       `round: ${input.round}`,
@@ -95,8 +97,9 @@ export class ClaudeCodeCliAdapter implements ClaudeCodeAdapter {
             "修复规则：",
             "- 不要重新审查设计稿，只把上一条审查结论和 findings 转换为合法 JSON。",
             "- 如果上一条输出表达仍需整改，reviewDecision 必须是 changes_requested。",
-            "- 如果上一条输出表达需要人工判断，reviewDecision 必须是 human_review_required。",
-            "- 非 approved 且存在 findings 时，至少一个 finding.status 必须是 unresolved。",
+            "- 如果上一条输出表达设计已可实施但仍有实施阶段遗留项，reviewDecision 必须是 defer_to_implementation。",
+            "- 只能输出上面列出的三种 reviewDecision；如上一条输出表达需要人工判断，请转换为 changes_requested。",
+            "- changes_requested 时至少包含一个 finding.status 为 unresolved 的 finding。",
             "- approved 时 findings 中不得包含 unresolved。",
             "- 缺少字段时，使用下面提供的 workflowId、round、designVersion 补齐。",
             "",
@@ -107,7 +110,7 @@ export class ClaudeCodeCliAdapter implements ClaudeCodeAdapter {
             '  "designer": "codex",',
             '  "reviewer": "claude-code",',
             '  "designVersion": "string",',
-            '  "reviewDecision": "approved" | "changes_requested" | "human_review_required",',
+            '  "reviewDecision": "approved" | "changes_requested" | "defer_to_implementation",',
             '  "findings": [{',
             '    "id": "DRF-001",',
             '    "title": "string",',
@@ -136,9 +139,10 @@ export class ClaudeCodeCliAdapter implements ClaudeCodeAdapter {
   }
 
   async createTaskPlan(
-    input: { workflowId: string; approvedDesign: string },
+    input: { workflowId: string; approvedDesign: string; deferredFindings?: DesignReview["findings"] },
     options: { signal?: AbortSignal } = {}
   ): Promise<TaskPlan> {
+    const deferredFindings = formatDeferredFindings(input.deferredFindings ?? []);
     const rawOutput = await this.runClaude([
       "你是需求治理层的 ClaudeCode 任务拆解员。请根据已批准设计稿输出 AO 执行层 task-plan。",
       "",
@@ -168,8 +172,12 @@ export class ClaudeCodeCliAdapter implements ClaudeCodeAdapter {
       "- 每个 aoPrompt 必须包含 workflowId、taskId、任务名称、AO 角色、验收标准和上下文摘要。",
       "- taskId 使用 TASK-001 递增。",
       "- status 全部使用 pending。",
+      "- 如果存在实施阶段遗留审查意见，必须在任务、验收标准或 aoPrompt 约束中体现，不能丢失。",
       "",
       `workflowId: ${input.workflowId}`,
+      "",
+      "实施阶段遗留审查意见：",
+      deferredFindings,
       "",
       "已批准设计稿：",
       input.approvedDesign
@@ -192,6 +200,7 @@ export class ClaudeCodeCliAdapter implements ClaudeCodeAdapter {
           "- 每个 aoPrompt 必须包含 workflowId、taskId、任务名称、AO 角色、验收标准和上下文摘要。",
           "- taskId 使用 TASK-001 递增。",
           "- status 全部使用 pending。",
+          "- 如果上一条输入包含实施阶段遗留审查意见，必须在任务、验收标准或 aoPrompt 约束中体现。",
           "",
           "JSON 必须符合以下 TypeScript 形状：",
           "{",
@@ -307,7 +316,11 @@ export class PlaceholderClaudeCodeAdapter implements ClaudeCodeAdapter {
   async createTaskPlan(input: {
     workflowId: string;
     approvedDesign: string;
+    deferredFindings?: DesignReview["findings"];
   }): Promise<TaskPlan> {
+    const deferredCriteria = (input.deferredFindings ?? []).map(
+      (finding) => `处理或明确遗留审查意见 ${finding.id}：${finding.title}`
+    );
     return {
       workflowId: input.workflowId,
       title: "结构化执行计划",
@@ -321,7 +334,7 @@ export class PlaceholderClaudeCodeAdapter implements ClaudeCodeAdapter {
           dependencies: [],
           dependencyCondition: "all_completed",
           aoRole: "backend-senior",
-          acceptanceCriteria: ["实现内容符合最终设计稿", "相关测试通过"],
+          acceptanceCriteria: ["实现内容符合最终设计稿", "相关测试通过", ...deferredCriteria],
           aoPrompt: [
             `[${input.workflowId} / TASK-001]`,
             "任务名称：根据已批准设计实现功能",
@@ -329,8 +342,10 @@ export class PlaceholderClaudeCodeAdapter implements ClaudeCodeAdapter {
             "验收标准：",
             "1. 实现内容符合最终设计稿。",
             "2. 相关测试通过。",
+            ...deferredCriteria.map((criterion, index) => `${index + 3}. ${criterion}。`),
             "上下文摘要：",
-            summarizeDesignForAoPrompt(input.approvedDesign)
+            summarizeDesignForAoPrompt(input.approvedDesign),
+            formatDeferredFindingsForAoPrompt(input.deferredFindings ?? [])
           ].join("\n"),
           status: "pending"
         }
@@ -344,6 +359,28 @@ function summarizeDesignForAoPrompt(design: string): string {
   return title
     ? `已批准设计：${title}。请参考已落盘最终设计稿完成实现。`
     : "请参考已落盘最终设计稿完成实现。";
+}
+
+function formatDeferredFindings(findings: DesignReview["findings"]): string {
+  const unresolvedFindings = findings.filter((finding) => finding.status === "unresolved");
+  if (unresolvedFindings.length === 0) {
+    return "无。";
+  }
+
+  return unresolvedFindings
+    .map((finding) =>
+      [
+        `- ${finding.id}｜${finding.severity}｜${finding.title}`,
+        `  内容：${finding.body}`,
+        finding.rationale ? `  理由：${finding.rationale}` : undefined
+      ].filter(Boolean).join("\n")
+    )
+    .join("\n");
+}
+
+function formatDeferredFindingsForAoPrompt(findings: DesignReview["findings"]): string {
+  const formatted = formatDeferredFindings(findings);
+  return formatted === "无。" ? "" : `实施阶段遗留审查意见：\n${formatted}`;
 }
 
 export function parseStructuredOutput<T>(

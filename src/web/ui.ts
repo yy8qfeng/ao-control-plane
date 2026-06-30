@@ -462,7 +462,7 @@ export function renderIndexHtml(): string {
       await runStep(
         "/api/governance/run",
         "正在执行完整治理流程：Codex 生成设计、ClaudeCode 审查、Codex 整改，并生成任务计划...",
-        "完整治理流程已完成。若补充需求后重新审查，审查轮次会从 1 开始。",
+        "后台任务已结束。若补充需求后重新审查，审查轮次会从 1 开始。",
         "logs"
       );
     });
@@ -611,7 +611,7 @@ export function renderIndexHtml(): string {
       if (document.hidden) {
         stopPollingTimers();
       } else {
-        startPollingJob(state.job.jobId, "完整治理流程已完成。若补充需求后重新审查，审查轮次会从 1 开始。");
+        startPollingJob(state.job.jobId, "后台任务已结束。若补充需求后重新审查，审查轮次会从 1 开始。");
       }
     });
 
@@ -693,7 +693,7 @@ export function renderIndexHtml(): string {
         if (job.status === "completed" || job.status === "failed") {
           stopPollingTimers();
           setBusy(false);
-          setStatus(job.status === "completed" ? "ok" : "bad", job.status === "completed" ? successMessage : job.error || "流程失败。");
+          setStatus(job.status === "completed" ? "ok" : "bad", job.status === "completed" ? getCompletedJobMessage(job, successMessage) : job.error || "流程失败。");
         }
         if (job.status === "stopped") {
           stopPollingTimers();
@@ -705,6 +705,21 @@ export function renderIndexHtml(): string {
         setBusy(false);
         setStatus("bad", error.message || String(error));
       }
+    }
+
+    function getCompletedJobMessage(job, fallbackMessage) {
+      if (job.result?.workflow?.status === "blocked_for_human") {
+        return "审查轮次已用完，仍存在设计阶段未解决问题，等待人工补充或提高轮次后继续。";
+      }
+      const reviews = job.result?.reviews || job.reviews || [];
+      const finalReview = reviews[reviews.length - 1];
+      if (finalReview?.reviewDecision === "defer_to_implementation") {
+        return "设计已达到可实施标准，部分问题将进入实施阶段处理。";
+      }
+      if (job.result?.plan) {
+        return fallbackMessage;
+      }
+      return "后台任务已结束。";
     }
 
     async function loadProjects() {

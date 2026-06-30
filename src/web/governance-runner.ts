@@ -70,7 +70,8 @@ export async function createTaskPlanStage(input: {
 
   const plan = await new PlaceholderClaudeCodeAdapter().createTaskPlan({
     workflowId: artifacts.workflow.workflowId,
-    approvedDesign: artifacts.design
+    approvedDesign: artifacts.design,
+    deferredFindings: collectDeferredFindings(artifacts.reviews)
   });
   const nextArtifacts: GovernanceArtifacts = {
     ...artifacts,
@@ -83,6 +84,13 @@ export async function createTaskPlanStage(input: {
   };
   const artifactDir = await input.store.saveWorkflow(nextArtifacts);
   return { ...nextArtifacts, artifactDir };
+}
+
+function collectDeferredFindings(reviews: DesignReview[]): DesignReview["findings"] {
+  const finalReview = reviews.at(-1);
+  return finalReview?.reviewDecision === "defer_to_implementation"
+    ? finalReview.findings.filter((finding) => finding.status === "unresolved")
+    : [];
 }
 
 export async function runGovernanceWorkflow(input: {

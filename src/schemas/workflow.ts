@@ -10,6 +10,7 @@ export const workflowStatusSchema = z.enum([
   "executing",
   "blocked_for_human",
   "completed",
+  "stopped",
   "failed"
 ]);
 

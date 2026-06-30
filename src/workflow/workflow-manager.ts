@@ -53,7 +53,8 @@ export async function runPlanningWorkflow(input: {
   const plan = taskPlanSchema.parse(
     await input.claudeCode.createTaskPlan({
       workflowId: workflow.workflowId,
-      approvedDesign: reviewLoop.design
+      approvedDesign: reviewLoop.design,
+      deferredFindings: reviewLoop.deferredFindings
     })
   );
 

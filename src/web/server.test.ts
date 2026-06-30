@@ -7,6 +7,7 @@ import type { CodexAdapter } from "../adapters/codex.js";
 import type { DesignReview } from "../schemas/design-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
 import { startWebServer } from "./server.js";
+import { renderIndexHtml } from "./ui.js";
 
 let tempDir: string | undefined;
 let server: Awaited<ReturnType<typeof startWebServer>> | undefined;
@@ -544,6 +545,12 @@ describe("web server", () => {
         artifactRoot: tempDir
       })
     ).rejects.toThrow("Refusing to bind the web console to a public host");
+  });
+
+  it("renders a deferred implementation completion message in the web UI", () => {
+    const html = renderIndexHtml();
+
+    expect(html).toContain("设计已达到可实施标准，部分问题将进入实施阶段处理。");
   });
 });
 

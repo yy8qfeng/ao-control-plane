@@ -11,7 +11,7 @@ export const reviewFindingStatusSchema = z.enum(["addressed", "accepted_as_is", 
 export const designReviewDecisionSchema = z.enum([
   "approved",
   "changes_requested",
-  "human_review_required"
+  "defer_to_implementation"
 ]);
 
 export const designReviewFindingSchema = z.object({
@@ -44,11 +44,19 @@ export const designReviewSchema = z
       });
     }
 
-    if (review.reviewDecision !== "approved" && !hasUnresolvedFinding && review.findings.length > 0) {
+    if (review.reviewDecision === "changes_requested" && !hasUnresolvedFinding) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["reviewDecision"],
-        message: "non-approved reviews with findings must leave at least one finding unresolved"
+        message: "changes_requested reviews must leave at least one finding unresolved"
+      });
+    }
+
+    if (review.reviewDecision === "defer_to_implementation" && !hasUnresolvedFinding) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["reviewDecision"],
+        message: "defer_to_implementation reviews must leave at least one finding unresolved"
       });
     }
   });
