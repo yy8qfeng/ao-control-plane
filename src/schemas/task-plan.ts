@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { aoRoleSchema } from "./ao-role.js";
-import { executionPolicySchema } from "./execution-policy.js";
+import { executionPolicySchema, getExecutionPolicyForTaskType } from "./execution-policy.js";
 
 const forbiddenExecutionFields = ["agent", "model", "provider", "codex", "claudeCode"] as const;
 const agentSelectionPromptPatterns = [
@@ -43,7 +43,7 @@ export const executionTaskSchema = z
     acceptanceCriteria: z.array(z.string().min(1)).min(1),
     aoPrompt: z.string().min(1),
     status: taskStatusSchema.default("pending"),
-    executionPolicy: executionPolicySchema,
+    executionPolicy: executionPolicySchema.optional(),
     aoSessionId: z.string().min(1).optional()
   })
   .passthrough()
@@ -92,7 +92,31 @@ export const executionTaskSchema = z
         message: "Tasks with aoSessionId must be working or completed"
       });
     }
-  });
+
+    if ((task.type === "implementation" || task.type === "refactor") && task.executionPolicy) {
+      const weakenedFields = [
+        !task.executionPolicy.developerSelfTestRequired ? "developerSelfTestRequired" : undefined,
+        !task.executionPolicy.qaRequired ? "qaRequired" : undefined,
+        !task.executionPolicy.regressionRequired ? "regressionRequired" : undefined,
+        !task.executionPolicy.reviewerRequired ? "reviewerRequired" : undefined,
+        task.executionPolicy.maxQaRounds < 3 ? "maxQaRounds" : undefined,
+        task.executionPolicy.maxReviewRounds < 3 ? "maxReviewRounds" : undefined,
+        !task.executionPolicy.requirePrOrRp ? "requirePrOrRp" : undefined
+      ].filter((field): field is string => Boolean(field));
+
+      if (weakenedFields.length > 0) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["executionPolicy"],
+          message: `Implementation and refactor tasks must keep full execution policy; weakened fields: ${weakenedFields.join(", ")}`
+        });
+      }
+    }
+  })
+  .transform((task) => ({
+    ...task,
+    executionPolicy: task.executionPolicy ?? getExecutionPolicyForTaskType(task.type)
+  }));
 
 export const taskPlanSchema = z
   .object({

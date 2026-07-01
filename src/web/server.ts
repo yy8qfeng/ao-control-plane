@@ -15,6 +15,7 @@ import { renderIndexHtml } from "./ui.js";
 import {
   createTaskPlanStage,
   runDesignReviewStage,
+  type TaskPlanStageEvent,
   type GovernanceRequest
 } from "./governance-runner.js";
 import { buildRequirementDescription } from "./request-formatting.js";
@@ -192,8 +193,9 @@ async function routeRequest(input: {
     void createTaskPlanStage({
         workflowId: body.workflowId,
         store: createRequestStore(body, input.defaultArtifactRoot),
-        codex: input.createCodexAdapter?.(resolveProjectRoot(body, input.aoProjectRoot)),
-        claudeCode: input.createClaudeCodeAdapter?.(resolveProjectRoot(body, input.aoProjectRoot)),
+        codex: createCodexAdapterForRequest(input.createCodexAdapter, body, input.aoProjectRoot),
+        claudeCode: createClaudeCodeAdapterForRequest(input.createClaudeCodeAdapter, body, input.aoProjectRoot),
+        onEvent: (event) => recordTaskPlanStageEvent(input.workflowJobs, job.snapshot.jobId, event),
         signal: job.controller.signal
       }).then((result) => {
         input.workflowJobs.recordLog(job.snapshot.jobId, {
@@ -305,6 +307,60 @@ function createRequestStore(
   defaultArtifactRoot: string
 ): ArtifactStore {
   return new ArtifactStore(resolveArtifactRoot(request, defaultArtifactRoot));
+}
+
+function recordTaskPlanStageEvent(
+  workflowJobs: WorkflowJobStore,
+  jobId: string,
+  event: TaskPlanStageEvent
+): void {
+  switch (event.type) {
+    case "planning_started":
+      workflowJobs.recordLog(jobId, {
+        currentStep: `等待 Codex 生成任务计划第 ${event.startingRound} 轮`,
+        message:
+          event.deferredFindings.length > 0
+            ? `Codex 正在生成任务计划第 ${event.startingRound} 轮，并纳入 ${event.deferredFindings.length} 条实施阶段遗留问题。`
+            : `Codex 正在生成任务计划第 ${event.startingRound} 轮。`
+      });
+      break;
+    case "task_plan_generated":
+      workflowJobs.recordLog(jobId, {
+        currentStep: `任务计划草稿第 ${event.round} 轮已生成`,
+        message: `Codex 已生成任务计划草稿第 ${event.round} 轮，共 ${event.plan.tasks.length} 个任务。`
+      });
+      break;
+    case "task_plan_review_started":
+      workflowJobs.recordLog(jobId, {
+        currentStep: `等待 ClaudeCode 审查任务计划第 ${event.round} 轮`,
+        message: `ClaudeCode 正在审查任务计划第 ${event.round} 轮。`
+      });
+      break;
+    case "task_plan_review_completed":
+      workflowJobs.recordLog(jobId, {
+        currentStep: `任务计划第 ${event.review.round} 轮审查已完成`,
+        message: `ClaudeCode 任务计划第 ${event.review.round} 轮结论：${event.review.reviewDecision}。`
+      });
+      break;
+    case "task_plan_local_gate_started":
+      workflowJobs.recordLog(jobId, {
+        currentStep: `本地门禁校验任务计划第 ${event.round} 轮`,
+        message: `本地任务计划门禁正在校验第 ${event.round} 轮 approved 结论。`
+      });
+      break;
+    case "task_plan_local_gate_failed":
+      workflowJobs.recordLog(jobId, {
+        currentStep: `任务计划第 ${event.review.round} 轮本地门禁未通过`,
+        message: `本地任务计划门禁发现 ${event.review.findings.length} 个阻断项，已转入整改。`
+      });
+      break;
+    case "task_plan_revision_started":
+      workflowJobs.recordLog(jobId, {
+        currentStep: `等待 Codex 整改任务计划第 ${event.round} 轮意见`,
+        message: `Codex 正在根据第 ${event.round} 轮任务计划审查意见整改。`
+      });
+      break;
+  }
 }
 
 function resolveArtifactRoot(request: ProjectScopedRequest, defaultArtifactRoot: string): string {
@@ -472,6 +528,24 @@ function resolveProjectRoot(
 ): string | undefined {
   const projectRoot = request.projectRoot?.trim();
   return projectRoot ? resolve(projectRoot) : fallbackProjectRoot;
+}
+
+function createCodexAdapterForRequest(
+  factory: ((projectRoot?: string) => CodexAdapter) | undefined,
+  request: ProjectScopedRequest,
+  fallbackProjectRoot: string | undefined
+): CodexAdapter {
+  const projectRoot = resolveProjectRoot(request, fallbackProjectRoot);
+  return factory?.(projectRoot) ?? new CodexCliAdapter({ projectRoot });
+}
+
+function createClaudeCodeAdapterForRequest(
+  factory: ((projectRoot?: string) => ClaudeCodeAdapter) | undefined,
+  request: ProjectScopedRequest,
+  fallbackProjectRoot: string | undefined
+): ClaudeCodeAdapter {
+  const projectRoot = resolveProjectRoot(request, fallbackProjectRoot);
+  return factory?.(projectRoot) ?? new ClaudeCodeCliAdapter({ projectRoot });
 }
 
 async function rememberProjectRootIfPresent(

@@ -32,7 +32,9 @@ describe("web server", () => {
     await mkdir(projectRoot);
     server = await startWebServer({
       port: 0,
-      artifactRoot: tempDir
+      artifactRoot: tempDir,
+      createCodexAdapter: () => fakeCodex,
+      createClaudeCodeAdapter: () => fakeClaudeCode
     });
 
     const projectsResponse = await fetch(`${server.url}/api/projects`);
@@ -102,7 +104,16 @@ describe("web server", () => {
     expect(planResponse.status).toBe(202);
     expect(planJob.status).toBe("running");
     expect(planJob.logs[0]).toContain("任务计划续审任务");
-    const planned = await waitForJob(server.url, planJob.jobId);
+    const plannedJob = await waitForCompletedJob(server.url, planJob.jobId);
+    expect(plannedJob.logs).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("Codex 正在生成任务计划第 1 轮。"),
+        expect.stringContaining("Codex 已生成任务计划草稿第 1 轮"),
+        expect.stringContaining("ClaudeCode 正在审查任务计划第 1 轮。"),
+        expect.stringContaining("ClaudeCode 任务计划第 1 轮结论：approved。")
+      ])
+    );
+    const planned = plannedJob.result;
     expect(planned.workflow.status).toBe("executing");
     expect(planned.plan.tasks).toHaveLength(1);
     await expect(
@@ -345,6 +356,110 @@ describe("web server", () => {
     await expect(
       readFile(join(projectRoot, ".ao-control-plane", "WF-PLAN-STOP", "task-plan.json"), "utf8")
     ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("uses injected adapters for standalone task-plan review jobs", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    const projectRoot = join(tempDir, "project");
+    await mkdir(projectRoot);
+    let codexProjectRoot: string | undefined;
+    let claudeProjectRoot: string | undefined;
+    const planCodex: CodexAdapter = {
+      createDesign: fakeCodex.createDesign,
+      reviseDesign: fakeCodex.reviseDesign,
+      async createTaskPlan(input) {
+        return createWebPlan(input.workflowId);
+      },
+      reviseTaskPlan: fakeCodex.reviseTaskPlan
+    };
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir,
+      createCodexAdapter: (receivedProjectRoot) => {
+        codexProjectRoot = receivedProjectRoot;
+        return planCodex;
+      },
+      createClaudeCodeAdapter: (receivedProjectRoot) => {
+        claudeProjectRoot = receivedProjectRoot;
+        return fakeClaudeCode;
+      }
+    });
+    await seedReadyForPlanningWorkflow(projectRoot, "WF-PLAN-REAL-ADAPTERS");
+
+    const planResponse = await fetch(`${server.url}/api/governance/plan`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectRoot,
+        workflowId: "WF-PLAN-REAL-ADAPTERS"
+      })
+    });
+    const started = (await planResponse.json()) as { jobId: string; status: string };
+    expect(planResponse.status).toBe(202);
+    expect(started.status).toBe("running");
+
+    const planned = await waitForJob(server.url, started.jobId);
+    expect(planned.plan.tasks[0]).toMatchObject({
+      taskId: "TASK-001",
+      title: "Implement permissions"
+    });
+    expect(codexProjectRoot).toBe(projectRoot);
+    expect(claudeProjectRoot).toBe(projectRoot);
+  });
+
+  it("logs standalone task-plan review jobs from the next existing review round", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    const projectRoot = join(tempDir, "project");
+    const workflowId = "WF-PLAN-ROUND-2";
+    await mkdir(projectRoot);
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir,
+      createCodexAdapter: () => fakeCodex,
+      createClaudeCodeAdapter: () => fakeClaudeCode
+    });
+    await seedReadyForPlanningWorkflow(projectRoot, workflowId);
+    await writeJson(join(projectRoot, ".ao-control-plane", workflowId, "task-plan-reviews.json"), [
+      {
+        workflowId,
+        round: 1,
+        planner: "codex",
+        reviewer: "claude-code",
+        planVersion: "task-plan-current",
+        reviewDecision: "approved",
+        findings: [
+          {
+            id: "TPF-001",
+            title: "已处理的历史意见",
+            body: "历史意见已处理，不应阻塞续审。",
+            severity: "observation",
+            status: "addressed"
+          }
+        ]
+      }
+    ]);
+
+    const planResponse = await fetch(`${server.url}/api/governance/plan`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectRoot,
+        workflowId
+      })
+    });
+    const started = (await planResponse.json()) as { jobId: string; status: string };
+    expect(planResponse.status).toBe(202);
+    expect(started.status).toBe("running");
+
+    const plannedJob = await waitForCompletedJob(server.url, started.jobId, 2);
+    expect(plannedJob.logs).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("Codex 正在生成任务计划第 2 轮。"),
+        expect.stringContaining("ClaudeCode 正在审查任务计划第 2 轮。"),
+        expect.stringContaining("ClaudeCode 任务计划第 2 轮结论：approved。")
+      ])
+    );
+    expect(plannedJob.result.workflow.status).toBe("executing");
   });
 
   it("persists and clears requirement draft form data", async () => {
@@ -761,6 +876,11 @@ const fakeCodex: CodexAdapter = {
 };
 
 async function waitForJob(url: string, jobId: string) {
+  const job = await waitForCompletedJob(url, jobId);
+  return job.result;
+}
+
+async function waitForCompletedJob(url: string, jobId: string, expectedTaskPlanReviews = 1) {
   for (let attempt = 0; attempt < 20; attempt += 1) {
     const response = await fetch(`${url}/api/governance/jobs/${encodeURIComponent(jobId)}`);
     const job = (await response.json()) as {
@@ -777,12 +897,13 @@ async function waitForJob(url: string, jobId: string) {
         taskPlanPath: string;
       };
       error?: string;
+      logs: string[];
     };
     if (job.status === "completed" && job.result) {
       expect(job.design).toBeTruthy();
       expect(job.reviews).toHaveLength(1);
-      expect(job.taskPlanReviews).toHaveLength(1);
-      return job.result;
+      expect(job.taskPlanReviews).toHaveLength(expectedTaskPlanReviews);
+      return { ...job, result: job.result };
     }
     if (job.status === "failed") {
       throw new Error(job.error ?? "job failed");

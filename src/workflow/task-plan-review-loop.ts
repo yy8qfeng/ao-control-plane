@@ -4,6 +4,7 @@ import type { DesignReview } from "../schemas/design-review.js";
 import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
 import { taskPlanSchema } from "../schemas/task-plan.js";
+import { createLocalGateReview, validateTaskPlanApprovalGate } from "./task-plan-gates.js";
 
 export interface TaskPlanReviewLoopOptions {
   maxTaskPlanReviewRounds: number;
@@ -14,6 +15,8 @@ export interface TaskPlanReviewLoopHooks {
   onPlan?: (input: { planVersion: string; plan: TaskPlan; round: number }) => Promise<void> | void;
   onReviewStart?: (input: { round: number; planVersion: string }) => Promise<void> | void;
   onReview?: (input: { review: TaskPlanReview }) => Promise<void> | void;
+  onLocalGateStart?: (input: { round: number; planVersion: string }) => Promise<void> | void;
+  onLocalGate?: (input: { review: TaskPlanReview }) => Promise<void> | void;
   onRevisionStart?: (input: { round: number; review: TaskPlanReview }) => Promise<void> | void;
 }
 
@@ -36,6 +39,7 @@ export async function runTaskPlanReviewLoop(input: {
   hooks?: TaskPlanReviewLoopHooks;
   signal?: AbortSignal;
   initialPlan?: TaskPlan;
+  previousReviews?: TaskPlanReview[];
 }): Promise<TaskPlanReviewLoopResult> {
   throwIfAborted(input.signal);
   let plan = input.initialPlan
@@ -48,6 +52,7 @@ export async function runTaskPlanReviewLoop(input: {
         }, { signal: input.signal })
       );
   const reviews: TaskPlanReview[] = [];
+  const previousReviews = input.previousReviews ?? [];
   const planVersion = "task-plan-current";
   const startingRound = input.options.startingRound ?? 1;
   const finalRound = startingRound + input.options.maxTaskPlanReviewRounds - 1;
@@ -68,6 +73,39 @@ export async function runTaskPlanReviewLoop(input: {
     await input.hooks?.onReview?.({ review });
 
     if (review.reviewDecision === "approved") {
+      await input.hooks?.onLocalGateStart?.({ round, planVersion });
+      const gate = validateTaskPlanApprovalGate({
+        workflowId: input.workflowId,
+        deferredFindings: input.deferredFindings,
+        plan,
+        previousReviews: [...previousReviews, ...reviews.slice(0, -1)]
+      });
+
+      if (!gate.passed) {
+        const localGateReview = createLocalGateReview({
+          workflowId: input.workflowId,
+          round,
+          planVersion,
+          gate
+        });
+        reviews.push(localGateReview);
+        await input.hooks?.onLocalGate?.({ review: localGateReview });
+
+        if (round === finalRound) {
+          break;
+        }
+
+        await input.hooks?.onRevisionStart?.({ round, review: localGateReview });
+        plan = taskPlanSchema.parse(
+          await input.codex.reviseTaskPlan({
+            currentPlan: plan,
+            review: localGateReview,
+            approvedDesign: input.approvedDesign
+          }, { signal: input.signal })
+        );
+        continue;
+      }
+
       return {
         approved: true,
         plan,

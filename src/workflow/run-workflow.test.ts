@@ -23,7 +23,7 @@ describe("runWorkflow", () => {
         description: "Build the feature.",
         acceptanceCriteria: ["Feature works"],
         constraints: ["Use AO roles only"],
-        maxDesignReviewRounds: 2
+        maxDesignReviewRounds: 1
       }),
       "utf8"
     );
@@ -93,7 +93,7 @@ describe("runWorkflow", () => {
         title: "Feature",
         source: "test",
         description: "Build the feature.",
-        maxDesignReviewRounds: 2
+        maxDesignReviewRounds: 1
       }),
       "utf8"
     );
@@ -364,7 +364,7 @@ describe("runWorkflow", () => {
         title: "Feature",
         source: "test",
         description: "Build the feature.",
-        maxDesignReviewRounds: 1
+        maxDesignReviewRounds: 2
       }),
       "utf8"
     );
@@ -386,7 +386,7 @@ describe("runWorkflow", () => {
           ...input.currentPlan,
           tasks: input.currentPlan.tasks.map((task) => ({
             ...task,
-            acceptanceCriteria: [...task.acceptanceCriteria, "续跑整改完成"]
+            acceptanceCriteria: [...task.acceptanceCriteria, "续跑整改完成 TPF-001：需要续跑整改"]
           }))
         };
       }
@@ -404,7 +404,7 @@ describe("runWorkflow", () => {
         };
       },
       async reviewTaskPlan(input): Promise<TaskPlanReview> {
-        return input.round === 1
+        return input.round <= 2
           ? {
               workflowId: input.workflowId,
               round: input.round,
@@ -433,7 +433,7 @@ describe("runWorkflow", () => {
     expect(first.workflow.status).toBe("blocked_for_human");
     expect(second.workflow.status).toBe("executing");
     expect(createTaskPlanCalls).toBe(1);
-    expect(second.taskPlanReviews.at(-1)?.round).toBe(2);
+    expect(second.taskPlanReviews.at(-1)?.round).toBe(3);
     await expect(
       readFile(join(artifactRoot, "WF-PLAN-CONTINUE", "task-plan.json"), "utf8")
     ).resolves.toContain("初始任务计划");

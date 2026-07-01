@@ -3,7 +3,12 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import { ArtifactStore } from "./artifact-store.js";
+import type { ClaudeCodeAdapter } from "../adapters/claude-code.js";
+import type { CodexAdapter } from "../adapters/codex.js";
+import type { DesignReview } from "../schemas/design-review.js";
 import { defaultExecutionPolicy } from "../schemas/execution-policy.js";
+import type { TaskPlanReview } from "../schemas/task-plan-review.js";
+import type { TaskPlan } from "../schemas/task-plan.js";
 import {
   createTaskPlanStage,
   runDesignReviewStage,
@@ -244,6 +249,201 @@ describe("runGovernanceWorkflow", () => {
       code: "ENOENT"
     });
   });
+
+  it("blocks task planning when ClaudeCode approves but the local gate still finds unresolved findings", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-"));
+    const store = new ArtifactStore(tempDir);
+    const workflowId = "WF-LOCAL-GATE-BLOCK";
+    await store.saveWorkflow({
+      requirement: {
+        id: workflowId,
+        title: "Local gate block",
+        source: "test",
+        description: "Block approved task plan when local gate fails.",
+        acceptanceCriteria: [],
+        constraints: []
+      },
+      workflow: {
+        workflowId,
+        title: "Local gate block",
+        rawRequirement: "Block approved task plan when local gate fails.",
+        status: "blocked_for_human",
+        designRounds: 1,
+        maxDesignReviewRounds: 1,
+        approvedDesignVersion: "design-current",
+        tasks: []
+      },
+      design: "# Local gate block",
+      reviews: [
+        {
+          workflowId,
+          round: 1,
+          designer: "codex",
+          reviewer: "claude-code",
+          designVersion: "design-current",
+          reviewDecision: "approved",
+          findings: []
+        }
+      ],
+      taskPlanReviews: [
+        {
+          workflowId,
+          round: 1,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: "task-plan-current",
+          reviewDecision: "changes_requested",
+          findings: [
+            {
+              id: "TPF-RAWIP",
+              title: "RawIpAdapter 权限失败错误契约缺失",
+              body: "RawIpAdapter 必须补齐固定错误码和结构化日志字段。",
+              severity: "blocking",
+              status: "unresolved"
+            }
+          ]
+        }
+      ],
+      draftPlan: createPlan(workflowId, "Final approved criterion")
+    });
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(): Promise<TaskPlan> {
+        throw new Error("should continue from draft");
+      },
+      async reviseTaskPlan(input): Promise<TaskPlan> {
+        return input.currentPlan;
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return {
+          workflowId: input.workflowId,
+          round: input.round,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: input.planVersion,
+          reviewDecision: "approved",
+          findings: []
+        };
+      }
+    };
+
+    const planned = await createTaskPlanStage({
+      store,
+      workflowId,
+      codex,
+      claudeCode
+    });
+
+    expect(planned.workflow.status).toBe("blocked_for_human");
+    expect(planned.plan).toBeUndefined();
+    expect(planned.draftPlan?.tasks[0]?.acceptanceCriteria).toContain("Final approved criterion");
+    expect(
+      planned.taskPlanReviews?.some((review) =>
+        review.findings.some((finding) => finding.id === "TPG-PREVIOUS-TPF-RAWIP")
+      )
+    ).toBe(true);
+  });
+
+  it("blocks after repeated local gate failures exhaust task-plan review rounds", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-"));
+    const store = new ArtifactStore(tempDir);
+    const workflowId = "WF-LOCAL-GATE-REPEATED";
+    await store.saveWorkflow({
+      requirement: {
+        id: workflowId,
+        title: "Repeated local gate block",
+        source: "test",
+        description: "Keep blocking until local gate evidence exists.",
+        acceptanceCriteria: [],
+        constraints: []
+      },
+      workflow: {
+        workflowId,
+        title: "Repeated local gate block",
+        rawRequirement: "Keep blocking until local gate evidence exists.",
+        status: "blocked_for_human",
+        designRounds: 1,
+        maxDesignReviewRounds: 3,
+        approvedDesignVersion: "design-current",
+        tasks: []
+      },
+      design: "# Repeated local gate block",
+      reviews: [
+        {
+          workflowId,
+          round: 1,
+          designer: "codex",
+          reviewer: "claude-code",
+          designVersion: "design-current",
+          reviewDecision: "approved",
+          findings: []
+        }
+      ],
+      taskPlanReviews: [
+        {
+          workflowId,
+          round: 1,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: "task-plan-current",
+          reviewDecision: "changes_requested",
+          findings: [
+            {
+              id: "TPF-CLOCK",
+              title: "clock_domain 字段未贯通",
+              body: "clock_domain 必须贯通到 IpcStats 和 TransportStats。",
+              severity: "blocking",
+              status: "unresolved"
+            }
+          ]
+        }
+      ],
+      draftPlan: createPlan(workflowId, "Final approved criterion")
+    });
+    let reviseTaskPlanCalls = 0;
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(): Promise<TaskPlan> {
+        throw new Error("should continue from draft");
+      },
+      async reviseTaskPlan(input): Promise<TaskPlan> {
+        reviseTaskPlanCalls += 1;
+        return input.currentPlan;
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return {
+          workflowId: input.workflowId,
+          round: input.round,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: input.planVersion,
+          reviewDecision: "approved",
+          findings: []
+        };
+      }
+    };
+
+    const planned = await createTaskPlanStage({
+      store,
+      workflowId,
+      codex,
+      claudeCode
+    });
+
+    expect(planned.workflow.status).toBe("blocked_for_human");
+    expect(planned.plan).toBeUndefined();
+    expect(reviseTaskPlanCalls).toBe(2);
+    expect(planned.taskPlanReviews).toHaveLength(7);
+    expect(planned.taskPlanReviews?.at(-1)?.findings[0]?.id).toBe("TPG-PREVIOUS-TPF-CLOCK");
+  });
 });
 
 function createPlan(workflowId: string, criterion: string) {
@@ -267,4 +467,16 @@ function createPlan(workflowId: string, criterion: string) {
       }
     ]
   };
+}
+
+async function unusedDesignMethod(): Promise<string> {
+  throw new Error("should not create design");
+}
+
+async function unusedDesignRevision(): Promise<string> {
+  throw new Error("should not revise design");
+}
+
+async function unusedDesignReview(): Promise<DesignReview> {
+  throw new Error("should not review design");
 }

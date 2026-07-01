@@ -38,6 +38,8 @@ export type RunWorkflowEvent =
   | { type: "task_plan_generated"; round: number; planVersion: string; plan: TaskPlan; path: string }
   | { type: "task_plan_review_started"; round: number; planVersion: string }
   | { type: "task_plan_review_completed"; review: TaskPlanReview; path: string }
+  | { type: "task_plan_local_gate_started"; round: number; planVersion: string }
+  | { type: "task_plan_local_gate_failed"; review: TaskPlanReview; path: string }
   | { type: "task_plan_revision_started"; round: number }
   | { type: "planning_completed"; plan: TaskPlan; path: string }
   | { type: "workflow_completed"; result: RunWorkflowResult }
@@ -163,6 +165,7 @@ export async function runWorkflow(input: {
       },
       signal: input.signal,
       initialPlan: existingState.plan,
+      previousReviews: existingState.taskPlanReviews,
       hooks: {
         onPlan: async ({ round, planVersion, plan }) => {
           const draftPath = join(artifactDir, "task-plan-draft.json");
@@ -184,6 +187,16 @@ export async function runWorkflow(input: {
           await writeJson(reviewPath, review);
           await writeJson(join(artifactDir, "task-plan-reviews.json"), taskPlanReviews);
           await input.onEvent?.({ type: "task_plan_review_completed", review, path: reviewPath });
+        },
+        onLocalGateStart: async ({ round, planVersion }) => {
+          await input.onEvent?.({ type: "task_plan_local_gate_started", round, planVersion });
+        },
+        onLocalGate: async ({ review }) => {
+          taskPlanReviews.push(review);
+          const reviewPath = join(artifactDir, `task-plan-review-${review.round}-local-gate.json`);
+          await writeJson(reviewPath, review);
+          await writeJson(join(artifactDir, "task-plan-reviews.json"), taskPlanReviews);
+          await input.onEvent?.({ type: "task_plan_local_gate_failed", review, path: reviewPath });
         },
         onRevisionStart: async ({ round }) => {
           await input.onEvent?.({ type: "task_plan_revision_started", round });

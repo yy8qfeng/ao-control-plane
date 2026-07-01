@@ -6,6 +6,7 @@ import type { DesignReview } from "../schemas/design-review.js";
 import { requirementSchema, type Requirement } from "../schemas/requirement.js";
 import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { Workflow } from "../schemas/workflow.js";
+import type { TaskPlan } from "../schemas/task-plan.js";
 import { runDesignReviewLoop } from "../workflow/design-review-loop.js";
 import { runTaskPlanReviewLoop } from "../workflow/task-plan-review-loop.js";
 import { ArtifactStore, type GovernanceArtifacts } from "./artifact-store.js";
@@ -26,6 +27,15 @@ export interface GovernanceRunResult extends GovernanceArtifacts {
   reviews: DesignReview[];
   taskPlanReviews?: TaskPlanReview[];
 }
+
+export type TaskPlanStageEvent =
+  | { type: "planning_started"; deferredFindings: DesignReview["findings"]; startingRound: number }
+  | { type: "task_plan_generated"; round: number; planVersion: string; plan: TaskPlan }
+  | { type: "task_plan_review_started"; round: number; planVersion: string }
+  | { type: "task_plan_review_completed"; review: TaskPlanReview }
+  | { type: "task_plan_local_gate_started"; round: number; planVersion: string }
+  | { type: "task_plan_local_gate_failed"; review: TaskPlanReview }
+  | { type: "task_plan_revision_started"; round: number };
 
 export async function runDesignReviewStage(input: {
   request: GovernanceRequest;
@@ -69,6 +79,7 @@ export async function createTaskPlanStage(input: {
   store: ArtifactStore;
   codex?: CodexAdapter;
   claudeCode?: ClaudeCodeAdapter;
+  onEvent?: (event: TaskPlanStageEvent) => Promise<void> | void;
   signal?: AbortSignal;
 }): Promise<GovernanceRunResult> {
   const artifacts = await input.store.readWorkflow(input.workflowId);
@@ -83,18 +94,42 @@ export async function createTaskPlanStage(input: {
   }
 
   const existingTaskPlanReviews = artifacts.taskPlanReviews ?? [];
+  const deferredFindings = collectDeferredFindings(artifacts.reviews);
+  const startingRound = existingTaskPlanReviews.length + 1;
+  await input.onEvent?.({ type: "planning_started", deferredFindings, startingRound });
   const planLoop = await runTaskPlanReviewLoop({
     workflowId: artifacts.workflow.workflowId,
     approvedDesign: artifacts.design,
-    deferredFindings: collectDeferredFindings(artifacts.reviews),
+    deferredFindings,
     codex: input.codex ?? new PlaceholderCodexAdapter(),
     claudeCode: input.claudeCode ?? new PlaceholderClaudeCodeAdapter(),
     options: {
       maxTaskPlanReviewRounds: artifacts.workflow.maxDesignReviewRounds,
-      startingRound: existingTaskPlanReviews.length + 1
+      startingRound
     },
     initialPlan,
-    signal: input.signal
+    previousReviews: existingTaskPlanReviews,
+    signal: input.signal,
+    hooks: {
+      onPlan: async ({ round, planVersion, plan }) => {
+        await input.onEvent?.({ type: "task_plan_generated", round, planVersion, plan });
+      },
+      onReviewStart: async ({ round, planVersion }) => {
+        await input.onEvent?.({ type: "task_plan_review_started", round, planVersion });
+      },
+      onReview: async ({ review }) => {
+        await input.onEvent?.({ type: "task_plan_review_completed", review });
+      },
+      onLocalGateStart: async ({ round, planVersion }) => {
+        await input.onEvent?.({ type: "task_plan_local_gate_started", round, planVersion });
+      },
+      onLocalGate: async ({ review }) => {
+        await input.onEvent?.({ type: "task_plan_local_gate_failed", review });
+      },
+      onRevisionStart: async ({ round }) => {
+        await input.onEvent?.({ type: "task_plan_revision_started", round });
+      }
+    }
   });
   // The loop emits absolute round numbers from startingRound, so appending preserves review history.
   const taskPlanReviews = [...existingTaskPlanReviews, ...planLoop.reviews];

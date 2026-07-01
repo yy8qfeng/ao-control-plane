@@ -2,7 +2,7 @@ import type { DesignReview } from "../schemas/design-review.js";
 import type { Requirement } from "../schemas/requirement.js";
 import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
-import { defaultExecutionPolicy, formatExecutionPolicyTemplate } from "../schemas/execution-policy.js";
+import { formatExecutionPolicyTemplate, getExecutionPolicyForTaskType } from "../schemas/execution-policy.js";
 import { taskPlanSchema } from "../schemas/task-plan.js";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -155,7 +155,7 @@ export class CodexCliAdapter implements CodexAdapter {
       "--output-last-message",
       outputFile,
       "-m",
-      this.options.model ?? "gpt-5.2",
+      this.options.model ?? "gpt-5.5",
       "--config",
       `model_reasoning_effort="${this.options.reasoningEffort ?? "high"}"`,
       "-"
@@ -210,14 +210,19 @@ function formatTaskPlanRules(mode: "create" | "revise"): string[] {
     "- 每个 aoPrompt 必须包含 workflowId、taskId、任务名称、AO 角色、验收标准和上下文摘要。",
     "- taskId 使用 TASK-001 递增。",
     "- status 全部使用 pending。",
-    "- 每个 implementation 任务必须包含 executionPolicy，且 executionPolicy 必须完整等于 JSON 模板中的默认执行策略：所有 bool 字段为 true，maxQaRounds 和 maxReviewRounds 均为 3。",
+    "- 每个任务必须包含完整 executionPolicy，并按任务类型显式差异化；禁止所有任务无脑使用同一套默认策略。",
+    "- implementation/refactor 任务必须保留开发自测、QA、回归、审查、PR/RP，且 maxQaRounds=maxReviewRounds=3。",
+    "- design/review/docs/test/verification 任务可按 JSON 模板中的任务类型策略降低不适用环节，但必须说明在任务类型上合理。",
     "- 任务必须足够细：每个任务只覆盖一个清晰模块或一个可验证交付物；单个任务验收标准不得超过 7 条，超过必须拆分。",
     "- 先拆接口、协议、契约、测试骨架等前置任务，再拆实现任务；跨平台实现必须通过共享抽象或接口冻结任务避免并行冲突。",
     "- 依赖必须完整、无环、无未知 taskId；人工放行门禁使用 dependencyCondition=manual_gate。",
     "- 对需要仓库实读或人工确认的前置校准任务，必须设为独立任务，并让后续实现任务显式依赖它。",
     mode === "revise"
       ? "- 如果当前计划已有实施阶段遗留审查意见，整改后必须继续保留在任务、验收标准或 aoPrompt 约束中，不能丢失。"
-      : "- 如果存在实施阶段遗留审查意见，必须在任务、验收标准或 aoPrompt 约束中体现，不能丢失。"
+      : "- 如果存在实施阶段遗留审查意见，必须在任务、验收标准或 aoPrompt 约束中体现，不能丢失。",
+    mode === "revise"
+      ? "- 如果审查意见 body 包含 [local-gate]，必须按结构性含义整改，例如重新分配 executionPolicy、补充前置契约任务、修正依赖或显式 manual_gate；禁止只把 finding id 追加进 acceptanceCriteria 后声称已整改。"
+      : "- 本地门禁会校验任务计划结构，不要依赖文字承诺绕过 executionPolicy、依赖、manual_gate 或跨轮 finding 闭环。"
   ];
 }
 
@@ -306,7 +311,7 @@ export class PlaceholderCodexAdapter implements CodexAdapter {
             formatDeferredFindingsForAoPrompt(input.deferredFindings ?? [])
           ].join("\n"),
           executionPolicy: {
-            ...defaultExecutionPolicy
+            ...getExecutionPolicyForTaskType("implementation")
           },
           status: "pending"
         }
@@ -325,7 +330,7 @@ export class PlaceholderCodexAdapter implements CodexAdapter {
       tasks: input.currentPlan.tasks.map((task) => ({
         ...task,
         executionPolicy: {
-          ...defaultExecutionPolicy
+          ...getExecutionPolicyForTaskType(task.type)
         },
         acceptanceCriteria: [
           ...task.acceptanceCriteria,

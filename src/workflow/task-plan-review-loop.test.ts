@@ -22,7 +22,7 @@ describe("runTaskPlanReviewLoop", () => {
           ...input.currentPlan,
           tasks: input.currentPlan.tasks.map((task) => ({
             ...task,
-            acceptanceCriteria: [...task.acceptanceCriteria, "补齐任务计划审查意见"]
+            acceptanceCriteria: [...task.acceptanceCriteria, "补齐任务计划审查意见 TPF-001：验收标准不足"]
           }))
         };
       }
@@ -64,7 +64,7 @@ describe("runTaskPlanReviewLoop", () => {
     expect(result.approved).toBe(true);
     expect(result.reviews).toHaveLength(2);
     expect(reviseTaskPlanCalls).toBe(1);
-    expect(result.plan.tasks[0]?.acceptanceCriteria).toContain("补齐任务计划审查意见");
+    expect(result.plan.tasks[0]?.acceptanceCriteria).toContain("补齐任务计划审查意见 TPF-001：验收标准不足");
   });
 
   it("blocks for human when task-plan review rounds are exhausted", async () => {
@@ -151,6 +151,75 @@ describe("runTaskPlanReviewLoop", () => {
     expect(createTaskPlanCalls).toBe(0);
     expect(result.reviews[0]?.round).toBe(4);
     expect(result.plan.tasks[0]?.acceptanceCriteria).toContain("已有计划");
+  });
+
+  it("does not approve a task plan when the local gate finds unresolved prior findings", async () => {
+    let reviseTaskPlanCalls = 0;
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(input): Promise<TaskPlan> {
+        return createPlan(input.workflowId, "初版验收");
+      },
+      async reviseTaskPlan(input): Promise<TaskPlan> {
+        reviseTaskPlanCalls += 1;
+        const isLocalGateReview = input.review.findings.some((finding) => finding.body.includes("[local-gate]"));
+        return {
+          ...input.currentPlan,
+          tasks: input.currentPlan.tasks.map((task) => ({
+            ...task,
+            acceptanceCriteria: [
+              ...task.acceptanceCriteria,
+              isLocalGateReview ? "补齐 RawIpAdapter 权限失败错误契约 TPF-RAWIP" : "补充通用审查整改记录"
+            ],
+            aoPrompt: isLocalGateReview
+              ? `${task.aoPrompt}\n任务计划审查整改：补齐 RawIpAdapter 权限失败错误契约 TPF-RAWIP。`
+              : `${task.aoPrompt}\n任务计划审查整改：补充通用审查整改记录。`
+          }))
+        };
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        if (input.round === 1) {
+          return {
+            workflowId: input.workflowId,
+            round: input.round,
+            planner: "codex",
+            reviewer: "claude-code",
+            planVersion: input.planVersion,
+            reviewDecision: "changes_requested",
+            findings: [
+              {
+                id: "TPF-RAWIP",
+                title: "RawIpAdapter 权限失败错误契约缺失",
+                body: "RawIpAdapter 必须补齐固定错误码和结构化日志字段。",
+                severity: "blocking",
+                status: "unresolved"
+              }
+            ]
+          };
+        }
+        return approveTaskPlan(input);
+      }
+    };
+
+    const result = await runTaskPlanReviewLoop({
+      workflowId: "WF-LOCAL-GATE",
+      approvedDesign: "# Design",
+      deferredFindings: [],
+      codex,
+      claudeCode,
+      options: { maxTaskPlanReviewRounds: 3 }
+    });
+
+    expect(result.approved).toBe(true);
+    expect(reviseTaskPlanCalls).toBe(2);
+    expect(result.reviews.some((review) => review.findings.some((finding) => finding.id === "TPG-PREVIOUS-TPF-RAWIP"))).toBe(
+      true
+    );
+    expect(result.plan.tasks[0]?.acceptanceCriteria).toContain("补齐 RawIpAdapter 权限失败错误契约 TPF-RAWIP");
   });
 });
 

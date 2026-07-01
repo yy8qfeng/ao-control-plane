@@ -1,7 +1,41 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { defaultExecutionPolicy } from "../schemas/execution-policy.js";
 import { taskPlanSchema, type TaskPlan } from "../schemas/task-plan.js";
-import { PlaceholderCodexAdapter } from "./codex.js";
+import { CodexCliAdapter, PlaceholderCodexAdapter } from "./codex.js";
+
+const execaMock = vi.hoisted(() =>
+  vi.fn(async (_command: string, args: string[]) => {
+    const { writeFile } = await import("node:fs/promises");
+    const outputFlagIndex = args.indexOf("--output-last-message");
+    if (outputFlagIndex >= 0) {
+      await writeFile(args[outputFlagIndex + 1] ?? "", "# Design\n\nGenerated design.");
+    }
+    return { exitCode: 0, stdout: "", stderr: "" };
+  })
+);
+
+vi.mock("execa", () => ({
+  execa: execaMock
+}));
+
+describe("CodexCliAdapter", () => {
+  it("defaults the Codex CLI model to gpt-5.5", async () => {
+    execaMock.mockClear();
+    const codex = new CodexCliAdapter({ codexBin: "codex-test" });
+
+    await codex.createDesign({
+      id: "REQ-001",
+      source: "test",
+      title: "Model default",
+      description: "Verify default model.",
+      acceptanceCriteria: [],
+      constraints: []
+    });
+
+    const args = execaMock.mock.calls[0]?.[1] as string[];
+    expect(args[args.indexOf("-m") + 1]).toBe("gpt-5.5");
+  });
+});
 
 describe("PlaceholderCodexAdapter", () => {
   it("keeps revised task plans valid with the default execution policy", async () => {

@@ -31,7 +31,7 @@ program
   .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
   .option("--codex-bin <command>", "Codex CLI command", "codex")
   .option("--claude-bin <command>", "ClaudeCode CLI command", "claude")
-  .option("--codex-model <model>", "Codex model", "gpt-5.2")
+  .option("--codex-model <model>", "Codex model", "gpt-5.5")
   .option("--codex-effort <level>", "Codex reasoning effort", "high")
   .option("--claude-model <model>", "ClaudeCode model")
   .option("--claude-effort <level>", "ClaudeCode effort", "high")

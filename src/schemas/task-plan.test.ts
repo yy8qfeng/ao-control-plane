@@ -105,6 +105,28 @@ describe("taskPlanSchema", () => {
     expect(result.success).toBe(false);
   });
 
+  it("accepts docs tasks with a lighter explicit policy", () => {
+    const result = taskPlanSchema.safeParse(
+      createPlan([
+        createTask({
+          type: "docs",
+          aoRole: "docs",
+          executionPolicy: {
+            developerSelfTestRequired: true,
+            qaRequired: true,
+            regressionRequired: false,
+            reviewerRequired: true,
+            maxQaRounds: 2,
+            maxReviewRounds: 2,
+            requirePrOrRp: true
+          }
+        })
+      ])
+    );
+
+    expect(result.success).toBe(true);
+  });
+
   it("rejects partial execution policies instead of completing them with defaults", () => {
     const result = taskPlanSchema.safeParse(
       createPlan([
@@ -121,7 +143,7 @@ describe("taskPlanSchema", () => {
       !result.success &&
         result.error.issues.some((issue) =>
           issue.message.includes(
-            "executionPolicy must equal defaultExecutionPolicy; invalid or missing fields: qaRequired"
+            "executionPolicy must be complete and valid; invalid or missing fields: qaRequired"
           )
         )
     ).toBe(true);
