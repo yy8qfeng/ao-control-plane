@@ -353,6 +353,91 @@ describe("runWorkflow", () => {
     ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("continues task-plan review from an existing draft after a blocked run", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ao-control-plane-workflow-"));
+    const requirementFile = join(root, "requirement.json");
+    await writeFile(
+      requirementFile,
+      JSON.stringify({
+        id: "WF-PLAN-CONTINUE",
+        title: "Feature",
+        source: "test",
+        description: "Build the feature.",
+        maxDesignReviewRounds: 1
+      }),
+      "utf8"
+    );
+
+    let createTaskPlanCalls = 0;
+    const codex: CodexAdapter = {
+      async createDesign() {
+        return "# Feature\n\n## 背景与问题定义\nBuild it.";
+      },
+      async reviseDesign(input) {
+        return input.currentDesign;
+      },
+      async createTaskPlan(input): Promise<TaskPlan> {
+        createTaskPlanCalls += 1;
+        return createPlan(input.workflowId, "初始任务计划");
+      },
+      async reviseTaskPlan(input): Promise<TaskPlan> {
+        return {
+          ...input.currentPlan,
+          tasks: input.currentPlan.tasks.map((task) => ({
+            ...task,
+            acceptanceCriteria: [...task.acceptanceCriteria, "续跑整改完成"]
+          }))
+        };
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      async reviewDesign(input): Promise<DesignReview> {
+        return {
+          workflowId: input.workflowId,
+          round: input.round,
+          designer: "codex",
+          reviewer: "claude-code",
+          designVersion: input.designVersion,
+          reviewDecision: "approved",
+          findings: []
+        };
+      },
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return input.round === 1
+          ? {
+              workflowId: input.workflowId,
+              round: input.round,
+              planner: "codex",
+              reviewer: "claude-code",
+              planVersion: input.planVersion,
+              reviewDecision: "changes_requested",
+              findings: [
+                {
+                  id: "TPF-001",
+                  title: "需要续跑整改",
+                  body: "任务计划需要继续整改。",
+                  severity: "major",
+                  status: "unresolved"
+                }
+              ]
+            }
+          : approveTaskPlan(input);
+      }
+    };
+
+    const artifactRoot = join(root, "artifacts");
+    const first = await runWorkflow({ requirementFile, artifactRoot, codex, claudeCode });
+    const second = await runWorkflow({ requirementFile, artifactRoot, codex, claudeCode });
+
+    expect(first.workflow.status).toBe("blocked_for_human");
+    expect(second.workflow.status).toBe("executing");
+    expect(createTaskPlanCalls).toBe(1);
+    expect(second.taskPlanReviews.at(-1)?.round).toBe(2);
+    await expect(
+      readFile(join(artifactRoot, "WF-PLAN-CONTINUE", "task-plan.json"), "utf8")
+    ).resolves.toContain("初始任务计划");
+  });
+
   it("persists stopped workflow status when the user aborts the run", async () => {
     const root = await mkdtemp(join(tmpdir(), "ao-control-plane-workflow-"));
     const requirementFile = join(root, "requirement.json");

@@ -371,7 +371,7 @@ export function renderIndexHtml(): string {
           <button id="stopButton" class="secondary" type="button" disabled>停止</button>
           <button id="saveDraftButton" class="secondary" type="button">保存草稿</button>
           <button id="clearDraftButton" class="secondary" type="button">清空草稿</button>
-          <button id="planButton" class="secondary" type="button" disabled>生成任务计划</button>
+          <button id="planButton" class="secondary" type="button" disabled>继续审查任务计划</button>
           <button id="dryRunButton" class="secondary" type="button" disabled>预演执行</button>
         </div>
         <div id="draftStatus" class="status">表单草稿会自动保存到本地。</div>
@@ -550,14 +550,15 @@ export function renderIndexHtml(): string {
     });
 
     planButton.addEventListener("click", async () => {
-      if (!state.result?.workflow?.workflowId) return;
+      const workflowId = state.result?.workflow?.workflowId || state.workflowId;
+      if (!workflowId) return;
       setBusy(true, "正在生成并审查任务计划...");
       try {
         const response = await fetch("/api/governance/plan", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
-            workflowId: state.result.workflow.workflowId,
+            workflowId,
             projectRoot: getProjectRoot()
           })
         });
@@ -953,8 +954,8 @@ export function renderIndexHtml(): string {
       stopButton.disabled = !busy;
       saveDraftButton.disabled = busy;
       deleteDraftButton.disabled = busy || !state.requirementDrafts.length;
-      planButton.disabled = busy || state.result?.workflow?.status !== "ready_for_planning";
-      planButton.title = getPlanButtonTitle(busy, state.result?.workflow?.status);
+      planButton.disabled = busy || !canReviewTaskPlan(state.result);
+      planButton.title = getPlanButtonTitle(busy, state.result);
       dryRunButton.disabled = busy || state.result?.workflow?.status !== "executing" || !state.result?.plan;
       clearDraftButton.disabled = busy;
       if (message) setStatus("warn", message);
@@ -990,16 +991,24 @@ export function renderIndexHtml(): string {
       saveDraftButton.disabled = running;
       clearDraftButton.disabled = running;
       deleteDraftButton.disabled = running || !state.requirementDrafts.length;
-      planButton.disabled = running || result?.workflow?.status !== "ready_for_planning";
-      planButton.title = getPlanButtonTitle(running, result?.workflow?.status);
+      planButton.disabled = running || !canReviewTaskPlan(result);
+      planButton.title = getPlanButtonTitle(running, result);
       dryRunButton.disabled = running || result?.workflow?.status !== "executing" || !result?.plan;
     }
 
-    function getPlanButtonTitle(running, workflowStatus) {
+    function canReviewTaskPlan(result) {
+      const workflowStatus = result?.workflow?.status;
+      return workflowStatus === "ready_for_planning" || Boolean(result?.plan) || Boolean(state.workflowId);
+    }
+
+    function getPlanButtonTitle(running, result) {
+      const workflowStatus = result?.workflow?.status;
       if (running) return "治理流程运行中，暂不能单独生成任务计划。";
       if (workflowStatus === "ready_for_planning") return "设计审查已通过，可以生成并审查任务计划。";
-      if (workflowStatus === "executing") return "任务计划已在治理流程中生成。";
-      if (workflowStatus === "blocked_for_human") return "当前仍需人工补充或复核，不能生成任务计划。";
+      if (result?.plan && workflowStatus === "executing") return "已有任务计划，可以基于当前计划继续审查或整改。";
+      if (result?.plan && workflowStatus === "blocked_for_human") return "已有任务计划草稿，可以基于当前计划继续审查或整改。";
+      if (!result && state.workflowId) return "已恢复历史需求，可尝试基于已保存任务计划继续审查或整改。";
+      if (workflowStatus === "blocked_for_human") return "当前仍需人工补充或复核，且没有可继续的任务计划。";
       return "需先完成分阶段设计审查。";
     }
 

@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { DesignReview } from "../schemas/design-review.js";
 import type { Requirement } from "../schemas/requirement.js";
@@ -11,7 +11,9 @@ export interface GovernanceArtifacts {
   workflow: Workflow;
   design: string;
   reviews: DesignReview[];
+  /** Optional when no task-plan review has been persisted yet; callers should default to an empty array. */
   taskPlanReviews?: TaskPlanReview[];
+  draftPlan?: TaskPlan;
   plan?: TaskPlan;
 }
 
@@ -30,7 +32,12 @@ export class ArtifactStore {
       artifacts.taskPlanReviews
         ? writeJson(join(workflowDir, "task-plan-reviews.json"), artifacts.taskPlanReviews)
         : Promise.resolve(),
-      artifacts.plan ? writeJson(join(workflowDir, "task-plan.json"), artifacts.plan) : Promise.resolve()
+      artifacts.draftPlan
+        ? writeJson(join(workflowDir, "task-plan-draft.json"), artifacts.draftPlan)
+        : removeOptionalFile(join(workflowDir, "task-plan-draft.json")),
+      artifacts.plan
+        ? writeJson(join(workflowDir, "task-plan.json"), artifacts.plan)
+        : removeOptionalFile(join(workflowDir, "task-plan.json"))
     ]);
 
     return workflowDir;
@@ -50,12 +57,13 @@ export class ArtifactStore {
 
   async readWorkflow(workflowId: string): Promise<GovernanceArtifacts> {
     const workflowDir = this.getWorkflowDir(workflowId);
-    const [requirement, workflow, design, reviews, taskPlanReviews, plan] = await Promise.all([
+    const [requirement, workflow, design, reviews, taskPlanReviews, draftPlan, plan] = await Promise.all([
       readJson<Requirement>(join(workflowDir, "requirement.json")),
       readJson<Workflow>(join(workflowDir, "workflow.json")),
       readFile(join(workflowDir, "design.md"), "utf8"),
       readJson<DesignReview[]>(join(workflowDir, "reviews.json")),
       readOptionalJson<TaskPlanReview[]>(join(workflowDir, "task-plan-reviews.json")),
+      readOptionalJson<TaskPlan>(join(workflowDir, "task-plan-draft.json")),
       readOptionalJson<TaskPlan>(join(workflowDir, "task-plan.json"))
     ]);
 
@@ -65,6 +73,7 @@ export class ArtifactStore {
       design,
       reviews,
       taskPlanReviews: taskPlanReviews ?? undefined,
+      draftPlan: draftPlan ?? undefined,
       plan: plan ?? undefined
     };
   }
@@ -97,6 +106,10 @@ async function readOptionalFile(file: string): Promise<string | undefined> {
     }
     throw error;
   }
+}
+
+async function removeOptionalFile(file: string): Promise<void> {
+  await rm(file, { force: true });
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {

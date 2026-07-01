@@ -7,6 +7,7 @@ import { taskPlanSchema } from "../schemas/task-plan.js";
 
 export interface TaskPlanReviewLoopOptions {
   maxTaskPlanReviewRounds: number;
+  startingRound?: number;
 }
 
 export interface TaskPlanReviewLoopHooks {
@@ -34,19 +35,24 @@ export async function runTaskPlanReviewLoop(input: {
   options: TaskPlanReviewLoopOptions;
   hooks?: TaskPlanReviewLoopHooks;
   signal?: AbortSignal;
+  initialPlan?: TaskPlan;
 }): Promise<TaskPlanReviewLoopResult> {
   throwIfAborted(input.signal);
-  let plan = taskPlanSchema.parse(
-    await input.codex.createTaskPlan({
-      workflowId: input.workflowId,
-      approvedDesign: input.approvedDesign,
-      deferredFindings: input.deferredFindings
-    }, { signal: input.signal })
-  );
+  let plan = input.initialPlan
+    ? taskPlanSchema.parse(input.initialPlan)
+    : taskPlanSchema.parse(
+        await input.codex.createTaskPlan({
+          workflowId: input.workflowId,
+          approvedDesign: input.approvedDesign,
+          deferredFindings: input.deferredFindings
+        }, { signal: input.signal })
+      );
   const reviews: TaskPlanReview[] = [];
   const planVersion = "task-plan-current";
+  const startingRound = input.options.startingRound ?? 1;
+  const finalRound = startingRound + input.options.maxTaskPlanReviewRounds - 1;
 
-  for (let round = 1; round <= input.options.maxTaskPlanReviewRounds; round += 1) {
+  for (let round = startingRound; round <= finalRound; round += 1) {
     throwIfAborted(input.signal);
     await input.hooks?.onPlan?.({ planVersion, plan, round });
     await input.hooks?.onReviewStart?.({ round, planVersion });
@@ -72,7 +78,7 @@ export async function runTaskPlanReviewLoop(input: {
       };
     }
 
-    if (round === input.options.maxTaskPlanReviewRounds) {
+    if (round === finalRound) {
       break;
     }
 

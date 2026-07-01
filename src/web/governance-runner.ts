@@ -67,27 +67,46 @@ export async function createTaskPlanStage(input: {
   store: ArtifactStore;
 }): Promise<GovernanceRunResult> {
   const artifacts = await input.store.readWorkflow(input.workflowId);
-  if (artifacts.workflow.status !== "ready_for_planning") {
+  const hasExecutablePlan = artifacts.workflow.status === "executing" && Boolean(artifacts.plan);
+  const initialPlan = hasExecutablePlan ? artifacts.plan : artifacts.draftPlan ?? artifacts.plan;
+  const canPlan =
+    artifacts.workflow.status === "ready_for_planning" ||
+    (artifacts.workflow.status === "blocked_for_human" && Boolean(initialPlan)) ||
+    (artifacts.workflow.status === "executing" && Boolean(initialPlan));
+  if (!canPlan) {
     throw new Error(`Workflow ${input.workflowId} is not ready for planning`);
   }
 
+  const existingTaskPlanReviews = artifacts.taskPlanReviews ?? [];
   const planLoop = await runTaskPlanReviewLoop({
     workflowId: artifacts.workflow.workflowId,
     approvedDesign: artifacts.design,
     deferredFindings: collectDeferredFindings(artifacts.reviews),
     codex: new PlaceholderCodexAdapter(),
     claudeCode: new PlaceholderClaudeCodeAdapter(),
-    options: { maxTaskPlanReviewRounds: artifacts.workflow.maxDesignReviewRounds }
+    options: {
+      maxTaskPlanReviewRounds: artifacts.workflow.maxDesignReviewRounds,
+      startingRound: existingTaskPlanReviews.length + 1
+    },
+    initialPlan
   });
+  // The loop emits absolute round numbers from startingRound, so appending preserves review history.
+  const taskPlanReviews = [...existingTaskPlanReviews, ...planLoop.reviews];
+  const nextPlan = planLoop.approved ? planLoop.plan : hasExecutablePlan ? artifacts.plan : undefined;
   const nextArtifacts: GovernanceArtifacts = {
     ...artifacts,
     workflow: {
       ...artifacts.workflow,
-      status: planLoop.approved ? "executing" : "blocked_for_human",
-      tasks: planLoop.approved ? planLoop.plan.tasks.map((task) => task.taskId) : []
+      status: planLoop.approved || hasExecutablePlan ? "executing" : "blocked_for_human",
+      tasks: planLoop.approved
+        ? planLoop.plan.tasks.map((task) => task.taskId)
+        : hasExecutablePlan
+          ? artifacts.workflow.tasks
+          : []
     },
-    taskPlanReviews: planLoop.reviews,
-    plan: planLoop.approved ? planLoop.plan : undefined
+    taskPlanReviews,
+    draftPlan: planLoop.approved ? undefined : planLoop.plan,
+    plan: nextPlan
   };
   const artifactDir = await input.store.saveWorkflow(nextArtifacts);
   return { ...nextArtifacts, artifactDir };

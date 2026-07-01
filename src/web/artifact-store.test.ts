@@ -79,11 +79,32 @@ describe("ArtifactStore", () => {
           reviewDecision: "approved",
           findings: []
         }
-      ]
+      ],
+      draftPlan: {
+        workflowId: "WF-PLAN-REVIEWS",
+        title: "Draft plan",
+        tasks: [
+          {
+            taskId: "TASK-001",
+            workflowId: "WF-PLAN-REVIEWS",
+            title: "Draft task",
+            description: "Persist draft task.",
+            type: "implementation",
+            dependencies: [],
+            dependencyCondition: "all_completed",
+            aoRole: "backend-senior",
+            acceptanceCriteria: ["Draft criterion"],
+            aoPrompt:
+              "[WF-PLAN-REVIEWS / TASK-001]\n任务名称：Draft task\nAO 角色：backend-senior\n验收标准：\n1. Draft criterion\n上下文摘要：Persist draft.",
+            status: "pending"
+          }
+        ]
+      }
     });
 
     const restored = await store.readWorkflow("WF-PLAN-REVIEWS");
     expect(restored.taskPlanReviews).toHaveLength(1);
     expect(restored.taskPlanReviews?.[0]?.reviewDecision).toBe("approved");
+    expect(restored.draftPlan?.tasks[0]?.title).toBe("Draft task");
   });
 });

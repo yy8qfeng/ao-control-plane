@@ -116,6 +116,41 @@ describe("runTaskPlanReviewLoop", () => {
     expect(result.reviews).toHaveLength(2);
     expect(reviseTaskPlanCalls).toBe(1);
   });
+
+  it("continues from an existing task plan without creating a new one", async () => {
+    let createTaskPlanCalls = 0;
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(input): Promise<TaskPlan> {
+        createTaskPlanCalls += 1;
+        return createPlan(input.workflowId, "新生成计划");
+      },
+      async reviseTaskPlan(input): Promise<TaskPlan> {
+        return input.currentPlan;
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return approveTaskPlan(input);
+      }
+    };
+
+    const result = await runTaskPlanReviewLoop({
+      workflowId: "WF-CONTINUE-PLAN",
+      approvedDesign: "# Design",
+      deferredFindings: [],
+      codex,
+      claudeCode,
+      options: { maxTaskPlanReviewRounds: 3, startingRound: 4 },
+      initialPlan: createPlan("WF-CONTINUE-PLAN", "已有计划")
+    });
+
+    expect(createTaskPlanCalls).toBe(0);
+    expect(result.reviews[0]?.round).toBe(4);
+    expect(result.plan.tasks[0]?.acceptanceCriteria).toContain("已有计划");
+  });
 });
 
 function createPlan(workflowId: string, criterion: string): TaskPlan {

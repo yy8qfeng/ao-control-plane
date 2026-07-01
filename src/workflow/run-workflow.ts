@@ -68,7 +68,7 @@ export async function runWorkflow(input: {
   const existingState = await readExistingWorkflowState(artifactDir);
   const startingRound = existingState.reviews.length + 1;
   const reviews: DesignReview[] = [...existingState.reviews];
-  const taskPlanReviews: TaskPlanReview[] = [];
+  const taskPlanReviews: TaskPlanReview[] = [...existingState.taskPlanReviews];
 
   await writeJson(join(artifactDir, "requirement.json"), requirement);
   await writeJson(join(artifactDir, "workflow.json"), workflow);
@@ -157,8 +157,12 @@ export async function runWorkflow(input: {
       deferredFindings: reviewLoop.deferredFindings,
       codex: input.codex,
       claudeCode: input.claudeCode,
-      options: { maxTaskPlanReviewRounds: requirementInput.maxDesignReviewRounds },
+      options: {
+        maxTaskPlanReviewRounds: requirementInput.maxDesignReviewRounds,
+        startingRound: existingState.taskPlanReviews.length + 1
+      },
       signal: input.signal,
+      initialPlan: existingState.plan,
       hooks: {
         onPlan: async ({ round, planVersion, plan }) => {
           const draftPath = join(artifactDir, "task-plan-draft.json");
@@ -259,15 +263,23 @@ async function readJson(file: string): Promise<unknown> {
 async function readExistingWorkflowState(artifactDir: string): Promise<{
   design?: string;
   reviews: DesignReview[];
+  taskPlanReviews: TaskPlanReview[];
+  plan?: TaskPlan;
 }> {
-  const [design, reviews] = await Promise.all([
+  const [design, reviews, taskPlanReviews, draftPlan, finalPlan] = await Promise.all([
     readOptionalText(join(artifactDir, "design.md")),
-    readOptionalJson<DesignReview[]>(join(artifactDir, "reviews.json"))
+    readOptionalJson<DesignReview[]>(join(artifactDir, "reviews.json")),
+    readOptionalJson<TaskPlanReview[]>(join(artifactDir, "task-plan-reviews.json")),
+    readOptionalJson<TaskPlan>(join(artifactDir, "task-plan-draft.json")),
+    readOptionalJson<TaskPlan>(join(artifactDir, "task-plan.json"))
   ]);
 
   return {
     design,
-    reviews: reviews ?? []
+    reviews: reviews ?? [],
+    taskPlanReviews: taskPlanReviews ?? [],
+    // Prefer the draft when continuing planning so blocked or interrupted revisions keep iterating in place.
+    plan: draftPlan ?? finalPlan
   };
 }
 
