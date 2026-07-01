@@ -1,6 +1,8 @@
 import type { AoCliAdapter } from "../adapters/ao.js";
 import type { ExecutionTask, TaskPlan } from "../schemas/task-plan.js";
 
+export type BlockedTaskKind = "waiting_dependencies" | "manual_gate";
+
 export interface PlanExecutionResult {
   sessions: Array<{
     taskId: string;
@@ -9,6 +11,7 @@ export interface PlanExecutionResult {
   }>;
   blockedTasks: Array<{
     taskId: string;
+    kind: BlockedTaskKind;
     reason: string;
   }>;
 }
@@ -16,7 +19,9 @@ export interface PlanExecutionResult {
 export async function executePlan(input: {
   plan: TaskPlan;
   ao: AoCliAdapter;
+  releasedManualGateTaskIds?: string[];
 }): Promise<PlanExecutionResult> {
+  const releasedManualGateTaskIds = new Set(input.releasedManualGateTaskIds ?? []);
   const completed = new Set(
     input.plan.tasks.filter((task) => task.status === "completed").map((task) => task.taskId)
   );
@@ -34,11 +39,12 @@ export async function executePlan(input: {
       continue;
     }
 
-    const readiness = getTaskReadiness(task, completed);
+    const readiness = getTaskReadiness(task, completed, releasedManualGateTaskIds);
 
     if (!readiness.ready) {
       blockedTasks.push({
         taskId: task.taskId,
+        kind: readiness.kind,
         reason: readiness.reason
       });
       continue;
@@ -58,14 +64,25 @@ export async function executePlan(input: {
 
 function getTaskReadiness(
   task: ExecutionTask,
-  completed: ReadonlySet<string>
-): { ready: true } | { ready: false; reason: string } {
+  completed: ReadonlySet<string>,
+  releasedManualGateTaskIds: ReadonlySet<string>
+): { ready: true } | { ready: false; kind: BlockedTaskKind; reason: string } {
   if (task.dependencyCondition === "manual_gate") {
     const dependenciesCompleted = task.dependencies.every((dependency) => completed.has(dependency));
-    // TODO: Add a CLI/API approval mechanism so completed manual gates can be released explicitly.
-    return dependenciesCompleted
-      ? { ready: false, reason: "manual_gate requires human approval before dispatch" }
-      : { ready: false, reason: `waiting for dependencies: ${task.dependencies.join(", ")}` };
+    if (!dependenciesCompleted) {
+      return {
+        ready: false,
+        kind: "waiting_dependencies",
+        reason: `waiting for dependencies: ${task.dependencies.join(", ")}`
+      };
+    }
+    return releasedManualGateTaskIds.has(task.taskId)
+      ? { ready: true }
+      : {
+          ready: false,
+          kind: "manual_gate",
+          reason: "manual_gate requires human approval before dispatch"
+        };
   }
 
   if (task.dependencies.length === 0) {
@@ -75,11 +92,19 @@ function getTaskReadiness(
   if (task.dependencyCondition === "any_completed") {
     return task.dependencies.some((dependency) => completed.has(dependency))
       ? { ready: true }
-      : { ready: false, reason: `waiting for any dependency: ${task.dependencies.join(", ")}` };
+      : {
+          ready: false,
+          kind: "waiting_dependencies",
+          reason: `waiting for any dependency: ${task.dependencies.join(", ")}`
+        };
   }
 
   const unresolved = task.dependencies.filter((dependency) => !completed.has(dependency));
   return unresolved.length === 0
     ? { ready: true }
-    : { ready: false, reason: `waiting for dependencies: ${unresolved.join(", ")}` };
+    : {
+        ready: false,
+        kind: "waiting_dependencies",
+        reason: `waiting for dependencies: ${unresolved.join(", ")}`
+      };
 }

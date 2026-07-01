@@ -372,7 +372,8 @@ export function renderIndexHtml(): string {
           <button id="saveDraftButton" class="secondary" type="button">保存草稿</button>
           <button id="clearDraftButton" class="secondary" type="button">清空草稿</button>
           <button id="planButton" class="secondary" type="button" disabled>继续审查任务计划</button>
-          <button id="dryRunButton" class="secondary" type="button" disabled>预演执行</button>
+          <button id="executeButton" class="secondary" type="button" disabled>派发执行</button>
+          <button id="releaseManualGateButton" class="secondary" type="button" disabled title="先点击派发执行，以识别需要人工放行的 manual_gate 任务。">放行门禁</button>
         </div>
         <div id="draftStatus" class="status">表单草稿会自动保存到本地。</div>
         <div id="formStatus" class="status"></div>
@@ -392,7 +393,7 @@ export function renderIndexHtml(): string {
           <button class="tab" type="button" data-tab="design">设计稿</button>
           <button class="tab" type="button" data-tab="reviews">审查</button>
           <button class="tab" type="button" data-tab="plan">任务计划</button>
-          <button class="tab" type="button" data-tab="execution">执行预演</button>
+          <button class="tab" type="button" data-tab="execution">AO 执行</button>
         </div>
       </div>
       <div class="content">
@@ -432,7 +433,8 @@ export function renderIndexHtml(): string {
     const saveDraftButton = document.querySelector("#saveDraftButton");
     const clearDraftButton = document.querySelector("#clearDraftButton");
     const planButton = document.querySelector("#planButton");
-    const dryRunButton = document.querySelector("#dryRunButton");
+    const executeButton = document.querySelector("#executeButton");
+    const releaseManualGateButton = document.querySelector("#releaseManualGateButton");
     const projectButton = document.querySelector("#projectButton");
     const projectDialog = document.querySelector("#projectDialog");
     const closeProjectDialog = document.querySelector("#closeProjectDialog");
@@ -594,29 +596,16 @@ export function renderIndexHtml(): string {
       }
     });
 
-    dryRunButton.addEventListener("click", async () => {
-      if (!state.result?.workflow?.workflowId) return;
-      setBusy(true, "正在预演 AO 下发...");
-      try {
-        const response = await fetch("/api/ao/execute", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            workflowId: state.result.workflow.workflowId,
-            projectRoot: getProjectRoot(),
-            dryRun: true
-          })
-        });
-        state.execution = await readResponse(response);
-        state.activeTab = "execution";
-        activateTab("execution");
-        renderActiveTab();
-        setStatus("ok", "预演完成。");
-      } catch (error) {
-        setStatus("bad", error.message || String(error));
-      } finally {
-        setBusy(false);
-      }
+    executeButton.addEventListener("click", async () => {
+      const dispatchableCount = getDispatchableTaskCount([]);
+      if (!confirm("即将真实派发 " + dispatchableCount + " 个任务到 AO，是否继续？")) return;
+      await executeAoPlan([], "正在向 AO 派发任务...");
+    });
+
+    releaseManualGateButton.addEventListener("click", async () => {
+      const releasedManualGateTaskIds = getManualGateBlockedTaskIds();
+      if (!confirm("即将真实放行并派发 " + releasedManualGateTaskIds.length + " 个 manual_gate 任务到 AO，是否继续？")) return;
+      await executeAoPlan(releasedManualGateTaskIds, "正在放行 manual_gate 任务...");
     });
 
     document.querySelectorAll(".tab").forEach((tab) => {
@@ -983,7 +972,9 @@ export function renderIndexHtml(): string {
       deleteDraftButton.disabled = busy || !state.requirementDrafts.length;
       planButton.disabled = busy || !canReviewTaskPlan(state.result);
       planButton.title = getPlanButtonTitle(busy, state.result);
-      dryRunButton.disabled = busy || state.result?.workflow?.status !== "executing" || !state.result?.plan;
+      executeButton.disabled = busy || state.result?.workflow?.status !== "executing" || !state.result?.plan;
+      releaseManualGateButton.disabled = busy || getManualGateBlockedTaskIds().length === 0;
+      releaseManualGateButton.title = getReleaseManualGateButtonTitle();
       clearDraftButton.disabled = busy;
       if (message) setStatus("warn", message);
     }
@@ -1020,7 +1011,9 @@ export function renderIndexHtml(): string {
       deleteDraftButton.disabled = running || !state.requirementDrafts.length;
       planButton.disabled = running || !canReviewTaskPlan(result);
       planButton.title = getPlanButtonTitle(running, result);
-      dryRunButton.disabled = running || result?.workflow?.status !== "executing" || !result?.plan;
+      executeButton.disabled = running || result?.workflow?.status !== "executing" || !result?.plan;
+      releaseManualGateButton.disabled = running || getManualGateBlockedTaskIds().length === 0;
+      releaseManualGateButton.title = getReleaseManualGateButtonTitle();
     }
 
     function canReviewTaskPlan(result) {
@@ -1066,8 +1059,75 @@ export function renderIndexHtml(): string {
       } else if (state.activeTab === "plan") {
         output.textContent = JSON.stringify(state.result?.plan || state.job?.plan || null, null, 2);
       } else {
-        output.textContent = JSON.stringify(state.execution || { message: "尚未执行预演。" }, null, 2);
+        output.textContent = JSON.stringify(state.execution || { message: "尚未执行 AO 派发。" }, null, 2);
       }
+    }
+
+    async function executeAoPlan(releasedManualGateTaskIds, busyMessage) {
+      if (!state.result?.workflow?.workflowId) return;
+      setBusy(true, busyMessage);
+      try {
+        const response = await fetch("/api/ao/execute", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            workflowId: state.result.workflow.workflowId,
+            projectRoot: getProjectRoot(),
+            dryRun: false,
+            releasedManualGateTaskIds
+          })
+        });
+        state.execution = await readResponse(response);
+        state.activeTab = "execution";
+        activateTab("execution");
+        renderActiveTab();
+        updateSummary();
+        setStatus("ok", getExecutionSuccessMessage(state.execution));
+      } catch (error) {
+        setStatus("bad", error.message || String(error));
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    function getManualGateBlockedTaskIds() {
+      return (state.execution?.blockedTasks || [])
+        .filter((task) => task.kind === "manual_gate")
+        .map((task) => task.taskId)
+        .filter(Boolean);
+    }
+
+    function getReleaseManualGateButtonTitle() {
+      const count = getManualGateBlockedTaskIds().length;
+      if (count > 0) return "放行当前识别到的 " + count + " 个 manual_gate 任务。";
+      return "先点击派发执行，以识别需要人工放行的 manual_gate 任务。";
+    }
+
+    function getExecutionSuccessMessage(execution) {
+      const sessionCount = execution?.sessions?.length || 0;
+      const blockedCount = execution?.blockedTasks?.length || 0;
+      return "AO 已派发 " + sessionCount + " 个任务" + (blockedCount > 0 ? "，" + blockedCount + " 个任务仍在等待。" : "。");
+    }
+
+    function getDispatchableTaskCount(releasedManualGateTaskIds) {
+      const tasks = state.result?.plan?.tasks || [];
+      const released = new Set(releasedManualGateTaskIds || []);
+      const completed = new Set(tasks.filter((task) => task.status === "completed").map((task) => task.taskId));
+      const alreadyWorking = new Set(
+        tasks
+          .filter((task) => task.status === "working" || Boolean(task.aoSessionId))
+          .map((task) => task.taskId)
+      );
+      return tasks.filter((task) => {
+        if (task.status !== "pending" || alreadyWorking.has(task.taskId)) return false;
+        if (task.dependencyCondition === "manual_gate" && !released.has(task.taskId)) return false;
+        const dependencies = task.dependencies || [];
+        if (dependencies.length === 0) return true;
+        if (task.dependencyCondition === "any_completed") {
+          return dependencies.some((dependency) => completed.has(dependency));
+        }
+        return dependencies.every((dependency) => completed.has(dependency));
+      }).length;
     }
 
     function outputHasSelection() {

@@ -255,6 +255,7 @@ async function routeRequest(input: {
     const body = (await readJsonBody(input.request)) as {
       workflowId?: string;
       dryRun?: boolean;
+      releasedManualGateTaskIds?: string[];
     } & ProjectScopedRequest;
     if (!body.workflowId) {
       sendJson(input.response, 400, { error: "workflowId is required" });
@@ -264,12 +265,21 @@ async function routeRequest(input: {
     const store = createRequestStore(body, input.defaultArtifactRoot);
     const projectRoot = resolveProjectRoot(body, input.aoProjectRoot);
     const plan = await store.readTaskPlan(body.workflowId);
+    const releasedManualGateTaskIds = normalizeReleasedManualGateTaskIds(
+      body.releasedManualGateTaskIds,
+      plan
+    );
+    if (releasedManualGateTaskIds instanceof Error) {
+      sendJson(input.response, 400, { error: releasedManualGateTaskIds.message });
+      return;
+    }
     const result = await executePlan({
       plan,
       ao: new AoCliAdapter({
         projectRoot,
         dryRun: body.dryRun ?? true
-      })
+      }),
+      releasedManualGateTaskIds
     });
     sendJson(input.response, 200, result);
     return;
@@ -300,6 +310,37 @@ function createRequestStore(
 function resolveArtifactRoot(request: ProjectScopedRequest, defaultArtifactRoot: string): string {
   const projectRoot = request.projectRoot?.trim();
   return projectRoot ? join(resolve(projectRoot), ".ao-control-plane") : defaultArtifactRoot;
+}
+
+function normalizeReleasedManualGateTaskIds(
+  value: unknown,
+  plan: { tasks: Array<{ taskId: string; dependencyCondition: string }> }
+): string[] | Error {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    return new Error("releasedManualGateTaskIds must be an array of task ids");
+  }
+
+  const taskById = new Map(plan.tasks.map((task) => [task.taskId, task]));
+  const normalized = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== "string" || item.trim().length === 0) {
+      return new Error("releasedManualGateTaskIds must contain non-empty task ids");
+    }
+    const taskId = item.trim();
+    const task = taskById.get(taskId);
+    if (!task) {
+      return new Error(`releasedManualGateTaskIds contains unknown task id: ${taskId}`);
+    }
+    if (task.dependencyCondition !== "manual_gate") {
+      return new Error(`releasedManualGateTaskIds contains non-manual_gate task id: ${taskId}`);
+    }
+    normalized.add(taskId);
+  }
+
+  return [...normalized];
 }
 
 async function deleteDraftArtifacts(

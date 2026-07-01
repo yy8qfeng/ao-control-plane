@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import { ArtifactStore } from "./artifact-store.js";
+import { defaultExecutionPolicy } from "../schemas/execution-policy.js";
 import {
   createTaskPlanStage,
   runDesignReviewStage,
@@ -153,6 +154,7 @@ describe("runGovernanceWorkflow", () => {
             acceptanceCriteria: ["Existing draft criterion"],
             aoPrompt:
               "[WF-STAGED-CONTINUE / TASK-001]\n任务名称：Keep existing task\nAO 角色：backend-senior\n验收标准：\n1. Existing draft criterion\n上下文摘要：Continue.",
+            executionPolicy: defaultExecutionPolicy,
             status: "pending"
           }
         ]
@@ -260,6 +262,7 @@ function createPlan(workflowId: string, criterion: string) {
         aoRole: "backend-senior" as const,
         acceptanceCriteria: [criterion],
         aoPrompt: `[${workflowId} / TASK-001]\n任务名称：Implement feature\nAO 角色：backend-senior\n验收标准：\n1. ${criterion}\n上下文摘要：Follow the approved design.`,
+        executionPolicy: defaultExecutionPolicy,
         status: "pending" as const
       }
     ]

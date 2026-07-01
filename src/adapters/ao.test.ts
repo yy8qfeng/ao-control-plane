@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { defaultExecutionPolicy } from "../schemas/execution-policy.js";
 import type { ExecutionTask } from "../schemas/task-plan.js";
 import { buildSpawnArgs, parseSessionId } from "./ao.js";
 
@@ -15,6 +16,7 @@ describe("buildSpawnArgs", () => {
       aoRole: "backend-senior",
       acceptanceCriteria: ["API works"],
       aoPrompt: "[WF-001 / TASK-001] Implement API.",
+      executionPolicy: defaultExecutionPolicy,
       status: "pending"
     };
 
@@ -40,6 +42,7 @@ describe("buildSpawnArgs", () => {
       aoRole: "backend-senior",
       acceptanceCriteria: ["API works"],
       aoPrompt: "[WF-001 / TASK-001] Implement API.",
+      executionPolicy: defaultExecutionPolicy,
       status: "pending",
       agent: "codex"
     } as ExecutionTask;

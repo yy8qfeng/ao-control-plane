@@ -2,6 +2,7 @@ import type { DesignReview } from "../schemas/design-review.js";
 import type { Requirement } from "../schemas/requirement.js";
 import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
+import { defaultExecutionPolicy, formatExecutionPolicyTemplate } from "../schemas/execution-policy.js";
 import { taskPlanSchema } from "../schemas/task-plan.js";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -75,6 +76,7 @@ export class CodexCliAdapter implements CodexAdapter {
     options: { signal?: AbortSignal } = {}
   ): Promise<TaskPlan> {
     const deferredFindings = formatDeferredFindings(input.deferredFindings ?? []);
+    const taskPlanRules = formatTaskPlanRules("create");
     const rawOutput = await this.runCodex([
       "你是需求治理层的 Codex 任务拆解负责人。请根据已批准设计稿输出 AO 执行层 task-plan。",
       "",
@@ -94,17 +96,13 @@ export class CodexCliAdapter implements CodexAdapter {
       '    "aoRole": "architect" | "reviewer" | "ui-designer" | "frontend-senior" | "frontend-junior" | "backend-senior" | "backend-junior" | "qa" | "docs" | "second-opinion" | "frontend" | "backend",',
       '    "acceptanceCriteria": ["string"],',
       '    "aoPrompt": "string",',
+      `    "executionPolicy": ${formatExecutionPolicyTemplate()},`,
       '    "status": "pending"',
       "  }]",
       "}",
       "",
       "硬性规则：",
-      "- 任务只能指定 aoRole，禁止出现 agent、model、provider、codex、claudeCode 字段。",
-      "- aoPrompt 中禁止要求 AO worker 选择、切换或调用具体 agent 或 model。",
-      "- 每个 aoPrompt 必须包含 workflowId、taskId、任务名称、AO 角色、验收标准和上下文摘要。",
-      "- taskId 使用 TASK-001 递增。",
-      "- status 全部使用 pending。",
-      "- 如果存在实施阶段遗留审查意见，必须在任务、验收标准或 aoPrompt 约束中体现，不能丢失。",
+      ...taskPlanRules,
       "",
       `workflowId: ${input.workflowId}`,
       "",
@@ -122,6 +120,7 @@ export class CodexCliAdapter implements CodexAdapter {
     input: { currentPlan: TaskPlan; review: TaskPlanReview; approvedDesign: string },
     options: { signal?: AbortSignal } = {}
   ): Promise<TaskPlan> {
+    const taskPlanRules = formatTaskPlanRules("revise");
     const rawOutput = await this.runCodex([
       "你是需求治理层的 Codex 任务拆解负责人。请根据 ClaudeCode 的结构化审查意见整改 task-plan。",
       "",
@@ -129,10 +128,7 @@ export class CodexCliAdapter implements CodexAdapter {
       "",
       "整改规则：",
       "- 保留合理任务，并逐条修复 unresolved finding。",
-      "- 任务只能指定 aoRole，禁止出现 agent、model、provider、codex、claudeCode 字段。",
-      "- aoPrompt 中禁止要求 AO worker 选择、切换或调用具体 agent 或 model。",
-      "- 每个 aoPrompt 必须包含 workflowId、taskId、任务名称、AO 角色、验收标准和上下文摘要。",
-      "- status 全部使用 pending。",
+      ...taskPlanRules,
       "",
       "当前 task-plan JSON：",
       JSON.stringify(input.currentPlan, null, 2),
@@ -205,6 +201,24 @@ async function readCodexOutputFile(outputFile: string): Promise<string> {
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
+}
+
+function formatTaskPlanRules(mode: "create" | "revise"): string[] {
+  return [
+    "- 任务只能指定 aoRole，禁止出现 agent、model、provider、codex、claudeCode 字段。",
+    "- aoPrompt 中禁止要求 AO worker 选择、切换或调用具体 agent 或 model。",
+    "- 每个 aoPrompt 必须包含 workflowId、taskId、任务名称、AO 角色、验收标准和上下文摘要。",
+    "- taskId 使用 TASK-001 递增。",
+    "- status 全部使用 pending。",
+    "- 每个 implementation 任务必须包含 executionPolicy，且 executionPolicy 必须完整等于 JSON 模板中的默认执行策略：所有 bool 字段为 true，maxQaRounds 和 maxReviewRounds 均为 3。",
+    "- 任务必须足够细：每个任务只覆盖一个清晰模块或一个可验证交付物；单个任务验收标准不得超过 7 条，超过必须拆分。",
+    "- 先拆接口、协议、契约、测试骨架等前置任务，再拆实现任务；跨平台实现必须通过共享抽象或接口冻结任务避免并行冲突。",
+    "- 依赖必须完整、无环、无未知 taskId；人工放行门禁使用 dependencyCondition=manual_gate。",
+    "- 对需要仓库实读或人工确认的前置校准任务，必须设为独立任务，并让后续实现任务显式依赖它。",
+    mode === "revise"
+      ? "- 如果当前计划已有实施阶段遗留审查意见，整改后必须继续保留在任务、验收标准或 aoPrompt 约束中，不能丢失。"
+      : "- 如果存在实施阶段遗留审查意见，必须在任务、验收标准或 aoPrompt 约束中体现，不能丢失。"
+  ];
 }
 
 export class PlaceholderCodexAdapter implements CodexAdapter {
@@ -291,6 +305,9 @@ export class PlaceholderCodexAdapter implements CodexAdapter {
             summarizeDesignForAoPrompt(input.approvedDesign),
             formatDeferredFindingsForAoPrompt(input.deferredFindings ?? [])
           ].join("\n"),
+          executionPolicy: {
+            ...defaultExecutionPolicy
+          },
           status: "pending"
         }
       ]
@@ -307,6 +324,9 @@ export class PlaceholderCodexAdapter implements CodexAdapter {
       ...input.currentPlan,
       tasks: input.currentPlan.tasks.map((task) => ({
         ...task,
+        executionPolicy: {
+          ...defaultExecutionPolicy
+        },
         acceptanceCriteria: [
           ...task.acceptanceCriteria,
           ...unresolved.map((finding) => `已整改任务计划审查意见 ${finding.id}：${finding.title}`)

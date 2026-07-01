@@ -106,14 +106,19 @@ program
   .argument("<file>", "Task plan JSON file")
   .option("--project-root <path>", "AO project root used as cwd for ao CLI")
   .option("--dry-run", "Print intended AO calls without spawning sessions")
+  .option("--release-manual-gate <taskId...>", "Explicitly release manual_gate task ids for dispatch")
   .description("Execute a validated task plan through AO built-in roles")
-  .action(async (file: string, options: { projectRoot?: string; dryRun?: boolean }) => {
+  .action(async (file: string, options: { projectRoot?: string; dryRun?: boolean; releaseManualGate?: string[] }) => {
     const plan = await readTaskPlan(file);
     const ao = new AoCliAdapter({
       projectRoot: options.projectRoot,
       dryRun: options.dryRun
     });
-    const result = await executePlan({ plan, ao });
+    const result = await executePlan({
+      plan,
+      ao,
+      releasedManualGateTaskIds: options.releaseManualGate
+    });
     console.log(JSON.stringify(result, null, 2));
   });
 

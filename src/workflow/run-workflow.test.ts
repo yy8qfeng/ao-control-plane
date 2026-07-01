@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { StructuredOutputError, type ClaudeCodeAdapter } from "../adapters/claude-code.js";
 import type { CodexAdapter } from "../adapters/codex.js";
 import type { DesignReview } from "../schemas/design-review.js";
+import { defaultExecutionPolicy } from "../schemas/execution-policy.js";
 import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
 import { runWorkflow } from "./run-workflow.js";
@@ -512,6 +513,7 @@ function createPlan(workflowId: string, criterion: string): TaskPlan {
         aoRole: "backend-senior",
         acceptanceCriteria: [criterion],
         aoPrompt: `[${workflowId} / TASK-001]\n任务名称：Implement feature\nAO 角色：backend-senior\n验收标准：\n1. ${criterion}\n上下文摘要：Follow the approved design.`,
+        executionPolicy: defaultExecutionPolicy,
         status: "pending"
       }
     ]

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { defaultExecutionPolicy } from "../schemas/execution-policy.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
 import {
   createCompletionReport,
@@ -22,6 +23,7 @@ const plan: TaskPlan = {
       aoRole: "backend-senior",
       acceptanceCriteria: ["API works"],
       aoPrompt: "[WF-001 / TASK-001] Implement API.",
+      executionPolicy: defaultExecutionPolicy,
       status: "pending"
     }
   ]

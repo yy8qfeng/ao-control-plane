@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { ClaudeCodeAdapter } from "../adapters/claude-code.js";
 import type { CodexAdapter } from "../adapters/codex.js";
 import type { DesignReview } from "../schemas/design-review.js";
+import { defaultExecutionPolicy } from "../schemas/execution-policy.js";
 import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
 import { startWebServer } from "./server.js";
@@ -121,6 +122,97 @@ describe("web server", () => {
 
     expect(executionResponse.status).toBe(200);
     expect(execution.sessions).toHaveLength(1);
+  });
+
+  it("releases manual gate tasks through the AO execute API in dry-run mode", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    const projectRoot = join(tempDir, "project");
+    await mkdir(projectRoot);
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir
+    });
+    await seedExecutingWorkflow(projectRoot, "WF-MANUAL-GATE", createManualGatePlan("WF-MANUAL-GATE"));
+
+    // Keep direct /api/ao/execute tests in dry-run mode so the suite never starts real AO sessions.
+    const blockedResponse = await fetch(`${server.url}/api/ao/execute`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectRoot,
+        workflowId: "WF-MANUAL-GATE",
+        dryRun: true
+      })
+    });
+    const blocked = (await blockedResponse.json()) as { sessions: unknown[]; blockedTasks: Array<{ taskId: string }> };
+    expect(blockedResponse.status).toBe(200);
+    expect(blocked.sessions).toEqual([]);
+    expect(blocked.blockedTasks).toEqual([
+      {
+        taskId: "TASK-002",
+        kind: "manual_gate",
+        reason: "manual_gate requires human approval before dispatch"
+      }
+    ]);
+
+    const releasedResponse = await fetch(`${server.url}/api/ao/execute`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectRoot,
+        workflowId: "WF-MANUAL-GATE",
+        dryRun: true,
+        releasedManualGateTaskIds: ["TASK-002"]
+      })
+    });
+    const released = (await releasedResponse.json()) as { sessions: Array<{ taskId: string; sessionId: string }> };
+    expect(releasedResponse.status).toBe(200);
+    expect(released.sessions).toEqual([
+      {
+        taskId: "TASK-002",
+        aoRole: "qa",
+        sessionId: "dry-run-TASK-002"
+      }
+    ]);
+  });
+
+  it("rejects invalid manual gate release ids through the AO execute API", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    const projectRoot = join(tempDir, "project");
+    await mkdir(projectRoot);
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir
+    });
+    await seedExecutingWorkflow(projectRoot, "WF-MANUAL-GATE", createManualGatePlan("WF-MANUAL-GATE"));
+
+    const unknownResponse = await fetch(`${server.url}/api/ao/execute`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectRoot,
+        workflowId: "WF-MANUAL-GATE",
+        dryRun: true,
+        releasedManualGateTaskIds: ["TASK-404"]
+      })
+    });
+    const unknown = (await unknownResponse.json()) as { error: string };
+    expect(unknownResponse.status).toBe(400);
+    expect(unknown.error).toContain("unknown task id: TASK-404");
+
+    const nonManualGateResponse = await fetch(`${server.url}/api/ao/execute`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectRoot,
+        workflowId: "WF-MANUAL-GATE",
+        dryRun: true,
+        releasedManualGateTaskIds: ["TASK-001"]
+      })
+    });
+    const nonManualGate = (await nonManualGateResponse.json()) as { error: string };
+    expect(nonManualGateResponse.status).toBe(400);
+    expect(nonManualGate.error).toContain("non-manual_gate task id: TASK-001");
   });
 
   it("runs the real governance endpoint through injected adapters", async () => {
@@ -610,6 +702,21 @@ describe("web server", () => {
 
     expect(html).toContain("设计已达到可实施标准，部分问题将进入实施阶段处理。");
   });
+
+  it("renders execution controls for real dispatch and structured manual gate release", () => {
+    const html = renderIndexHtml();
+
+    expect(html).toContain('id="executeButton"');
+    expect(html).toContain("派发执行");
+    expect(html).toContain("dryRun: false");
+    expect(html).toContain("即将真实派发");
+    expect(html).toContain("AO 已派发");
+    expect(html).toContain("先点击派发执行，以识别需要人工放行的 manual_gate 任务。");
+    expect(html).toContain('task.kind === "manual_gate"');
+    expect(html).not.toContain('id="dryRunToggle"');
+    expect(html).not.toContain("预演模式");
+    expect(html).not.toContain('task.reason === "manual_gate requires human approval before dispatch"');
+  });
 });
 
 const fakeCodex: CodexAdapter = {
@@ -745,6 +852,44 @@ function createWebPlan(workflowId: string): TaskPlan {
         acceptanceCriteria: ["Permissions are enforced"],
         aoPrompt:
           `[${workflowId} / TASK-001]\n任务名称：Implement permissions\nAO 角色：backend-senior\n验收标准：\n1. Permissions are enforced\n上下文摘要：Use existing middleware.`,
+        executionPolicy: defaultExecutionPolicy,
+        status: "pending"
+      }
+    ]
+  };
+}
+
+function createManualGatePlan(workflowId: string): TaskPlan {
+  return {
+    workflowId,
+    title: "Manual gate plan",
+    tasks: [
+      {
+        taskId: "TASK-001",
+        workflowId,
+        title: "Completed prerequisite",
+        description: "Completed prerequisite.",
+        type: "implementation",
+        dependencies: [],
+        dependencyCondition: "all_completed",
+        aoRole: "backend-senior",
+        acceptanceCriteria: ["Prerequisite completed"],
+        aoPrompt: `[${workflowId} / TASK-001]\n任务名称：Completed prerequisite\nAO 角色：backend-senior\n验收标准：\n1. Prerequisite completed\n上下文摘要：Manual gate test.`,
+        executionPolicy: defaultExecutionPolicy,
+        status: "completed"
+      },
+      {
+        taskId: "TASK-002",
+        workflowId,
+        title: "Manual gate verification",
+        description: "Manual gate verification.",
+        type: "verification",
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        aoRole: "qa",
+        acceptanceCriteria: ["Manual gate released"],
+        aoPrompt: `[${workflowId} / TASK-002]\n任务名称：Manual gate verification\nAO 角色：qa\n验收标准：\n1. Manual gate released\n上下文摘要：Manual gate test.`,
+        executionPolicy: defaultExecutionPolicy,
         status: "pending"
       }
     ]
@@ -788,6 +933,42 @@ async function seedReadyForPlanningWorkflow(projectRoot: string, workflowId: str
       findings: []
     }
   ]);
+}
+
+async function seedExecutingWorkflow(projectRoot: string, workflowId: string, plan: TaskPlan): Promise<void> {
+  const workflowDir = join(projectRoot, ".ao-control-plane", workflowId);
+  await mkdir(workflowDir, { recursive: true });
+  await writeJson(join(workflowDir, "requirement.json"), {
+    id: workflowId,
+    title: "Manual gate",
+    source: "test",
+    description: "Manual gate execution.",
+    acceptanceCriteria: [],
+    constraints: []
+  });
+  await writeJson(join(workflowDir, "workflow.json"), {
+    workflowId,
+    title: "Manual gate",
+    rawRequirement: "Manual gate execution.",
+    status: "executing",
+    designRounds: 1,
+    maxDesignReviewRounds: 3,
+    approvedDesignVersion: "design-current",
+    tasks: plan.tasks.map((task) => task.taskId)
+  });
+  await writeFile(join(workflowDir, "design.md"), "# Manual gate\n\n## 背景与问题定义\nManual gate execution.", "utf8");
+  await writeJson(join(workflowDir, "reviews.json"), [
+    {
+      workflowId,
+      round: 1,
+      designer: "codex",
+      reviewer: "claude-code",
+      designVersion: "design-current",
+      reviewDecision: "approved",
+      findings: []
+    }
+  ]);
+  await writeJson(join(workflowDir, "task-plan.json"), plan);
 }
 
 async function waitForCondition(predicate: () => boolean, message: string): Promise<void> {

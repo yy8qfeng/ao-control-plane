@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { defaultExecutionPolicy } from "../schemas/execution-policy.js";
 import { ArtifactStore } from "./artifact-store.js";
 
 let tempDir: string | undefined;
@@ -96,6 +97,7 @@ describe("ArtifactStore", () => {
             acceptanceCriteria: ["Draft criterion"],
             aoPrompt:
               "[WF-PLAN-REVIEWS / TASK-001]\n任务名称：Draft task\nAO 角色：backend-senior\n验收标准：\n1. Draft criterion\n上下文摘要：Persist draft.",
+            executionPolicy: defaultExecutionPolicy,
             status: "pending"
           }
         ]

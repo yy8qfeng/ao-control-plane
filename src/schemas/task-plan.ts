@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { aoRoleSchema } from "./ao-role.js";
+import { executionPolicySchema } from "./execution-policy.js";
 
 const forbiddenExecutionFields = ["agent", "model", "provider", "codex", "claudeCode"] as const;
 const agentSelectionPromptPatterns = [
@@ -42,6 +43,7 @@ export const executionTaskSchema = z
     acceptanceCriteria: z.array(z.string().min(1)).min(1),
     aoPrompt: z.string().min(1),
     status: taskStatusSchema.default("pending"),
+    executionPolicy: executionPolicySchema,
     aoSessionId: z.string().min(1).optional()
   })
   .passthrough()
@@ -66,13 +68,135 @@ export const executionTaskSchema = z
         break;
       }
     }
+
+    if (task.acceptanceCriteria.length > 7) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["acceptanceCriteria"],
+        message: "Execution tasks should be fine-grained; split tasks with more than 7 acceptance criteria"
+      });
+    }
+
+    if (task.status === "working" && !task.aoSessionId) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["aoSessionId"],
+        message: "Working tasks must include aoSessionId"
+      });
+    }
+
+    if (task.aoSessionId && task.status !== "working" && task.status !== "completed") {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["aoSessionId"],
+        message: "Tasks with aoSessionId must be working or completed"
+      });
+    }
   });
 
-export const taskPlanSchema = z.object({
-  workflowId: z.string().min(1),
-  title: z.string().min(1),
-  tasks: z.array(executionTaskSchema).min(1)
-});
+export const taskPlanSchema = z
+  .object({
+    workflowId: z.string().min(1),
+    title: z.string().min(1),
+    tasks: z.array(executionTaskSchema).min(1)
+  })
+  .superRefine((plan, context) => {
+    const taskIds = new Set<string>();
+    let hasDuplicateTaskId = false;
+    for (const [index, task] of plan.tasks.entries()) {
+      if (task.workflowId !== plan.workflowId) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["tasks", index, "workflowId"],
+          message: "Task workflowId must match task-plan workflowId"
+        });
+      }
 
-export type ExecutionTask = z.infer<typeof executionTaskSchema>;
-export type TaskPlan = z.infer<typeof taskPlanSchema>;
+      if (taskIds.has(task.taskId)) {
+        hasDuplicateTaskId = true;
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["tasks", index, "taskId"],
+          message: `Duplicate taskId: ${task.taskId}`
+        });
+      }
+      taskIds.add(task.taskId);
+    }
+
+    for (const [index, task] of plan.tasks.entries()) {
+      for (const dependency of task.dependencies) {
+        if (!taskIds.has(dependency)) {
+          context.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["tasks", index, "dependencies"],
+            message: `Unknown dependency ${dependency} for task ${task.taskId}`
+          });
+        }
+
+        if (dependency === task.taskId) {
+          context.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["tasks", index, "dependencies"],
+            message: `Task ${task.taskId} must not depend on itself`
+          });
+        }
+      }
+    }
+
+    if (hasDuplicateTaskId) {
+      return;
+    }
+
+    const graph = new Map(plan.tasks.map((task) => [task.taskId, task.dependencies]));
+    const cycle = findDependencyCycle(graph);
+    if (cycle.length > 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["tasks"],
+        message: `Task dependencies must not contain cycles: ${cycle.join(" -> ")}`
+      });
+    }
+  });
+
+export type ExecutionTask = z.output<typeof executionTaskSchema>;
+export type TaskPlan = z.output<typeof taskPlanSchema>;
+
+function findDependencyCycle(graph: Map<string, string[]>): string[] {
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const stack: string[] = [];
+
+  const visit = (taskId: string): string[] => {
+    if (visiting.has(taskId)) {
+      return [...stack.slice(stack.indexOf(taskId)), taskId];
+    }
+    if (visited.has(taskId)) {
+      return [];
+    }
+
+    visiting.add(taskId);
+    stack.push(taskId);
+    for (const dependency of graph.get(taskId) ?? []) {
+      if (!graph.has(dependency)) {
+        continue;
+      }
+      const cycle = visit(dependency);
+      if (cycle.length > 0) {
+        return cycle;
+      }
+    }
+    stack.pop();
+    visiting.delete(taskId);
+    visited.add(taskId);
+    return [];
+  };
+
+  for (const taskId of graph.keys()) {
+    const cycle = visit(taskId);
+    if (cycle.length > 0) {
+      return cycle;
+    }
+  }
+
+  return [];
+}
