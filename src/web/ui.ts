@@ -541,7 +541,11 @@ export function renderIndexHtml(): string {
         const response = await fetch("/api/governance/draft", { method: "DELETE" });
         const config = await readResponse(response);
         state.workflowId = "";
+        state.result = null;
+        state.execution = null;
         renderDraftHistory(config.requirementDrafts || []);
+        updateSummary();
+        renderActiveTab();
         setDraftStatus("warn", "需求草稿已清空。");
         setStatus("ok", "需求草稿已清空。");
       } catch (error) {
@@ -553,6 +557,7 @@ export function renderIndexHtml(): string {
       const workflowId = state.result?.workflow?.workflowId || state.workflowId;
       if (!workflowId) return;
       setBusy(true, "正在生成并审查任务计划...");
+      let startedJob = false;
       try {
         const response = await fetch("/api/governance/plan", {
           method: "POST",
@@ -562,7 +567,19 @@ export function renderIndexHtml(): string {
             projectRoot: getProjectRoot()
           })
         });
-        state.result = await readResponse(response);
+        const responseBody = await readResponse(response);
+        if (responseBody.jobId) {
+          startedJob = true;
+          state.job = responseBody;
+          state.result = null;
+          state.activeTab = "logs";
+          activateTab("logs");
+          updateSummary();
+          renderActiveTab();
+          startPollingJob(responseBody.jobId, "任务计划审查已完成。");
+          return;
+        }
+        state.result = responseBody;
         state.activeTab = "plan";
         activateTab("plan");
         updateSummary();
@@ -571,7 +588,9 @@ export function renderIndexHtml(): string {
       } catch (error) {
         setStatus("bad", error.message || String(error));
       } finally {
-        setBusy(false);
+        if (!startedJob) {
+          setBusy(false);
+        }
       }
     });
 
@@ -893,9 +912,15 @@ export function renderIndexHtml(): string {
     function restoreDraft(draft) {
       if (!draft) {
         state.workflowId = "";
+        state.result = null;
+        state.execution = null;
+        updateSummary();
+        renderActiveTab();
         return;
       }
       state.workflowId = draft.workflowId || "";
+      state.result = null;
+      state.execution = null;
       setFieldValue("title", draft.title);
       setFieldValue("projectRoot", draft.projectRoot || projectRootInput.value);
       setFieldValue("description", draft.description);
@@ -904,6 +929,8 @@ export function renderIndexHtml(): string {
       setFieldValue("constraints", draft.constraints || "");
       setFieldValue("maxDesignReviewRounds", String(draft.maxDesignReviewRounds || 3));
       selectDraftInHistory(draft);
+      updateSummary();
+      renderActiveTab();
       setDraftStatus("ok", "已恢复上次需求草稿" + (draft.updatedAt ? "，保存时间：" + draft.updatedAt : "") + "。");
       setStatus("ok", "已恢复上次需求草稿。");
     }
@@ -981,7 +1008,7 @@ export function renderIndexHtml(): string {
       const result = state.result;
       const job = state.job;
       const running = job?.status === "running";
-      document.querySelector("#workflowId").textContent = result?.workflow?.workflowId || job?.result?.workflow?.workflowId || "未生成";
+      document.querySelector("#workflowId").textContent = result?.workflow?.workflowId || job?.result?.workflow?.workflowId || state.workflowId || "未生成";
       document.querySelector("#workflowStatus").textContent = job?.currentStep || result?.workflow?.status || job?.status || "-";
       document.querySelector("#reviewCount").textContent = String(result?.reviews?.length || job?.reviews?.length || 0);
       document.querySelector("#elapsedSeconds").textContent = String(job?.elapsedSeconds || 0) + "s";

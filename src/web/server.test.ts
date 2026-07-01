@@ -96,12 +96,12 @@ describe("web server", () => {
         workflowId: reviewed.workflow.workflowId
       })
     });
-    const planned = (await planResponse.json()) as {
-      workflow: { workflowId: string; status: string };
-      plan: { tasks: unknown[] };
-    };
+    const planJob = (await planResponse.json()) as { jobId: string; status: string; logs: string[] };
 
-    expect(planResponse.status).toBe(200);
+    expect(planResponse.status).toBe(202);
+    expect(planJob.status).toBe("running");
+    expect(planJob.logs[0]).toContain("任务计划续审任务");
+    const planned = await waitForJob(server.url, planJob.jobId);
     expect(planned.workflow.status).toBe("executing");
     expect(planned.plan.tasks).toHaveLength(1);
     await expect(
@@ -196,6 +196,63 @@ describe("web server", () => {
     expect(stopResponse.status).toBe(200);
     expect(stopped.status).toBe("stopped");
     expect(stopped.currentStep).toBe("已停止");
+  });
+
+  it("passes the stop signal into a running task-plan job", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    const projectRoot = join(tempDir, "project");
+    await mkdir(projectRoot);
+    let planSignal: AbortSignal | undefined;
+    const slowPlanCodex: CodexAdapter = {
+      createDesign: fakeCodex.createDesign,
+      reviseDesign: fakeCodex.reviseDesign,
+      async createTaskPlan(_input, options) {
+        planSignal = options?.signal;
+        await new Promise((_resolve, reject) => {
+          options?.signal?.addEventListener("abort", () => reject(new Error("Workflow was stopped by user")), {
+            once: true
+          });
+        });
+        return createWebPlan("WF-PLAN-STOP");
+      },
+      reviseTaskPlan: fakeCodex.reviseTaskPlan
+    };
+
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir,
+      createCodexAdapter: () => slowPlanCodex,
+      createClaudeCodeAdapter: () => fakeClaudeCode
+    });
+
+    await seedReadyForPlanningWorkflow(projectRoot, "WF-PLAN-STOP");
+
+    const planResponse = await fetch(`${server.url}/api/governance/plan`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectRoot,
+        workflowId: "WF-PLAN-STOP"
+      })
+    });
+    const started = (await planResponse.json()) as { jobId: string; status: string };
+    expect(planResponse.status).toBe(202);
+    expect(started.status).toBe("running");
+    await waitForCondition(() => Boolean(planSignal), "task-plan job did not receive an abort signal");
+
+    const stopResponse = await fetch(
+      `${server.url}/api/governance/jobs/${encodeURIComponent(started.jobId)}/stop`,
+      { method: "POST" }
+    );
+    const stopped = (await stopResponse.json()) as { status: string; currentStep: string };
+
+    expect(stopResponse.status).toBe(200);
+    expect(stopped.status).toBe("stopped");
+    expect(stopped.currentStep).toBe("已停止");
+    expect(planSignal?.aborted).toBe(true);
+    await expect(
+      readFile(join(projectRoot, ".ao-control-plane", "WF-PLAN-STOP", "task-plan.json"), "utf8")
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("persists and clears requirement draft form data", async () => {
@@ -696,4 +753,49 @@ function createWebPlan(workflowId: string): TaskPlan {
 
 async function writeJson(file: string, value: unknown): Promise<void> {
   await writeFile(file, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+async function seedReadyForPlanningWorkflow(projectRoot: string, workflowId: string): Promise<void> {
+  const workflowDir = join(projectRoot, ".ao-control-plane", workflowId);
+  await mkdir(workflowDir, { recursive: true });
+  await writeJson(join(workflowDir, "requirement.json"), {
+    id: workflowId,
+    title: "Plan stop",
+    source: "test",
+    description: "Stop task-plan review.",
+    acceptanceCriteria: [],
+    constraints: []
+  });
+  await writeJson(join(workflowDir, "workflow.json"), {
+    workflowId,
+    title: "Plan stop",
+    rawRequirement: "Stop task-plan review.",
+    status: "ready_for_planning",
+    designRounds: 1,
+    maxDesignReviewRounds: 3,
+    approvedDesignVersion: "design-current",
+    tasks: []
+  });
+  await writeFile(join(workflowDir, "design.md"), "# Plan stop\n\n## 背景与问题定义\nStop task-plan review.", "utf8");
+  await writeJson(join(workflowDir, "reviews.json"), [
+    {
+      workflowId,
+      round: 1,
+      designer: "codex",
+      reviewer: "claude-code",
+      designVersion: "design-current",
+      reviewDecision: "approved",
+      findings: []
+    }
+  ]);
+}
+
+async function waitForCondition(predicate: () => boolean, message: string): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(message);
 }

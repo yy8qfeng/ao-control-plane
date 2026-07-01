@@ -1,5 +1,7 @@
 import { PlaceholderClaudeCodeAdapter } from "../adapters/claude-code.js";
+import type { ClaudeCodeAdapter } from "../adapters/claude-code.js";
 import { PlaceholderCodexAdapter } from "../adapters/codex.js";
+import type { CodexAdapter } from "../adapters/codex.js";
 import type { DesignReview } from "../schemas/design-review.js";
 import { requirementSchema, type Requirement } from "../schemas/requirement.js";
 import type { TaskPlanReview } from "../schemas/task-plan-review.js";
@@ -65,6 +67,9 @@ export async function runDesignReviewStage(input: {
 export async function createTaskPlanStage(input: {
   workflowId: string;
   store: ArtifactStore;
+  codex?: CodexAdapter;
+  claudeCode?: ClaudeCodeAdapter;
+  signal?: AbortSignal;
 }): Promise<GovernanceRunResult> {
   const artifacts = await input.store.readWorkflow(input.workflowId);
   const hasExecutablePlan = artifacts.workflow.status === "executing" && Boolean(artifacts.plan);
@@ -82,13 +87,14 @@ export async function createTaskPlanStage(input: {
     workflowId: artifacts.workflow.workflowId,
     approvedDesign: artifacts.design,
     deferredFindings: collectDeferredFindings(artifacts.reviews),
-    codex: new PlaceholderCodexAdapter(),
-    claudeCode: new PlaceholderClaudeCodeAdapter(),
+    codex: input.codex ?? new PlaceholderCodexAdapter(),
+    claudeCode: input.claudeCode ?? new PlaceholderClaudeCodeAdapter(),
     options: {
       maxTaskPlanReviewRounds: artifacts.workflow.maxDesignReviewRounds,
       startingRound: existingTaskPlanReviews.length + 1
     },
-    initialPlan
+    initialPlan,
+    signal: input.signal
   });
   // The loop emits absolute round numbers from startingRound, so appending preserves review history.
   const taskPlanReviews = [...existingTaskPlanReviews, ...planLoop.reviews];

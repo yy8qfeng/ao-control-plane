@@ -185,11 +185,26 @@ async function routeRequest(input: {
       return;
     }
     await rememberProjectRootIfPresent(body, input.projectConfig);
-    const result = await createTaskPlanStage({
-      workflowId: body.workflowId,
-      store: createRequestStore(body, input.defaultArtifactRoot)
+    const job = input.workflowJobs.createJob({
+      currentStep: "准备继续审查任务计划",
+      logs: ["已创建任务计划续审任务，准备调用 Codex 和 ClaudeCode。"]
     });
-    sendJson(input.response, 200, result);
+    void createTaskPlanStage({
+        workflowId: body.workflowId,
+        store: createRequestStore(body, input.defaultArtifactRoot),
+        codex: input.createCodexAdapter?.(resolveProjectRoot(body, input.aoProjectRoot)),
+        claudeCode: input.createClaudeCodeAdapter?.(resolveProjectRoot(body, input.aoProjectRoot)),
+        signal: job.controller.signal
+      }).then((result) => {
+        input.workflowJobs.recordLog(job.snapshot.jobId, {
+          currentStep: "任务计划续审已完成",
+          message: `任务计划续审已完成，产物目录：${result.artifactDir}`
+        });
+        input.workflowJobs.completeGovernanceResult(job.snapshot.jobId, result);
+      }).catch((error: unknown) => {
+        input.workflowJobs.failJob(job.snapshot.jobId, error);
+      });
+    sendJson(input.response, 202, job.snapshot);
     return;
   }
 

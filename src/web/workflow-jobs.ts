@@ -2,6 +2,7 @@ import type { RunWorkflowEvent, RunWorkflowResult } from "../workflow/run-workfl
 import type { DesignReview } from "../schemas/design-review.js";
 import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
+import type { GovernanceRunResult } from "./governance-runner.js";
 
 export interface WorkflowJobSnapshot {
   jobId: string;
@@ -15,7 +16,7 @@ export interface WorkflowJobSnapshot {
   reviews: DesignReview[];
   taskPlanReviews: TaskPlanReview[];
   plan?: TaskPlan;
-  result?: RunWorkflowResult;
+  result?: RunWorkflowResult | GovernanceRunResult;
   error?: string;
 }
 
@@ -28,15 +29,15 @@ export class WorkflowJobStore {
   private readonly jobs = new Map<string, WorkflowJobRuntime>();
   private activeJobId: string | undefined;
 
-  createJob(): WorkflowJobRuntime {
+  createJob(options: { currentStep?: string; logs?: string[] } = {}): WorkflowJobRuntime {
     const job: WorkflowJobSnapshot = {
       jobId: createJobId(),
       status: "running",
       active: true,
       startedAt: new Date().toISOString(),
       elapsedSeconds: 0,
-      currentStep: "准备调用 Codex",
-      logs: ["已创建治理流程任务，准备调用 Codex。"],
+      currentStep: options.currentStep ?? "准备调用 Codex",
+      logs: options.logs ?? ["已创建治理流程任务，准备调用 Codex。"],
       reviews: [],
       taskPlanReviews: []
     };
@@ -60,6 +61,43 @@ export class WorkflowJobStore {
     }
     refreshElapsed(runtime.snapshot);
     return runtime.snapshot;
+  }
+
+  recordLog(jobId: string, input: { currentStep: string; message: string }): void {
+    const runtime = this.jobs.get(jobId);
+    if (!runtime) {
+      return;
+    }
+    const job = runtime.snapshot;
+    if (job.status === "stopped") {
+      return;
+    }
+    job.currentStep = input.currentStep;
+    job.logs.push(input.message);
+    refreshElapsed(job);
+  }
+
+  completeGovernanceResult(jobId: string, result: RunWorkflowResult | GovernanceRunResult): void {
+    const runtime = this.jobs.get(jobId);
+    if (!runtime) {
+      return;
+    }
+    const job = runtime.snapshot;
+    if (job.status === "stopped") {
+      return;
+    }
+    job.status = "completed";
+    job.currentStep = result.workflow.status === "blocked_for_human" ? "等待人工补充" : "后台任务已结束";
+    job.result = result;
+    job.plan = result.plan;
+    job.design = {
+      content: result.design ?? "",
+      path: getDesignPath(result)
+    };
+    job.reviews = result.reviews;
+    job.taskPlanReviews = result.taskPlanReviews ?? [];
+    job.logs.push(`后台任务已结束，状态：${result.workflow.status}。`);
+    refreshElapsed(job);
   }
 
   stopJob(jobId: string): WorkflowJobSnapshot | undefined {
@@ -183,6 +221,13 @@ export class WorkflowJobStore {
     job.logs.push(`流程失败：${job.error}`);
     refreshElapsed(job);
   }
+}
+
+function getDesignPath(result: RunWorkflowResult | GovernanceRunResult): string {
+  if ("designPath" in result && result.designPath) {
+    return result.designPath;
+  }
+  return `${result.artifactDir}/design.md`;
 }
 
 function createJobId(): string {
