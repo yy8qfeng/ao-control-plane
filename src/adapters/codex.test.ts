@@ -81,6 +81,151 @@ describe("CodexCliAdapter", () => {
     expect(plan.tasks[0]?.executionPolicy).toEqual(defaultExecutionPolicy);
     expect("policyRationale" in (plan.tasks[0]?.executionPolicy ?? {})).toBe(false);
   });
+
+  it("normalizes Codex design coverage trace aliases and unknown evidence task ids", async () => {
+    codexOutput.value = JSON.stringify({
+      workflowId: "WF-001",
+      title: "Plan",
+      designCoverageTrace: [
+        {
+          requirement: "IPv6 实现、冒烟或验收证据",
+          sourceRef: "目标与非目标",
+          status: "covered",
+          taskIds: ["TASK-001", "TASK-999"],
+          rationale: "IPv6 由 TASK-001 覆盖。"
+        }
+      ],
+      tasks: [
+        {
+          taskId: "TASK-001",
+          workflowId: "WF-001",
+          title: "Verify IPv6 support",
+          description: "Verify IPv6 support.",
+          type: "verification",
+          dependencies: [],
+          dependencyCondition: "all_completed",
+          aoRole: "qa",
+          acceptanceCriteria: ["IPv6 smoke test passes"],
+          aoPrompt: "[WF-001 / TASK-001] Verify IPv6 support.",
+          status: "pending"
+        }
+      ]
+    });
+    const codex = new CodexCliAdapter({ codexBin: "codex-test" });
+
+    const plan = await codex.createTaskPlan({
+      workflowId: "WF-001",
+      approvedDesign: "# Design\n\nApproved design."
+    });
+
+    expect(plan.designCoverageTrace).toEqual([
+      {
+        requirementId: "ipv6-support",
+        requirement: "IPv6 实现、冒烟或验收证据",
+        source: "目标与非目标",
+        status: "covered",
+        evidenceTaskIds: ["TASK-001"],
+        rationale: "IPv6 由 TASK-001 覆盖。"
+      }
+    ]);
+  });
+
+  it("skips unidentifiable Codex design coverage trace entries instead of failing schema parsing", async () => {
+    codexOutput.value = JSON.stringify({
+      workflowId: "WF-001",
+      title: "Plan",
+      designCoverageTrace: [
+        {
+          status: "covered",
+          evidenceTaskIds: ["TASK-001"]
+        }
+      ],
+      tasks: [
+        {
+          taskId: "TASK-001",
+          workflowId: "WF-001",
+          title: "Implement feature",
+          description: "Implement the feature.",
+          type: "implementation",
+          dependencies: [],
+          dependencyCondition: "all_completed",
+          aoRole: "backend-senior",
+          acceptanceCriteria: ["Feature works"],
+          aoPrompt: "[WF-001 / TASK-001] Implement feature.",
+          status: "pending"
+        }
+      ]
+    });
+    const codex = new CodexCliAdapter({ codexBin: "codex-test" });
+
+    const plan = await codex.createTaskPlan({
+      workflowId: "WF-001",
+      approvedDesign: "# Design\n\nApproved design."
+    });
+
+    expect(plan.designCoverageTrace).toBeUndefined();
+  });
+
+  it("normalizes human reviewer role aliases from Codex task-plan output", async () => {
+    codexOutput.value = JSON.stringify({
+      workflowId: "WF-001",
+      title: "Plan",
+      tasks: [
+        {
+          taskId: "TASK-001",
+          workflowId: "WF-001",
+          title: "Approve G0 result",
+          description: "Human review and release gate for the G0 result.",
+          type: "review",
+          dependencies: [],
+          dependencyCondition: "manual_gate",
+          aoRole: "human-reviewer",
+          acceptanceCriteria: ["G0 result is reviewed"],
+          aoPrompt: "[WF-001 / TASK-001] Review G0 result.",
+          status: "pending"
+        }
+      ]
+    });
+    const codex = new CodexCliAdapter({ codexBin: "codex-test" });
+
+    const plan = await codex.createTaskPlan({
+      workflowId: "WF-001",
+      approvedDesign: "# Design\n\nApproved design."
+    });
+
+    expect(plan.tasks[0]?.aoRole).toBe("reviewer");
+  });
+
+  it("normalizes calibration task type from Codex task-plan output into review phase calibration", async () => {
+    codexOutput.value = JSON.stringify({
+      workflowId: "WF-001",
+      title: "Plan",
+      tasks: [
+        {
+          taskId: "TASK-001",
+          workflowId: "WF-001",
+          title: "G0 reality check",
+          description: "Calibrate repository reality before implementation.",
+          type: "calibration",
+          dependencies: [],
+          dependencyCondition: "all_completed",
+          aoRole: "architect",
+          acceptanceCriteria: ["G0 result is documented"],
+          aoPrompt: "[WF-001 / TASK-001] G0 reality check.",
+          status: "pending"
+        }
+      ]
+    });
+    const codex = new CodexCliAdapter({ codexBin: "codex-test" });
+
+    const plan = await codex.createTaskPlan({
+      workflowId: "WF-001",
+      approvedDesign: "# Design\n\nApproved design."
+    });
+
+    expect(plan.tasks[0]?.type).toBe("review");
+    expect(plan.tasks[0]?.phase).toBe("calibration");
+  });
 });
 
 describe("PlaceholderCodexAdapter", () => {

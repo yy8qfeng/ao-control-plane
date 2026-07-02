@@ -254,6 +254,193 @@ describe("runGovernanceWorkflow", () => {
     });
   });
 
+  it("continues a rejected draft instead of a stale final plan for executing workflows", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-"));
+    const store = new ArtifactStore(tempDir);
+    const workflowId = "WF-EXECUTING-REJECTED-DRAFT";
+    await store.saveWorkflow({
+      requirement: {
+        id: workflowId,
+        title: "Executing rejected draft",
+        source: "test",
+        description: "Continue a rejected draft task plan.",
+        acceptanceCriteria: [],
+        constraints: []
+      },
+      workflow: {
+        workflowId,
+        title: "Executing rejected draft",
+        rawRequirement: "Continue a rejected draft task plan.",
+        status: "executing",
+        designRounds: 1,
+        maxDesignReviewRounds: 1,
+        approvedDesignVersion: "design-current",
+        tasks: ["TASK-001"]
+      },
+      design: "# Executing rejected draft",
+      reviews: [
+        {
+          workflowId,
+          round: 1,
+          designer: "codex",
+          reviewer: "claude-code",
+          designVersion: "design-current",
+          reviewDecision: "approved",
+          findings: []
+        }
+      ],
+      taskPlanApprovalReport: {
+        workflowId,
+        planVersion: "task-plan-current",
+        generatedAt: "2026-07-02T00:00:00.000Z",
+        approved: false,
+        planReadiness: "gated_implementable",
+        dispatchSummary: {
+          dispatchableTaskCount: 1,
+          waitingTaskCount: 1,
+          manualGateTaskCount: 1,
+          blockingFindingCount: 1
+        },
+        designCoverageTrace: [],
+        findingSummary: [
+          {
+            id: "TPF-DRAFT",
+            title: "Draft still needs changes",
+            severity: "major",
+            status: "unresolved"
+          }
+        ]
+      },
+      plan: createPlan(workflowId, "Old final criterion"),
+      draftPlan: createPlan(workflowId, "Rejected draft criterion")
+    });
+
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        expect(input.plan.tasks[0]?.acceptanceCriteria).toContain("Rejected draft criterion");
+        return {
+          workflowId,
+          round: input.round,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: input.planVersion,
+          reviewDecision: "approved",
+          findings: []
+        };
+      }
+    };
+
+    const reviewed = await createTaskPlanStage({
+      store,
+      workflowId,
+      claudeCode
+    });
+
+    expect(reviewed.workflow.status).toBe("executing");
+    expect(reviewed.plan?.tasks[0]?.acceptanceCriteria).toContain("Rejected draft criterion");
+    expect(reviewed.draftPlan).toBeUndefined();
+    await expect(readFile(join(reviewed.artifactDir, "task-plan.json"), "utf8")).resolves.toContain(
+      "Rejected draft criterion"
+    );
+    await expect(readFile(join(reviewed.artifactDir, "task-plan.json"), "utf8")).resolves.not.toContain(
+      "Old final criterion"
+    );
+  });
+
+  it("removes stale final task plans when replanning an executing workflow is blocked", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-"));
+    const store = new ArtifactStore(tempDir);
+    const workflowId = "WF-EXECUTING-REPLAN-BLOCK";
+    await store.saveWorkflow({
+      requirement: {
+        id: workflowId,
+        title: "Executing replan block",
+        source: "test",
+        description: "Replan an already executable task plan.",
+        acceptanceCriteria: [],
+        constraints: []
+      },
+      workflow: {
+        workflowId,
+        title: "Executing replan block",
+        rawRequirement: "Replan an already executable task plan.",
+        status: "executing",
+        designRounds: 1,
+        maxDesignReviewRounds: 2,
+        approvedDesignVersion: "design-current",
+        tasks: ["TASK-001"]
+      },
+      design: "# Executing replan block",
+      reviews: [
+        {
+          workflowId,
+          round: 1,
+          designer: "codex",
+          reviewer: "claude-code",
+          designVersion: "design-current",
+          reviewDecision: "approved",
+          findings: []
+        }
+      ],
+      plan: createPlan(workflowId, "Old approved criterion")
+    });
+
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(): Promise<TaskPlan> {
+        throw new Error("should continue from existing plan");
+      },
+      async reviseTaskPlan(): Promise<TaskPlan> {
+        return createPlan(workflowId, "Blocked replan draft criterion");
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return {
+          workflowId,
+          round: input.round,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: input.planVersion,
+          reviewDecision: "changes_requested",
+          findings: [
+            {
+              id: `TPF-${input.round}`,
+              title: "继续整改",
+              body: "本轮任务计划仍需整改。",
+              severity: "major",
+              status: "unresolved"
+            }
+          ]
+        };
+      }
+    };
+
+    const planned = await createTaskPlanStage({
+      store,
+      workflowId,
+      codex,
+      claudeCode
+    });
+
+    expect(planned.workflow.status).toBe("blocked_for_human");
+    expect(planned.workflow.tasks).toEqual([]);
+    expect(planned.plan).toBeUndefined();
+    expect(planned.draftPlan?.tasks[0]?.acceptanceCriteria).toContain("Blocked replan draft criterion");
+    await expect(readFile(join(planned.artifactDir, "task-plan.json"), "utf8")).rejects.toMatchObject({
+      code: "ENOENT"
+    });
+    await expect(readFile(join(planned.artifactDir, "task-plan-draft.json"), "utf8")).resolves.toContain(
+      "Blocked replan draft criterion"
+    );
+    await expect(readFile(join(planned.artifactDir, "task-plan-approval-report.json"), "utf8")).resolves.toContain(
+      '"approved": false'
+    );
+  });
+
   it("blocks task planning when ClaudeCode approves but the local gate still finds unresolved findings", async () => {
     tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-"));
     const store = new ArtifactStore(tempDir);

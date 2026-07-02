@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -437,6 +437,91 @@ describe("runWorkflow", () => {
     await expect(
       readFile(join(artifactRoot, "WF-PLAN-CONTINUE", "task-plan.json"), "utf8")
     ).resolves.toContain("初始任务计划");
+  });
+
+  it("removes a stale final task plan when continued planning is blocked", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ao-control-plane-workflow-"));
+    const requirementFile = join(root, "requirement.json");
+    await writeFile(
+      requirementFile,
+      JSON.stringify({
+        id: "WF-STALE-FINAL-BLOCKED",
+        title: "Feature",
+        source: "test",
+        description: "Build the feature.",
+        maxDesignReviewRounds: 2
+      }),
+      "utf8"
+    );
+    const workflowDir = join(root, "artifacts", "WF-STALE-FINAL-BLOCKED");
+    await mkdir(workflowDir, { recursive: true });
+    await writeFile(
+      join(workflowDir, "task-plan.json"),
+      JSON.stringify(createPlan("WF-STALE-FINAL-BLOCKED", "Old final criterion")),
+      "utf8"
+    );
+
+    const codex: CodexAdapter = {
+      async createDesign() {
+        return "# Feature\n\n## 背景与问题定义\nBuild it.";
+      },
+      async reviseDesign() {
+        throw new Error("should not revise approved design");
+      },
+      async createTaskPlan(): Promise<TaskPlan> {
+        throw new Error("should continue from existing plan");
+      },
+      async reviseTaskPlan(): Promise<TaskPlan> {
+        return createPlan("WF-STALE-FINAL-BLOCKED", "Blocked draft criterion");
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      async reviewDesign(input): Promise<DesignReview> {
+        return {
+          workflowId: input.workflowId,
+          round: input.round,
+          designer: "codex",
+          reviewer: "claude-code",
+          designVersion: input.designVersion,
+          reviewDecision: "approved",
+          findings: []
+        };
+      },
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return {
+          workflowId: input.workflowId,
+          round: input.round,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: input.planVersion,
+          reviewDecision: "changes_requested",
+          findings: [
+            {
+              id: `TPF-${input.round}`,
+              title: "任务计划仍需整改",
+              body: "本轮任务计划仍需整改。",
+              severity: "major",
+              status: "unresolved"
+            }
+          ]
+        };
+      }
+    };
+
+    const result = await runWorkflow({
+      requirementFile,
+      artifactRoot: join(root, "artifacts"),
+      codex,
+      claudeCode
+    });
+
+    expect(result.workflow.status).toBe("blocked_for_human");
+    expect(result.workflow.tasks).toEqual([]);
+    expect(result.taskPlanPath).toBeUndefined();
+    await expect(readFile(join(workflowDir, "task-plan.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(join(workflowDir, "task-plan-draft.json"), "utf8")).resolves.toContain(
+      "Blocked draft criterion"
+    );
   });
 
   it("persists stopped workflow status when the user aborts the run", async () => {

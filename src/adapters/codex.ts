@@ -220,6 +220,7 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
 function formatTaskPlanRules(mode: "create" | "revise"): string[] {
   return [
     "- 任务只能指定 aoRole，禁止出现 agent、model、provider、codex、claudeCode 字段。",
+    "- 人工复核任务的 aoRole 必须使用 reviewer，禁止输出 human-reviewer、human_review、manual-reviewer 等非枚举角色；人工等待语义通过 dependencyCondition=manual_gate 表达。",
     "- aoPrompt 中禁止要求 AO worker 选择、切换或调用具体 agent 或 model。",
     "- 每个 aoPrompt 必须包含 workflowId、taskId、任务名称、AO 角色、验收标准和上下文摘要。",
     "- taskId 使用 TASK-001 递增。",
@@ -390,19 +391,154 @@ function normalizeCodexTaskPlanOutput(value: unknown): unknown {
     return value;
   }
 
+  const taskIds = new Set(
+    value.tasks
+      .filter(isRecord)
+      .map((task) => task.taskId)
+      .filter((taskId): taskId is string => typeof taskId === "string" && taskId.trim().length > 0)
+  );
+
   return {
     ...value,
+    designCoverageTrace: normalizeCodexDesignCoverageTrace(value.designCoverageTrace, taskIds),
     tasks: value.tasks.map((task) => {
       if (!isRecord(task)) {
         return task;
       }
 
+      const normalizedType = normalizeCodexTaskType(task.type);
       return {
         ...task,
-        executionPolicy: normalizeCodexExecutionPolicy(task.type, task.executionPolicy)
+        type: normalizedType,
+        phase: normalizeCodexTaskPhase(task.phase, task.type),
+        aoRole: normalizeCodexAoRole(task.aoRole),
+        executionPolicy: normalizeCodexExecutionPolicy(normalizedType, task.executionPolicy)
       };
     })
   };
+}
+
+function normalizeCodexTaskType(value: unknown): unknown {
+  if (value === "calibration") {
+    return "review";
+  }
+  if (value === "planning") {
+    return "design";
+  }
+  if (value === "release") {
+    return "verification";
+  }
+  return value;
+}
+
+function normalizeCodexTaskPhase(phase: unknown, originalType: unknown): unknown {
+  if (phase !== undefined) {
+    return phase;
+  }
+  if (originalType === "calibration" || originalType === "planning" || originalType === "release") {
+    return originalType;
+  }
+  return phase;
+}
+
+function normalizeCodexAoRole(value: unknown): unknown {
+  if (typeof value !== "string") {
+    return value;
+  }
+
+  const normalized = value.trim().toLowerCase().replace(/_/g, "-");
+  if (normalized === "human-reviewer" || normalized === "human-review" || normalized === "manual-reviewer") {
+    return "reviewer";
+  }
+
+  return value;
+}
+
+function normalizeCodexDesignCoverageTrace(value: unknown, taskIds: ReadonlySet<string>): unknown {
+  if (value === undefined) {
+    return value;
+  }
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const normalized = value.flatMap((trace) => {
+    if (!isRecord(trace)) {
+      return [];
+    }
+
+    const requirementId = firstString(
+      trace.requirementId,
+      trace.id,
+      trace.requirementKey,
+      trace.key,
+      inferKnownRequirementId(trace.requirement, trace.title, trace.description)
+    );
+    if (!requirementId) {
+      return [];
+    }
+
+    return [{
+      requirementId,
+      requirement: firstString(trace.requirement, trace.title, trace.description, requirementId) ?? requirementId,
+      source: firstString(trace.source, trace.sourceRef, trace.section, trace.quote, "approvedDesign") ?? "approvedDesign",
+      status: normalizeDesignCoverageStatus(trace.status),
+      evidenceTaskIds: normalizeEvidenceTaskIds(taskIds, trace.evidenceTaskIds, trace.taskIds, trace.evidenceTasks, trace.taskId),
+      ...(typeof trace.rationale === "string" && trace.rationale.trim()
+        ? { rationale: trace.rationale.trim() }
+        : {})
+    }];
+  });
+
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function inferKnownRequirementId(...values: unknown[]): string | undefined {
+  const text = values.filter((value): value is string => typeof value === "string").join("\n");
+  if (!text.trim()) {
+    return undefined;
+  }
+  if (containsAny(text, ["G0", "Repo Reality Check", "仓库现实", "仓库校准", "预实施冻结", "人工复核"])) {
+    return "g0-readiness-gate";
+  }
+  if (containsAny(text, ["JDK 21", "JAR", "依赖调用", "Gradle", "Maven"])) {
+    return "java-jar-delivery";
+  }
+  if (containsAny(text, ["0700", "0600", "ACL", "/dev/shm", "ProgramData", "权限模型", "共享段"])) {
+    return "shared-segment-permission";
+  }
+  if (containsAny(text, ["IPv4/IPv6", "IPv6"])) {
+    return "ipv6-support";
+  }
+  if (containsAny(text, ["OutboundTransport", "send", "发包能力预留", "发送接口"])) {
+    return "outbound-transport-reservation";
+  }
+  return undefined;
+}
+
+function normalizeDesignCoverageStatus(value: unknown): "covered" | "missing" | "deferred" {
+  return value === "covered" || value === "deferred" ? value : "missing";
+}
+
+function normalizeEvidenceTaskIds(taskIds: ReadonlySet<string>, ...values: unknown[]): string[] {
+  const ids = values.flatMap((value) => {
+    if (Array.isArray(value)) {
+      return value;
+    }
+    return value === undefined ? [] : [value];
+  });
+  return [
+    ...new Set(
+      ids
+        .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+        .map((value) => value.trim())
+        .filter((taskId) => taskIds.has(taskId))
+    )
+  ];
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  return values.find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim();
 }
 
 function normalizeCodexExecutionPolicy(type: unknown, policy: unknown): unknown {
@@ -470,6 +606,11 @@ function extractJsonObject(rawOutput: string, errorMessage: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function containsAny(text: string, terms: readonly string[]): boolean {
+  const normalized = text.toLowerCase();
+  return terms.some((term) => normalized.includes(term.toLowerCase()));
 }
 
 function summarizeDesignForAoPrompt(design: string): string {

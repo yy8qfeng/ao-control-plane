@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import type { ClaudeCodeAdapter } from "../adapters/claude-code.js";
 import { StructuredOutputError } from "../adapters/claude-code.js";
@@ -209,8 +209,10 @@ export async function runWorkflow(input: {
 
     if (!planLoop.approved) {
       workflow.status = "blocked_for_human";
+      workflow.tasks = [];
       const taskPlanApprovalReportPath = join(artifactDir, "task-plan-approval-report.json");
       await writeJson(taskPlanApprovalReportPath, planLoop.approvalReport);
+      await removeOptionalFile(join(artifactDir, "task-plan.json"));
       await writeJson(join(artifactDir, "workflow.json"), workflow);
       const result = {
         workflow,
@@ -360,6 +362,10 @@ async function readOptionalText(file: string): Promise<string | undefined> {
 async function writeJson(file: string, value: unknown): Promise<void> {
   await mkdir(dirname(file), { recursive: true });
   await writeFile(file, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+async function removeOptionalFile(file: string): Promise<void> {
+  await rm(file, { force: true });
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
