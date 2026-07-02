@@ -2,7 +2,11 @@ import type { DesignReview } from "../schemas/design-review.js";
 import type { Requirement } from "../schemas/requirement.js";
 import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
-import { formatExecutionPolicyTemplate, getExecutionPolicyForTaskType } from "../schemas/execution-policy.js";
+import {
+  formatExecutionPolicyTemplate,
+  getExecutionPolicyForTaskType,
+  type ExecutionPolicy
+} from "../schemas/execution-policy.js";
 import { taskPlanSchema } from "../schemas/task-plan.js";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -211,6 +215,7 @@ function formatTaskPlanRules(mode: "create" | "revise"): string[] {
     "- taskId 使用 TASK-001 递增。",
     "- status 全部使用 pending。",
     "- 每个任务必须包含完整 executionPolicy，并按任务类型显式差异化；禁止所有任务无脑使用同一套默认策略。",
+    "- executionPolicy 只能包含 developerSelfTestRequired、qaRequired、regressionRequired、reviewerRequired、maxQaRounds、maxReviewRounds、requirePrOrRp 七个字段；禁止在 executionPolicy 内输出 policyRationale、rationale、reason 等说明字段，策略理由应写入 description、acceptanceCriteria 或 aoPrompt。",
     "- implementation/refactor 任务必须保留开发自测、QA、回归、审查、PR/RP，且 maxQaRounds=maxReviewRounds=3。",
     "- design/review/docs/test/verification 任务可按 JSON 模板中的任务类型策略降低不适用环节，但必须说明在任务类型上合理。",
     "- 任务必须足够细：每个任务只覆盖一个清晰模块或一个可验证交付物；单个任务验收标准不得超过 7 条，超过必须拆分。",
@@ -356,7 +361,67 @@ function parseTaskPlanOutput(rawOutput: string, errorMessage: string): TaskPlan 
     throw new Error(`${errorMessage}: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  return taskPlanSchema.parse(parsed);
+  return taskPlanSchema.parse(normalizeCodexTaskPlanOutput(parsed));
+}
+
+function normalizeCodexTaskPlanOutput(value: unknown): unknown {
+  if (!isRecord(value) || !Array.isArray(value.tasks)) {
+    return value;
+  }
+
+  return {
+    ...value,
+    tasks: value.tasks.map((task) => {
+      if (!isRecord(task)) {
+        return task;
+      }
+
+      return {
+        ...task,
+        executionPolicy: normalizeCodexExecutionPolicy(task.type, task.executionPolicy)
+      };
+    })
+  };
+}
+
+function normalizeCodexExecutionPolicy(type: unknown, policy: unknown): unknown {
+  if (!isKnownTaskType(type) || policy === undefined) {
+    return policy;
+  }
+
+  if (!isRecord(policy)) {
+    return policy;
+  }
+
+  const fallbackPolicy = getExecutionPolicyForTaskType(type);
+  const policyWithoutRationale = omitPolicyRationaleFields(policy);
+
+  return {
+    ...policyWithoutRationale,
+    maxQaRounds: normalizeRoundLimit(policyWithoutRationale.maxQaRounds, fallbackPolicy.maxQaRounds),
+    maxReviewRounds: normalizeRoundLimit(policyWithoutRationale.maxReviewRounds, fallbackPolicy.maxReviewRounds)
+  };
+}
+
+function omitPolicyRationaleFields(policy: Record<string, unknown>): Record<string, unknown> {
+  const { policyRationale: _policyRationale, rationale: _rationale, reason: _reason, ...policyWithoutRationale } = policy;
+  return policyWithoutRationale;
+}
+
+function normalizeRoundLimit(value: unknown, fallback: ExecutionPolicy["maxQaRounds"]): ExecutionPolicy["maxQaRounds"] {
+  return value === 1 || value === 2 || value === 3 ? value : fallback;
+}
+
+function isKnownTaskType(type: unknown): type is Parameters<typeof getExecutionPolicyForTaskType>[0] {
+  return (
+    type === "implementation" ||
+    type === "test" ||
+    type === "verification" ||
+    type === "design" ||
+    type === "review" ||
+    type === "docs" ||
+    type === "refactor"
+  );
 }
 
 function extractJsonObject(rawOutput: string, errorMessage: string): string {
@@ -377,6 +442,10 @@ function extractJsonObject(rawOutput: string, errorMessage: string): string {
   }
 
   throw new Error(errorMessage);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function summarizeDesignForAoPrompt(design: string): string {
