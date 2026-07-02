@@ -6,6 +6,7 @@ import type { CodexAdapter } from "../adapters/codex.js";
 import type { DesignReview } from "../schemas/design-review.js";
 import { requirementInputSchema, buildRequirementFromInput } from "../schemas/requirement-input.js";
 import type { Requirement } from "../schemas/requirement.js";
+import type { TaskPlanApprovalReport } from "../schemas/task-plan-approval-report.js";
 import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
 import { taskPlanSchema } from "../schemas/task-plan.js";
@@ -23,6 +24,8 @@ export interface RunWorkflowResult {
   designPath?: string;
   reviewsPath: string;
   taskPlanReviewsPath?: string;
+  taskPlanApprovalReportPath?: string;
+  taskPlanApprovalReport?: TaskPlanApprovalReport;
   taskPlanPath?: string;
   plan?: TaskPlan;
 }
@@ -41,7 +44,7 @@ export type RunWorkflowEvent =
   | { type: "task_plan_local_gate_started"; round: number; planVersion: string }
   | { type: "task_plan_local_gate_failed"; review: TaskPlanReview; path: string }
   | { type: "task_plan_revision_started"; round: number }
-  | { type: "planning_completed"; plan: TaskPlan; path: string }
+  | { type: "planning_completed"; plan: TaskPlan; path: string; approvalReport: TaskPlanApprovalReport; approvalReportPath: string }
   | { type: "workflow_completed"; result: RunWorkflowResult }
   | { type: "workflow_failed"; message: string };
 
@@ -206,6 +209,8 @@ export async function runWorkflow(input: {
 
     if (!planLoop.approved) {
       workflow.status = "blocked_for_human";
+      const taskPlanApprovalReportPath = join(artifactDir, "task-plan-approval-report.json");
+      await writeJson(taskPlanApprovalReportPath, planLoop.approvalReport);
       await writeJson(join(artifactDir, "workflow.json"), workflow);
       const result = {
         workflow,
@@ -217,6 +222,8 @@ export async function runWorkflow(input: {
         designPath: join(artifactDir, "design.md"),
         reviewsPath: join(artifactDir, "reviews.json"),
         taskPlanReviewsPath: join(artifactDir, "task-plan-reviews.json"),
+        taskPlanApprovalReportPath,
+        taskPlanApprovalReport: planLoop.approvalReport,
         plan: planLoop.plan
       };
       await input.onEvent?.({ type: "workflow_completed", result });
@@ -228,9 +235,17 @@ export async function runWorkflow(input: {
     workflow.status = "executing";
     workflow.tasks = plan.tasks.map((task) => task.taskId);
     const taskPlanPath = join(artifactDir, "task-plan.json");
+    const taskPlanApprovalReportPath = join(artifactDir, "task-plan-approval-report.json");
     await writeJson(taskPlanPath, plan);
+    await writeJson(taskPlanApprovalReportPath, planLoop.approvalReport);
     await writeJson(join(artifactDir, "workflow.json"), workflow);
-    await input.onEvent?.({ type: "planning_completed", plan, path: taskPlanPath });
+    await input.onEvent?.({
+      type: "planning_completed",
+      plan,
+      path: taskPlanPath,
+      approvalReport: planLoop.approvalReport,
+      approvalReportPath: taskPlanApprovalReportPath
+    });
 
     const result = {
       workflow,
@@ -242,6 +257,8 @@ export async function runWorkflow(input: {
       designPath: join(artifactDir, "design.md"),
       reviewsPath: join(artifactDir, "reviews.json"),
       taskPlanReviewsPath: join(artifactDir, "task-plan-reviews.json"),
+      taskPlanApprovalReportPath,
+      taskPlanApprovalReport: planLoop.approvalReport,
       taskPlanPath,
       plan
     };

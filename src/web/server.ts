@@ -6,7 +6,7 @@ import { ClaudeCodeCliAdapter, StructuredOutputError } from "../adapters/claude-
 import type { ClaudeCodeAdapter } from "../adapters/claude-code.js";
 import { CodexCliAdapter } from "../adapters/codex.js";
 import type { CodexAdapter } from "../adapters/codex.js";
-import { executePlan } from "../workflow/plan-execution.js";
+import { executePlan, type ManualGateRelease } from "../workflow/plan-execution.js";
 import { runWorkflow } from "../workflow/run-workflow.js";
 import { ArtifactStore } from "./artifact-store.js";
 import { browseDirectories } from "./filesystem-browser.js";
@@ -257,7 +257,7 @@ async function routeRequest(input: {
     const body = (await readJsonBody(input.request)) as {
       workflowId?: string;
       dryRun?: boolean;
-      releasedManualGateTaskIds?: string[];
+      releasedManualGateTaskIds?: Array<string | ManualGateRelease>;
     } & ProjectScopedRequest;
     if (!body.workflowId) {
       sendJson(input.response, 400, { error: "workflowId is required" });
@@ -371,32 +371,61 @@ function resolveArtifactRoot(request: ProjectScopedRequest, defaultArtifactRoot:
 function normalizeReleasedManualGateTaskIds(
   value: unknown,
   plan: { tasks: Array<{ taskId: string; dependencyCondition: string }> }
-): string[] | Error {
+): ManualGateRelease[] | Error {
   if (value === undefined) {
     return [];
   }
   if (!Array.isArray(value)) {
-    return new Error("releasedManualGateTaskIds must be an array of task ids");
+    return new Error("releasedManualGateTaskIds must be an array of task ids or release objects");
   }
 
   const taskById = new Map(plan.tasks.map((task) => [task.taskId, task]));
-  const normalized = new Set<string>();
+  const normalized = new Map<string, ManualGateRelease>();
   for (const item of value) {
-    if (typeof item !== "string" || item.trim().length === 0) {
-      return new Error("releasedManualGateTaskIds must contain non-empty task ids");
+    const release = normalizeManualGateReleaseItem(item);
+    if (release instanceof Error) {
+      return release;
     }
-    const taskId = item.trim();
-    const task = taskById.get(taskId);
+    const task = taskById.get(release.taskId);
     if (!task) {
-      return new Error(`releasedManualGateTaskIds contains unknown task id: ${taskId}`);
+      return new Error(`releasedManualGateTaskIds contains unknown task id: ${release.taskId}`);
     }
     if (task.dependencyCondition !== "manual_gate") {
-      return new Error(`releasedManualGateTaskIds contains non-manual_gate task id: ${taskId}`);
+      return new Error(`releasedManualGateTaskIds contains non-manual_gate task id: ${release.taskId}`);
     }
-    normalized.add(taskId);
+    normalized.set(release.taskId, release);
   }
 
-  return [...normalized];
+  return [...normalized.values()];
+}
+
+function normalizeManualGateReleaseItem(value: unknown): ManualGateRelease | Error {
+  if (typeof value === "string") {
+    const taskId = value.trim();
+    return taskId
+      ? { taskId, decision: "approved", releasedAt: new Date().toISOString() }
+      : new Error("releasedManualGateTaskIds must contain non-empty task ids");
+  }
+
+  if (!isRecord(value)) {
+    return new Error("releasedManualGateTaskIds must contain task ids or release objects");
+  }
+
+  const taskId = typeof value.taskId === "string" ? value.taskId.trim() : "";
+  if (!taskId) {
+    return new Error("manual gate release object must contain a non-empty taskId");
+  }
+  const decision = value.decision;
+  if (decision !== "approved" && decision !== "requires_replan" && decision !== "blocked") {
+    return new Error("manual gate release decision must be approved, requires_replan, or blocked");
+  }
+
+  return {
+    taskId,
+    decision,
+    rationale: typeof value.rationale === "string" && value.rationale.trim() ? value.rationale.trim() : undefined,
+    releasedAt: typeof value.releasedAt === "string" && value.releasedAt.trim() ? value.releasedAt.trim() : new Date().toISOString()
+  };
 }
 
 async function deleteDraftArtifacts(
@@ -637,6 +666,10 @@ function splitStoredLines(value: string | undefined): string[] {
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function assertSafeHost(host: string, allowPublicHost: boolean): void {

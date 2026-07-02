@@ -173,7 +173,13 @@ describe("web server", () => {
         projectRoot,
         workflowId: "WF-MANUAL-GATE",
         dryRun: true,
-        releasedManualGateTaskIds: ["TASK-002"]
+        releasedManualGateTaskIds: [
+          {
+            taskId: "TASK-002",
+            decision: "approved",
+            rationale: "人工确认放行"
+          }
+        ]
       })
     });
     const released = (await releasedResponse.json()) as { sessions: Array<{ taskId: string; sessionId: string }> };
@@ -183,6 +189,33 @@ describe("web server", () => {
         taskId: "TASK-002",
         aoRole: "qa",
         sessionId: "dry-run-TASK-002"
+      }
+    ]);
+
+    const replanResponse = await fetch(`${server.url}/api/ao/execute`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectRoot,
+        workflowId: "WF-MANUAL-GATE",
+        dryRun: true,
+        releasedManualGateTaskIds: [
+          {
+            taskId: "TASK-002",
+            decision: "requires_replan",
+            rationale: "人工要求重规划"
+          }
+        ]
+      })
+    });
+    const replan = (await replanResponse.json()) as { sessions: unknown[]; blockedTasks: Array<{ taskId: string; kind: string }> };
+    expect(replanResponse.status).toBe(200);
+    expect(replan.sessions).toEqual([]);
+    expect(replan.blockedTasks).toEqual([
+      {
+        taskId: "TASK-002",
+        kind: "manual_gate",
+        reason: "manual_gate requires human approval before dispatch"
       }
     ]);
   });
@@ -224,6 +257,20 @@ describe("web server", () => {
     const nonManualGate = (await nonManualGateResponse.json()) as { error: string };
     expect(nonManualGateResponse.status).toBe(400);
     expect(nonManualGate.error).toContain("non-manual_gate task id: TASK-001");
+
+    const invalidDecisionResponse = await fetch(`${server.url}/api/ao/execute`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectRoot,
+        workflowId: "WF-MANUAL-GATE",
+        dryRun: true,
+        releasedManualGateTaskIds: [{ taskId: "TASK-002", decision: "skip" }]
+      })
+    });
+    const invalidDecision = (await invalidDecisionResponse.json()) as { error: string };
+    expect(invalidDecisionResponse.status).toBe(400);
+    expect(invalidDecision.error).toContain("decision must be approved, requires_replan, or blocked");
   });
 
   it("runs the real governance endpoint through injected adapters", async () => {
@@ -822,11 +869,27 @@ describe("web server", () => {
     const html = renderIndexHtml();
 
     expect(html).toContain('id="executeButton"');
+    expect(html).toContain('id="releaseManualGateButton"');
+    expect(html).toContain('id="replanManualGateButton"');
+    expect(html).toContain('id="blockManualGateButton"');
     expect(html).toContain("派发执行");
+    expect(html).toContain("要求重规划");
+    expect(html).toContain("标记阻断");
     expect(html).toContain("dryRun: false");
     expect(html).toContain("即将真实派发");
     expect(html).toContain("AO 已派发");
     expect(html).toContain("先点击派发执行，以识别需要人工放行的 manual_gate 任务。");
+    expect(html).toContain("taskPlanApprovalReport");
+    expect(html).toContain('createManualGateReleases("approved"');
+    expect(html).toContain('createManualGateReleases("requires_replan"');
+    expect(html).toContain('createManualGateReleases("blocked"');
+    expect(html).toContain("Web UI 人工放行");
+    expect(html).toContain("Web UI 要求重规划");
+    expect(html).toContain("Web UI 标记阻断");
+    expect(html).toContain("审批状态：");
+    expect(html).toContain("可实施状态：");
+    expect(html).toContain("覆盖缺口：");
+    expect(html).toContain("待处理 finding：");
     expect(html).toContain('task.kind === "manual_gate"');
     expect(html).not.toContain('id="dryRunToggle"');
     expect(html).not.toContain("预演模式");

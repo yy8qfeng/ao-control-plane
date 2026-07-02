@@ -1,10 +1,27 @@
 import type { DesignReview } from "../schemas/design-review.js";
 import { defaultExecutionPolicy } from "../schemas/execution-policy.js";
+import type { TaskPlanApprovalReport } from "../schemas/task-plan-approval-report.js";
 import type { TaskPlanReview } from "../schemas/task-plan-review.js";
-import { taskPlanSchema, type ExecutionTask, type TaskPlan } from "../schemas/task-plan.js";
+import {
+  taskPlanSchema,
+  type ExecutionTask,
+  type TaskPlan
+} from "../schemas/task-plan.js";
+
+type DesignCoverageTrace = NonNullable<TaskPlan["designCoverageTrace"]>[number];
 
 const manualGateTerms = ["人工", "复核", "放行", "确认", "审批", "决策", "切换", "授权", "等待"] as const;
 const platformTerms = ["Linux", "Windows", "macOS", "io_uring", "epoll", "IOCP", "kqueue"] as const;
+const g0GateTerms = [
+  "G0",
+  "Repo Reality Check",
+  "仓库现实",
+  "仓库校准",
+  "预实施冻结稿",
+  "不得进入文件级",
+  "人工复核放行",
+  "增量重构版"
+] as const;
 const prerequisiteTerms = [
   "共享",
   "接口",
@@ -34,10 +51,13 @@ export interface TaskPlanGateFinding {
 export interface TaskPlanGateResult {
   passed: boolean;
   findings: TaskPlanGateFinding[];
+  approvalReport: TaskPlanApprovalReport;
 }
 
 export function validateTaskPlanApprovalGate(input: {
   workflowId: string;
+  planVersion?: string;
+  approvedDesign?: string;
   deferredFindings: DesignReview["findings"];
   plan: TaskPlan;
   previousReviews: TaskPlanReview[];
@@ -54,20 +74,41 @@ export function validateTaskPlanApprovalGate(input: {
       status: "unresolved",
       source: "local-gate"
     });
-    return { passed: false, findings };
+    return {
+      passed: false,
+      findings,
+      approvalReport: createTaskPlanApprovalReport({
+        workflowId: input.workflowId,
+        planVersion: input.planVersion ?? "task-plan-current",
+        approved: false,
+        approvedDesign: input.approvedDesign ?? "",
+        plan: input.plan,
+        findings
+      })
+    };
   }
 
   const plan = parsed.data;
   findings.push(...validateExecutionPolicies(plan));
   findings.push(...validateAoPromptContext(plan));
   findings.push(...validateManualGate(plan));
+  findings.push(...validateReadinessAndG0Gate(input.approvedDesign ?? "", plan));
+  findings.push(...validateArtifactDeliverables(input.approvedDesign ?? "", plan));
   findings.push(...validateCrossPlatformPrerequisites(plan));
   findings.push(...validateDeferredFindings(input.deferredFindings, plan));
   findings.push(...validatePreviousUnresolvedFindings(input.previousReviews, plan));
 
   return {
     passed: findings.length === 0,
-    findings
+    findings,
+    approvalReport: createTaskPlanApprovalReport({
+      workflowId: input.workflowId,
+      planVersion: input.planVersion ?? "task-plan-current",
+      approved: findings.length === 0,
+      approvedDesign: input.approvedDesign ?? "",
+      plan,
+      findings
+    })
   };
 }
 
@@ -154,6 +195,135 @@ function validateManualGate(plan: TaskPlan): TaskPlanGateFinding[] {
       title: "需要人工确认的前置任务缺少 manual_gate",
       body: "任务计划包含人工复核、放行或确认语义，但没有任何任务使用 dependencyCondition=manual_gate。",
       severity: "blocking",
+      status: "unresolved",
+      source: "local-gate"
+    });
+  }
+
+  return findings;
+}
+
+function validateReadinessAndG0Gate(approvedDesign: string, plan: TaskPlan): TaskPlanGateFinding[] {
+  if (!hasG0ReadinessSignal(approvedDesign, plan)) {
+    return [];
+  }
+
+  const manualGateTasks = plan.tasks.filter((task) => task.dependencyCondition === "manual_gate");
+  const missingManualGateFinding = validateG0ManualGateExists(manualGateTasks);
+  if (missingManualGateFinding) {
+    return [missingManualGateFinding];
+  }
+
+  return validatePostG0TaskDependencies(manualGateTasks, plan);
+}
+
+function hasG0ReadinessSignal(approvedDesign: string, plan: TaskPlan): boolean {
+  const designRequiresG0 = containsAny(approvedDesign, g0GateTerms);
+  const planCarriesG0 = plan.tasks.some((task) => containsAny(taskText(task), g0GateTerms));
+  return designRequiresG0 || planCarriesG0;
+}
+
+function validateG0ManualGateExists(manualGateTasks: ExecutionTask[]): TaskPlanGateFinding | undefined {
+  if (manualGateTasks.length > 0) {
+    return undefined;
+  }
+
+  return {
+    id: "TPG-G0-001",
+    title: "G0 或预实施冻结语义缺少人工门禁",
+    body: "设计稿或任务计划包含 G0、仓库现实校准、预实施冻结稿或人工复核放行语义，但任务计划没有 dependencyCondition=manual_gate 的人工门禁任务。",
+    severity: "blocking",
+    status: "unresolved",
+    source: "local-gate"
+  };
+}
+
+function validatePostG0TaskDependencies(manualGateTasks: ExecutionTask[], plan: TaskPlan): TaskPlanGateFinding[] {
+  const manualGateIds = new Set(manualGateTasks.map((task) => task.taskId));
+  const gatedTaskIds = new Set(
+    plan.tasks
+      .filter((task) => !manualGateIds.has(task.taskId) && requiresPostG0Gate(task))
+      .filter((task) => !dependsOnAny(task.taskId, manualGateIds, plan))
+      .map((task) => task.taskId)
+  );
+
+  return gatedTaskIds.size > 0
+    ? [
+        {
+          id: "TPG-G0-002",
+          title: "G0 后续实施任务未被人工门禁阻塞",
+          body: `存在 G0 或预实施冻结语义时，后续实现、重构、发布或平台实现任务必须直接或间接依赖人工门禁任务。未覆盖任务：${[...gatedTaskIds].join("、")}。`,
+          severity: "blocking",
+          status: "unresolved",
+          source: "local-gate"
+        }
+      ]
+    : [];
+}
+
+function validateArtifactDeliverables(approvedDesign: string, plan: TaskPlan): TaskPlanGateFinding[] {
+  if (!approvedDesign.trim()) {
+    return [];
+  }
+
+  const findings: TaskPlanGateFinding[] = [];
+  const planText = plan.tasks.map(taskText).join("\n");
+
+  if (
+    containsAny(approvedDesign, ["JDK 21", "JAR", "依赖调用"]) &&
+    !hasStructuredCoverage(plan, "java-jar-delivery") &&
+    !hasJarDeliveryEvidence(planText)
+  ) {
+    findings.push({
+      id: "TPG-COVERAGE-JAR",
+      title: "设计要求 Java JAR 交付但任务计划缺少构建或发布验证",
+      body: "设计稿包含 JDK 21、JAR 或依赖调用语义，但任务计划中没有 Java JAR 构建、打包、发布、Gradle/Maven 或示例依赖验证证据。",
+      severity: "major",
+      status: "unresolved",
+      source: "local-gate"
+    });
+  }
+
+  if (
+    containsAny(approvedDesign, ["0700", "0600", "ACL", "/dev/shm", "ProgramData", "权限模型"]) &&
+    !hasStructuredCoverage(plan, "shared-segment-permission") &&
+    !hasSegmentPermissionEvidence(planText)
+  ) {
+    findings.push({
+      id: "TPG-COVERAGE-PERMISSION",
+      title: "设计要求共享段权限模型但任务计划缺少权限实现或验证",
+      body: "设计稿包含共享段路径、0700、0600、ACL 或权限模型语义，但任务计划中没有共享段路径、文件权限、访问控制或跨平台权限验证证据。",
+      severity: "major",
+      status: "unresolved",
+      source: "local-gate"
+    });
+  }
+
+  if (
+    containsAny(approvedDesign, ["IPv4/IPv6", "IPv6"]) &&
+    !hasStructuredCoverage(plan, "ipv6-support") &&
+    !containsAny(planText, ["IPv6", "ipv6"])
+  ) {
+    findings.push({
+      id: "TPG-COVERAGE-IPV6",
+      title: "设计要求 IPv4/IPv6 但任务计划缺少 IPv6 验收证据",
+      body: "设计稿包含 IPv4/IPv6 或 IPv6 语义，但任务计划中没有 IPv6 实现、冒烟或验收证据。",
+      severity: "major",
+      status: "unresolved",
+      source: "local-gate"
+    });
+  }
+
+  if (
+    containsAny(approvedDesign, ["OutboundTransport", "send", "发包能力预留"]) &&
+    !hasStructuredCoverage(plan, "outbound-transport-reservation") &&
+    !hasOutboundEvidence(planText)
+  ) {
+    findings.push({
+      id: "TPG-COVERAGE-OUTBOUND",
+      title: "设计要求发包能力预留但任务计划缺少落位或复核证据",
+      body: "设计稿包含 OutboundTransport、send 或发包能力预留语义，但任务计划中没有发送接口预留落位、代码边界复核或明确不做代码落位的证据。",
+      severity: "major",
       status: "unresolved",
       source: "local-gate"
     });
@@ -258,6 +428,192 @@ function hasFindingEvidence(finding: { id: string; title: string; body: string }
   return matched.length >= Math.min(2, keywords.length);
 }
 
+function createTaskPlanApprovalReport(input: {
+  workflowId: string;
+  planVersion: string;
+  approved: boolean;
+  approvedDesign: string;
+  plan: TaskPlan;
+  findings: TaskPlanGateFinding[];
+}): TaskPlanApprovalReport {
+  const blockingFindingCount = input.findings.filter(
+    (finding) => finding.status === "unresolved" && (finding.severity === "blocking" || finding.severity === "major")
+  ).length;
+  const dispatchSummary = summarizeDispatchability(input.plan, blockingFindingCount);
+  const planReadiness = inferPlanReadiness(input.approvedDesign, input.plan, input.findings);
+  return {
+    workflowId: input.workflowId,
+    planVersion: input.planVersion,
+    generatedAt: new Date().toISOString(),
+    approved: input.approved,
+    planReadiness,
+    dispatchSummary,
+    designCoverageTrace: buildDesignCoverageTrace(input.approvedDesign, input.plan, input.findings),
+    findingSummary: input.findings.map((finding) => ({
+      id: finding.id,
+      title: finding.title,
+      severity: finding.severity,
+      status: finding.status
+    }))
+  };
+}
+
+function inferPlanReadiness(
+  approvedDesign: string,
+  plan: TaskPlan,
+  findings: TaskPlanGateFinding[]
+): TaskPlanApprovalReport["planReadiness"] {
+  const hasG0Finding = findings.some((finding) => finding.id.startsWith("TPG-G0"));
+  const designRequiresG0 = containsAny(approvedDesign, g0GateTerms);
+  if (hasG0Finding || (designRequiresG0 && plan.tasks.every((task) => task.phase === "calibration" || task.type === "review"))) {
+    return "calibration_only";
+  }
+  if (designRequiresG0 || plan.tasks.some((task) => task.dependencyCondition === "manual_gate")) {
+    return "gated_implementable";
+  }
+  return plan.planReadiness ?? "directly_implementable";
+}
+
+function summarizeDispatchability(
+  plan: TaskPlan,
+  blockingFindingCount: number
+): TaskPlanApprovalReport["dispatchSummary"] {
+  const completed = new Set(plan.tasks.filter((task) => task.status === "completed").map((task) => task.taskId));
+  let dispatchableTaskCount = 0;
+  let waitingTaskCount = 0;
+  let manualGateTaskCount = 0;
+
+  for (const task of plan.tasks) {
+    if (task.status !== "pending") {
+      continue;
+    }
+    if (task.dependencyCondition === "manual_gate") {
+      manualGateTaskCount += 1;
+      waitingTaskCount += 1;
+      continue;
+    }
+    if (task.dependencies.length === 0) {
+      dispatchableTaskCount += 1;
+      continue;
+    }
+    const dependenciesSatisfied =
+      task.dependencyCondition === "any_completed"
+        ? task.dependencies.some((dependency) => completed.has(dependency))
+        : task.dependencies.every((dependency) => completed.has(dependency));
+    if (dependenciesSatisfied) {
+      dispatchableTaskCount += 1;
+    } else {
+      waitingTaskCount += 1;
+    }
+  }
+
+  return {
+    dispatchableTaskCount,
+    waitingTaskCount,
+    manualGateTaskCount,
+    blockingFindingCount
+  };
+}
+
+function buildDesignCoverageTrace(
+  approvedDesign: string,
+  plan: TaskPlan,
+  findings: TaskPlanGateFinding[]
+): DesignCoverageTrace[] {
+  const existing = new Map((plan.designCoverageTrace ?? []).map((trace) => [trace.requirementId, trace]));
+  const findingIds = new Set(findings.map((finding) => finding.id));
+  const entries: DesignCoverageTrace[] = [];
+
+  addTraceIfRequired(entries, existing, approvedDesign, {
+    requirementId: "g0-readiness-gate",
+    requirement: "G0 / 预实施冻结稿必须被人工门禁承接",
+    source: "approvedDesign",
+    terms: g0GateTerms,
+    missingFindingIds: ["TPG-G0-001", "TPG-G0-002"],
+    evidenceTaskIds: findEvidenceTaskIds(plan, (task) => containsAny(taskText(task), g0GateTerms) || task.dependencyCondition === "manual_gate"),
+    findingIds
+  });
+  addTraceIfRequired(entries, existing, approvedDesign, {
+    requirementId: "java-jar-delivery",
+    requirement: "JDK 21 JAR 构建、打包、发布或示例依赖验证",
+    source: "approvedDesign",
+    terms: ["JDK 21", "JAR", "依赖调用"],
+    missingFindingIds: ["TPG-COVERAGE-JAR"],
+    evidenceTaskIds: findEvidenceTaskIds(plan, (task) => hasJarDeliveryEvidence(taskText(task))),
+    findingIds
+  });
+  addTraceIfRequired(entries, existing, approvedDesign, {
+    requirementId: "shared-segment-permission",
+    requirement: "共享段路径、文件权限、访问控制或跨平台权限验证",
+    source: "approvedDesign",
+    terms: ["0700", "0600", "ACL", "/dev/shm", "ProgramData", "权限模型"],
+    missingFindingIds: ["TPG-COVERAGE-PERMISSION"],
+    evidenceTaskIds: findEvidenceTaskIds(plan, (task) => hasSegmentPermissionEvidence(taskText(task))),
+    findingIds
+  });
+  addTraceIfRequired(entries, existing, approvedDesign, {
+    requirementId: "ipv6-support",
+    requirement: "IPv6 实现、冒烟或验收证据",
+    source: "approvedDesign",
+    terms: ["IPv4/IPv6", "IPv6"],
+    missingFindingIds: ["TPG-COVERAGE-IPV6"],
+    evidenceTaskIds: findEvidenceTaskIds(plan, (task) => containsAny(taskText(task), ["IPv6", "ipv6"])),
+    findingIds
+  });
+  addTraceIfRequired(entries, existing, approvedDesign, {
+    requirementId: "outbound-transport-reservation",
+    requirement: "OutboundTransport/send 发包能力预留落位或非一期边界复核",
+    source: "approvedDesign",
+    terms: ["OutboundTransport", "send", "发包能力预留"],
+    missingFindingIds: ["TPG-COVERAGE-OUTBOUND"],
+    evidenceTaskIds: findEvidenceTaskIds(plan, (task) => hasOutboundEvidence(taskText(task))),
+    findingIds
+  });
+
+  return entries;
+}
+
+function addTraceIfRequired(
+  entries: DesignCoverageTrace[],
+  existing: ReadonlyMap<string, DesignCoverageTrace>,
+  approvedDesign: string,
+  input: {
+    requirementId: string;
+    requirement: string;
+    source: string;
+    terms: readonly string[];
+    missingFindingIds: readonly string[];
+    evidenceTaskIds: string[];
+    findingIds: ReadonlySet<string>;
+  }
+): void {
+  if (!containsAny(approvedDesign, input.terms) && !existing.has(input.requirementId)) {
+    return;
+  }
+  const existingTrace = existing.get(input.requirementId);
+  const hasMissingFinding = input.missingFindingIds.some((findingId) => input.findingIds.has(findingId));
+  entries.push({
+    requirementId: input.requirementId,
+    requirement: existingTrace?.requirement ?? input.requirement,
+    source: existingTrace?.source ?? input.source,
+    status: hasMissingFinding ? "missing" : existingTrace?.status ?? "covered",
+    evidenceTaskIds: existingTrace?.evidenceTaskIds.length ? existingTrace.evidenceTaskIds : input.evidenceTaskIds,
+    rationale: hasMissingFinding
+      ? "本地门禁未找到足够任务证据。"
+      : existingTrace?.rationale ?? "本地门禁已找到任务证据。"
+  });
+}
+
+function findEvidenceTaskIds(plan: TaskPlan, predicate: (task: ExecutionTask) => boolean): string[] {
+  return plan.tasks.filter(predicate).map((task) => task.taskId);
+}
+
+function hasStructuredCoverage(plan: TaskPlan, requirementId: string): boolean {
+  return (plan.designCoverageTrace ?? []).some(
+    (trace) => trace.requirementId === requirementId && trace.status === "covered" && trace.evidenceTaskIds.length > 0
+  );
+}
+
 function extractKeywords(text: string): string[] {
   const normalized = normalize(text);
   const tokens = normalized.match(/[a-z0-9_./-]{4,}|[\u4e00-\u9fa5]{2,}/g) ?? [];
@@ -309,4 +665,43 @@ function containsAny(text: string, terms: readonly string[]): boolean {
 
 function isImplementationTask(task: ExecutionTask): boolean {
   return task.type === "implementation" || task.type === "refactor";
+}
+
+function requiresPostG0Gate(task: ExecutionTask): boolean {
+  const text = taskText(task);
+  return (
+    task.type === "implementation" ||
+    task.type === "refactor" ||
+    containsAny(text, ["重构", "发布", "release", "JAR", "Gradle", "Maven", "io_uring", "epoll", "IOCP", "kqueue"])
+  );
+}
+
+function dependsOnAny(taskId: string, dependencyIds: ReadonlySet<string>, plan: TaskPlan): boolean {
+  const taskById = new Map(plan.tasks.map((task) => [task.taskId, task]));
+  const visited = new Set<string>();
+  const visit = (currentTaskId: string): boolean => {
+    if (visited.has(currentTaskId)) {
+      return false;
+    }
+    visited.add(currentTaskId);
+    const task = taskById.get(currentTaskId);
+    if (!task) {
+      return false;
+    }
+    return task.dependencies.some((dependency) => dependencyIds.has(dependency) || visit(dependency));
+  };
+
+  return visit(taskId);
+}
+
+function hasJarDeliveryEvidence(text: string): boolean {
+  return containsAny(text, ["JAR", "jar"]) && containsAny(text, ["Gradle", "Maven", "构建", "打包", "发布", "依赖验证", "示例依赖"]);
+}
+
+function hasSegmentPermissionEvidence(text: string): boolean {
+  return containsAny(text, ["权限", "访问控制", "ACL", "0700", "0600"]) && containsAny(text, ["共享段", "段路径", "段文件", "segment", "跨平台"]);
+}
+
+function hasOutboundEvidence(text: string): boolean {
+  return containsAny(text, ["OutboundTransport", "send", "发送接口", "发包能力", "接口兼容位"]) && containsAny(text, ["预留", "落位", "复核", "不做代码落位", "兼容位"]);
 }

@@ -221,6 +221,49 @@ describe("runTaskPlanReviewLoop", () => {
     );
     expect(result.plan.tasks[0]?.acceptanceCriteria).toContain("补齐 RawIpAdapter 权限失败错误契约 TPF-RAWIP");
   });
+
+  it("passes approvedDesign into the local gate and revises missing deliverable coverage", async () => {
+    let reviseTaskPlanCalls = 0;
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(input): Promise<TaskPlan> {
+        return createPlan(input.workflowId, "初版验收");
+      },
+      async reviseTaskPlan(input): Promise<TaskPlan> {
+        reviseTaskPlanCalls += 1;
+        return {
+          ...input.currentPlan,
+          tasks: input.currentPlan.tasks.map((task) => ({
+            ...task,
+            title: "实现 Java JAR 构建发布验证",
+            acceptanceCriteria: [...task.acceptanceCriteria, "补齐 JDK 21 JAR 构建、打包、发布和示例依赖验证。"],
+            aoPrompt: `${task.aoPrompt}\n任务计划审查整改：补齐 JDK 21 JAR 构建、打包、发布和示例依赖验证。`
+          }))
+        };
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return approveTaskPlan(input);
+      }
+    };
+
+    const result = await runTaskPlanReviewLoop({
+      workflowId: "WF-DESIGN-COVERAGE",
+      approvedDesign: "Java 侧交付形态固定为 JDK 21 标准 JAR，供项目直接依赖调用。",
+      deferredFindings: [],
+      codex,
+      claudeCode,
+      options: { maxTaskPlanReviewRounds: 3 }
+    });
+
+    expect(result.approved).toBe(true);
+    expect(reviseTaskPlanCalls).toBe(1);
+    expect(result.reviews.some((review) => review.findings.some((finding) => finding.id === "TPG-COVERAGE-JAR"))).toBe(true);
+    expect(result.plan.tasks[0]?.acceptanceCriteria).toContain("补齐 JDK 21 JAR 构建、打包、发布和示例依赖验证。");
+  });
 });
 
 function createPlan(workflowId: string, criterion: string): TaskPlan {

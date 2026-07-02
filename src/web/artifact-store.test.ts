@@ -81,6 +81,21 @@ describe("ArtifactStore", () => {
           findings: []
         }
       ],
+      taskPlanApprovalReport: {
+        workflowId: "WF-PLAN-REVIEWS",
+        planVersion: "task-plan-current",
+        generatedAt: "2026-07-02T00:00:00.000Z",
+        approved: true,
+        planReadiness: "directly_implementable",
+        dispatchSummary: {
+          dispatchableTaskCount: 1,
+          waitingTaskCount: 0,
+          manualGateTaskCount: 0,
+          blockingFindingCount: 0
+        },
+        designCoverageTrace: [],
+        findingSummary: []
+      },
       draftPlan: {
         workflowId: "WF-PLAN-REVIEWS",
         title: "Draft plan",
@@ -107,6 +122,7 @@ describe("ArtifactStore", () => {
     const restored = await store.readWorkflow("WF-PLAN-REVIEWS");
     expect(restored.taskPlanReviews).toHaveLength(1);
     expect(restored.taskPlanReviews?.[0]?.reviewDecision).toBe("approved");
+    expect(restored.taskPlanApprovalReport?.planReadiness).toBe("directly_implementable");
     expect(restored.draftPlan?.tasks[0]?.title).toBe("Draft task");
   });
 });

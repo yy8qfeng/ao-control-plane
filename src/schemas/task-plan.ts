@@ -30,6 +30,31 @@ export const taskStatusSchema = z.enum([
   "failed"
 ]);
 
+export const taskPhaseSchema = z.enum([
+  "calibration",
+  "planning",
+  "implementation",
+  "verification",
+  "release"
+]);
+
+export const planReadinessSchema = z.enum([
+  "directly_implementable",
+  "gated_implementable",
+  "calibration_only"
+]);
+
+export const designCoverageStatusSchema = z.enum(["covered", "missing", "deferred"]);
+
+export const designCoverageTraceSchema = z.object({
+  requirementId: z.string().min(1),
+  requirement: z.string().min(1),
+  source: z.string().min(1),
+  status: designCoverageStatusSchema,
+  evidenceTaskIds: z.array(z.string().min(1)).default([]),
+  rationale: z.string().min(1).optional()
+});
+
 export const executionTaskSchema = z
   .object({
     taskId: z.string().min(1),
@@ -42,6 +67,7 @@ export const executionTaskSchema = z
     aoRole: aoRoleSchema,
     acceptanceCriteria: z.array(z.string().min(1)).min(1),
     aoPrompt: z.string().min(1),
+    phase: taskPhaseSchema.optional(),
     status: taskStatusSchema.default("pending"),
     executionPolicy: executionPolicySchema.optional(),
     aoSessionId: z.string().min(1).optional()
@@ -122,6 +148,8 @@ export const taskPlanSchema = z
   .object({
     workflowId: z.string().min(1),
     title: z.string().min(1),
+    planReadiness: planReadinessSchema.optional(),
+    designCoverageTrace: z.array(designCoverageTraceSchema).optional(),
     tasks: z.array(executionTaskSchema).min(1)
   })
   .superRefine((plan, context) => {
@@ -145,6 +173,18 @@ export const taskPlanSchema = z
         });
       }
       taskIds.add(task.taskId);
+    }
+
+    for (const [index, trace] of (plan.designCoverageTrace ?? []).entries()) {
+      for (const evidenceTaskId of trace.evidenceTaskIds) {
+        if (!taskIds.has(evidenceTaskId)) {
+          context.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["designCoverageTrace", index, "evidenceTaskIds"],
+            message: `Unknown evidenceTaskId ${evidenceTaskId} for design coverage trace ${trace.requirementId}`
+          });
+        }
+      }
     }
 
     for (const [index, task] of plan.tasks.entries()) {

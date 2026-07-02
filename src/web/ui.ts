@@ -374,6 +374,8 @@ export function renderIndexHtml(): string {
           <button id="planButton" class="secondary" type="button" disabled>继续审查任务计划</button>
           <button id="executeButton" class="secondary" type="button" disabled>派发执行</button>
           <button id="releaseManualGateButton" class="secondary" type="button" disabled title="先点击派发执行，以识别需要人工放行的 manual_gate 任务。">放行门禁</button>
+          <button id="replanManualGateButton" class="secondary" type="button" disabled title="先点击派发执行，以识别需要人工决策的 manual_gate 任务。">要求重规划</button>
+          <button id="blockManualGateButton" class="secondary" type="button" disabled title="先点击派发执行，以识别需要人工决策的 manual_gate 任务。">标记阻断</button>
         </div>
         <div id="draftStatus" class="status">表单草稿会自动保存到本地。</div>
         <div id="formStatus" class="status"></div>
@@ -435,6 +437,8 @@ export function renderIndexHtml(): string {
     const planButton = document.querySelector("#planButton");
     const executeButton = document.querySelector("#executeButton");
     const releaseManualGateButton = document.querySelector("#releaseManualGateButton");
+    const replanManualGateButton = document.querySelector("#replanManualGateButton");
+    const blockManualGateButton = document.querySelector("#blockManualGateButton");
     const projectButton = document.querySelector("#projectButton");
     const projectDialog = document.querySelector("#projectDialog");
     const closeProjectDialog = document.querySelector("#closeProjectDialog");
@@ -603,9 +607,21 @@ export function renderIndexHtml(): string {
     });
 
     releaseManualGateButton.addEventListener("click", async () => {
-      const releasedManualGateTaskIds = getManualGateBlockedTaskIds();
-      if (!confirm("即将真实放行并派发 " + releasedManualGateTaskIds.length + " 个 manual_gate 任务到 AO，是否继续？")) return;
-      await executeAoPlan(releasedManualGateTaskIds, "正在放行 manual_gate 任务...");
+      const releases = createManualGateReleases("approved", "Web UI 人工放行");
+      if (!confirm("即将真实放行并派发 " + releases.length + " 个 manual_gate 任务到 AO，是否继续？")) return;
+      await executeAoPlan(releases, "正在放行 manual_gate 任务...");
+    });
+
+    replanManualGateButton.addEventListener("click", async () => {
+      const releases = createManualGateReleases("requires_replan", "Web UI 要求重规划");
+      if (!confirm("即将把 " + releases.length + " 个 manual_gate 标记为需要重规划，旧后续任务不会被放行，是否继续？")) return;
+      await executeAoPlan(releases, "正在标记 manual_gate 需要重规划...");
+    });
+
+    blockManualGateButton.addEventListener("click", async () => {
+      const releases = createManualGateReleases("blocked", "Web UI 标记阻断");
+      if (!confirm("即将把 " + releases.length + " 个 manual_gate 标记为阻断，旧后续任务不会被放行，是否继续？")) return;
+      await executeAoPlan(releases, "正在标记 manual_gate 阻断...");
     });
 
     document.querySelectorAll(".tab").forEach((tab) => {
@@ -975,6 +991,10 @@ export function renderIndexHtml(): string {
       executeButton.disabled = busy || state.result?.workflow?.status !== "executing" || !state.result?.plan;
       releaseManualGateButton.disabled = busy || getManualGateBlockedTaskIds().length === 0;
       releaseManualGateButton.title = getReleaseManualGateButtonTitle();
+      replanManualGateButton.disabled = busy || getManualGateBlockedTaskIds().length === 0;
+      replanManualGateButton.title = getManualGateDecisionButtonTitle("requires_replan");
+      blockManualGateButton.disabled = busy || getManualGateBlockedTaskIds().length === 0;
+      blockManualGateButton.title = getManualGateDecisionButtonTitle("blocked");
       clearDraftButton.disabled = busy;
       if (message) setStatus("warn", message);
     }
@@ -1014,6 +1034,10 @@ export function renderIndexHtml(): string {
       executeButton.disabled = running || result?.workflow?.status !== "executing" || !result?.plan;
       releaseManualGateButton.disabled = running || getManualGateBlockedTaskIds().length === 0;
       releaseManualGateButton.title = getReleaseManualGateButtonTitle();
+      replanManualGateButton.disabled = running || getManualGateBlockedTaskIds().length === 0;
+      replanManualGateButton.title = getManualGateDecisionButtonTitle("requires_replan");
+      blockManualGateButton.disabled = running || getManualGateBlockedTaskIds().length === 0;
+      blockManualGateButton.title = getManualGateDecisionButtonTitle("blocked");
     }
 
     function canReviewTaskPlan(result) {
@@ -1057,7 +1081,7 @@ export function renderIndexHtml(): string {
           output.textContent = JSON.stringify(reviews, null, 2);
         }
       } else if (state.activeTab === "plan") {
-        output.textContent = JSON.stringify(state.result?.plan || state.job?.plan || null, null, 2);
+        output.textContent = formatPlanTabContent();
       } else {
         output.textContent = JSON.stringify(state.execution || { message: "尚未执行 AO 派发。" }, null, 2);
       }
@@ -1103,6 +1127,22 @@ export function renderIndexHtml(): string {
       return "先点击派发执行，以识别需要人工放行的 manual_gate 任务。";
     }
 
+    function getManualGateDecisionButtonTitle(decision) {
+      const count = getManualGateBlockedTaskIds().length;
+      if (count === 0) return "先点击派发执行，以识别需要人工决策的 manual_gate 任务。";
+      if (decision === "requires_replan") return "将当前识别到的 " + count + " 个 manual_gate 标记为需要重规划。";
+      return "将当前识别到的 " + count + " 个 manual_gate 标记为阻断。";
+    }
+
+    function createManualGateReleases(decision, rationale) {
+      return getManualGateBlockedTaskIds().map((taskId) => ({
+        taskId,
+        decision,
+        rationale,
+        releasedAt: new Date().toISOString()
+      }));
+    }
+
     function getExecutionSuccessMessage(execution) {
       const sessionCount = execution?.sessions?.length || 0;
       const blockedCount = execution?.blockedTasks?.length || 0;
@@ -1111,7 +1151,10 @@ export function renderIndexHtml(): string {
 
     function getDispatchableTaskCount(releasedManualGateTaskIds) {
       const tasks = state.result?.plan?.tasks || [];
-      const released = new Set(releasedManualGateTaskIds || []);
+      const released = new Set((releasedManualGateTaskIds || []).map((release) => {
+        if (typeof release === "string") return release;
+        return release.decision === "approved" ? release.taskId : "";
+      }));
       const completed = new Set(tasks.filter((task) => task.status === "completed").map((task) => task.taskId));
       const alreadyWorking = new Set(
         tasks
@@ -1128,6 +1171,56 @@ export function renderIndexHtml(): string {
         }
         return dependencies.every((dependency) => completed.has(dependency));
       }).length;
+    }
+
+    function getTaskPlanApprovalReport() {
+      return state.result?.taskPlanApprovalReport || state.job?.result?.taskPlanApprovalReport || null;
+    }
+
+    function getCurrentPlan() {
+      return state.result?.plan || state.job?.plan || state.job?.result?.plan || null;
+    }
+
+    function formatPlanTabContent() {
+      const report = getTaskPlanApprovalReport();
+      const plan = getCurrentPlan();
+      const summary = report ? formatTaskPlanApprovalSummary(report) : "审批报告：暂无。";
+      return [
+        summary,
+        "",
+        "审批报告 JSON：",
+        JSON.stringify(report, null, 2),
+        "",
+        "任务计划 JSON：",
+        JSON.stringify(plan, null, 2)
+      ].join("\\n");
+    }
+
+    function formatTaskPlanApprovalSummary(report) {
+      const dispatch = report.dispatchSummary || {};
+      const missingCoverage = (report.designCoverageTrace || [])
+        .filter((trace) => trace.status === "missing")
+        .map((trace) => trace.requirementId);
+      const unresolvedFindings = (report.findingSummary || [])
+        .filter((finding) => finding.status === "unresolved")
+        .map((finding) => finding.id);
+      return [
+        "审批状态：" + (report.approved ? "通过" : "未通过"),
+        "可实施状态：" + formatPlanReadiness(report.planReadiness),
+        "可派发任务：" + Number(dispatch.dispatchableTaskCount || 0),
+        "等待任务：" + Number(dispatch.waitingTaskCount || 0),
+        "人工门禁：" + Number(dispatch.manualGateTaskCount || 0),
+        "阻断 finding：" + Number(dispatch.blockingFindingCount || 0),
+        "覆盖缺口：" + (missingCoverage.length ? missingCoverage.join("、") : "无"),
+        "待处理 finding：" + (unresolvedFindings.length ? unresolvedFindings.join("、") : "无")
+      ].join("\\n");
+    }
+
+    function formatPlanReadiness(readiness) {
+      if (readiness === "directly_implementable") return "可直接实施";
+      if (readiness === "gated_implementable") return "门禁后可实施";
+      if (readiness === "calibration_only") return "仅校准，需重规划";
+      return "未知";
     }
 
     function outputHasSelection() {

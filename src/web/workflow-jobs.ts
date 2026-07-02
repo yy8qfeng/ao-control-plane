@@ -1,5 +1,6 @@
 import type { RunWorkflowEvent, RunWorkflowResult } from "../workflow/run-workflow.js";
 import type { DesignReview } from "../schemas/design-review.js";
+import type { TaskPlanApprovalReport } from "../schemas/task-plan-approval-report.js";
 import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
 import type { GovernanceRunResult } from "./governance-runner.js";
@@ -16,6 +17,7 @@ export interface WorkflowJobSnapshot {
   reviews: DesignReview[];
   taskPlanReviews: TaskPlanReview[];
   plan?: TaskPlan;
+  taskPlanApprovalReport?: TaskPlanApprovalReport;
   result?: RunWorkflowResult | GovernanceRunResult;
   error?: string;
 }
@@ -90,6 +92,7 @@ export class WorkflowJobStore {
     job.currentStep = result.workflow.status === "blocked_for_human" ? "等待人工补充" : "后台任务已结束";
     job.result = result;
     job.plan = result.plan;
+    job.taskPlanApprovalReport = result.taskPlanApprovalReport;
     job.design = {
       content: result.design ?? "",
       path: getDesignPath(result)
@@ -190,8 +193,9 @@ export class WorkflowJobStore {
         break;
       case "planning_completed":
         job.plan = event.plan;
+        job.taskPlanApprovalReport = event.approvalReport;
         job.currentStep = "任务计划已生成";
-        job.logs.push(`任务计划已生成：${event.path}`);
+        job.logs.push(`任务计划已生成：${event.path}；审批报告：${event.approvalReportPath}`);
         break;
       case "workflow_completed":
         job.status = "completed";
@@ -199,6 +203,7 @@ export class WorkflowJobStore {
           event.result.workflow.status === "blocked_for_human" ? "等待人工补充" : "后台任务已结束";
         job.result = event.result;
         job.plan = event.result.plan;
+        job.taskPlanApprovalReport = event.result.taskPlanApprovalReport;
         if (event.result.workflow.status === "blocked_for_human") {
           job.logs.push("审查轮次已用完，仍存在设计阶段未解决问题，等待人工补充或提高轮次后继续。");
         } else {

@@ -3,6 +3,13 @@ import type { ExecutionTask, TaskPlan } from "../schemas/task-plan.js";
 
 export type BlockedTaskKind = "waiting_dependencies" | "manual_gate";
 
+export interface ManualGateRelease {
+  taskId: string;
+  decision: "approved" | "requires_replan" | "blocked";
+  rationale?: string;
+  releasedAt?: string;
+}
+
 export interface PlanExecutionResult {
   sessions: Array<{
     taskId: string;
@@ -19,9 +26,13 @@ export interface PlanExecutionResult {
 export async function executePlan(input: {
   plan: TaskPlan;
   ao: AoCliAdapter;
-  releasedManualGateTaskIds?: string[];
+  releasedManualGateTaskIds?: Array<string | ManualGateRelease>;
 }): Promise<PlanExecutionResult> {
-  const releasedManualGateTaskIds = new Set(input.releasedManualGateTaskIds ?? []);
+  const releasedManualGateTaskIds = new Set(
+    (input.releasedManualGateTaskIds ?? [])
+      .map((release) => (typeof release === "string" ? release : release.decision === "approved" ? release.taskId : undefined))
+      .filter((taskId): taskId is string => Boolean(taskId))
+  );
   const completed = new Set(
     input.plan.tasks.filter((task) => task.status === "completed").map((task) => task.taskId)
   );

@@ -89,6 +89,15 @@ export class CodexCliAdapter implements CodexAdapter {
       "{",
       '  "workflowId": "string",',
       '  "title": "string",',
+      '  "planReadiness": "directly_implementable" | "gated_implementable" | "calibration_only",',
+      '  "designCoverageTrace": [{',
+      '    "requirementId": "string",',
+      '    "requirement": "string",',
+      '    "source": "approvedDesign section or quote",',
+      '    "status": "covered" | "missing" | "deferred",',
+      '    "evidenceTaskIds": ["TASK-001"],',
+      '    "rationale": "string"',
+      "  }],",
       '  "tasks": [{',
       '    "taskId": "TASK-001",',
       '    "workflowId": "string",',
@@ -100,6 +109,7 @@ export class CodexCliAdapter implements CodexAdapter {
       '    "aoRole": "architect" | "reviewer" | "ui-designer" | "frontend-senior" | "frontend-junior" | "backend-senior" | "backend-junior" | "qa" | "docs" | "second-opinion" | "frontend" | "backend",',
       '    "acceptanceCriteria": ["string"],',
       '    "aoPrompt": "string",',
+      '    "phase": "calibration" | "planning" | "implementation" | "verification" | "release",',
       `    "executionPolicy": ${formatExecutionPolicyTemplate()},`,
       '    "status": "pending"',
       "  }]",
@@ -214,6 +224,9 @@ function formatTaskPlanRules(mode: "create" | "revise"): string[] {
     "- 每个 aoPrompt 必须包含 workflowId、taskId、任务名称、AO 角色、验收标准和上下文摘要。",
     "- taskId 使用 TASK-001 递增。",
     "- status 全部使用 pending。",
+    "- planReadiness 必须准确表达当前计划状态：可直接派发为 directly_implementable；需要人工门禁后派发为 gated_implementable；只能做 G0/校准、后续需重规划为 calibration_only。",
+    "- 每个任务必须填写 phase：G0/仓库校准为 calibration，契约/计划冻结为 planning，代码实现为 implementation，测试/审查为 verification，打包发布为 release。",
+    "- designCoverageTrace 必须逐条列出设计稿关键目标的覆盖状态，至少覆盖 G0/readiness、JAR 交付、共享段权限、IPv6、发包预留；每条 evidenceTaskIds 必须引用真实 taskId。",
     "- 每个任务必须包含完整 executionPolicy，并按任务类型显式差异化；禁止所有任务无脑使用同一套默认策略。",
     "- executionPolicy 只能包含 developerSelfTestRequired、qaRequired、regressionRequired、reviewerRequired、maxQaRounds、maxReviewRounds、requirePrOrRp 七个字段；禁止在 executionPolicy 内输出 policyRationale、rationale、reason 等说明字段，策略理由应写入 description、acceptanceCriteria 或 aoPrompt。",
     "- implementation/refactor 任务必须保留开发自测、QA、回归、审查、PR/RP，且 maxQaRounds=maxReviewRounds=3。",
@@ -222,6 +235,14 @@ function formatTaskPlanRules(mode: "create" | "revise"): string[] {
     "- 先拆接口、协议、契约、测试骨架等前置任务，再拆实现任务；跨平台实现必须通过共享抽象或接口冻结任务避免并行冲突。",
     "- 依赖必须完整、无环、无未知 taskId；人工放行门禁使用 dependencyCondition=manual_gate。",
     "- 对需要仓库实读或人工确认的前置校准任务，必须设为独立任务，并让后续实现任务显式依赖它。",
+    "- 如果设计稿包含“预实施冻结稿”“G0 Repo Reality Check”“仓库现实校准”“不得进入文件级 AO”“人工复核放行”或“转为增量重构版”等语义，必须生成 G0 校准任务和人工复核门禁任务；所有 implementation/refactor/发布/平台实现任务必须直接或间接依赖该人工门禁。",
+    "- 如果 G0 结果可能改变真实模块路径，后续任务的 aoPrompt 必须声明以 G0 输出的真实路径映射和人工放行结论为准；若 G0 发现存量冲突，后续实现任务不得直接执行。",
+    "- 生成任务前必须覆盖设计稿中的交付物、平台协议、权限安全、性能、可观测性、发布文档要求；不能只在设计任务中“冻结”而没有后续实现、测试、验证或明确非一期边界。",
+    "- 设计稿包含 JDK 21、JAR 或依赖调用时，必须有 Java JAR 构建、打包、发布或示例依赖验证任务或验收标准。",
+    "- 设计稿包含 /dev/shm、ProgramData、0700、0600、ACL 或权限模型时，必须有共享段路径、文件权限、访问控制或跨平台权限验证任务或验收标准。",
+    "- 设计稿包含 IPv4/IPv6 或 IPv6 时，必须在 UDP/TCP 后端、冒烟或验收任务中显式覆盖 IPv6。",
+    "- 设计稿包含 OutboundTransport、send 或发包能力预留时，必须有发送接口预留落位任务，或有明确的设计复核任务说明一期不做代码落位且不影响 ingress 主路径。",
+    "- 如果某项设计目标被判定为非一期范围或本期不做代码落位，必须在任务标题、验收标准或 aoPrompt 中显式写出“非一期”“不做代码落位”“边界复核”“不影响主路径”等边界证据；禁止只用泛泛的接口兼容表述绕过本地门禁。",
     mode === "revise"
       ? "- 如果当前计划已有实施阶段遗留审查意见，整改后必须继续保留在任务、验收标准或 aoPrompt 约束中，不能丢失。"
       : "- 如果存在实施阶段遗留审查意见，必须在任务、验收标准或 aoPrompt 约束中体现，不能丢失。",
@@ -404,7 +425,10 @@ function normalizeCodexExecutionPolicy(type: unknown, policy: unknown): unknown 
 }
 
 function omitPolicyRationaleFields(policy: Record<string, unknown>): Record<string, unknown> {
-  const { policyRationale: _policyRationale, rationale: _rationale, reason: _reason, ...policyWithoutRationale } = policy;
+  const policyWithoutRationale = { ...policy };
+  delete policyWithoutRationale.policyRationale;
+  delete policyWithoutRationale.rationale;
+  delete policyWithoutRationale.reason;
   return policyWithoutRationale;
 }
 

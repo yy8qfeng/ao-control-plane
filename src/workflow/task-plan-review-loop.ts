@@ -1,6 +1,7 @@
 import type { ClaudeCodeAdapter } from "../adapters/claude-code.js";
 import type { CodexAdapter } from "../adapters/codex.js";
 import type { DesignReview } from "../schemas/design-review.js";
+import type { TaskPlanApprovalReport } from "../schemas/task-plan-approval-report.js";
 import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
 import { taskPlanSchema } from "../schemas/task-plan.js";
@@ -27,6 +28,7 @@ export interface TaskPlanReviewLoopResult {
   reviews: TaskPlanReview[];
   blockedForHuman: boolean;
   finalReviewDecision?: TaskPlanReview["reviewDecision"];
+  approvalReport: TaskPlanApprovalReport;
 }
 
 export async function runTaskPlanReviewLoop(input: {
@@ -76,6 +78,8 @@ export async function runTaskPlanReviewLoop(input: {
       await input.hooks?.onLocalGateStart?.({ round, planVersion });
       const gate = validateTaskPlanApprovalGate({
         workflowId: input.workflowId,
+        planVersion,
+        approvedDesign: input.approvedDesign,
         deferredFindings: input.deferredFindings,
         plan,
         previousReviews: [...previousReviews, ...reviews.slice(0, -1)]
@@ -112,7 +116,8 @@ export async function runTaskPlanReviewLoop(input: {
         planVersion,
         reviews,
         blockedForHuman: false,
-        finalReviewDecision: review.reviewDecision
+        finalReviewDecision: review.reviewDecision,
+        approvalReport: gate.approvalReport
       };
     }
 
@@ -136,7 +141,15 @@ export async function runTaskPlanReviewLoop(input: {
     planVersion,
     reviews,
     blockedForHuman: true,
-    finalReviewDecision: reviews.at(-1)?.reviewDecision
+    finalReviewDecision: reviews.at(-1)?.reviewDecision,
+    approvalReport: validateTaskPlanApprovalGate({
+      workflowId: input.workflowId,
+      planVersion,
+      approvedDesign: input.approvedDesign,
+      deferredFindings: input.deferredFindings,
+      plan,
+      previousReviews: [...previousReviews, ...reviews]
+    }).approvalReport
   };
 }
 

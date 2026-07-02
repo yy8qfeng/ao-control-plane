@@ -205,6 +205,59 @@ describe("executePlan", () => {
       blockedTasks: []
     });
   });
+
+  it("only dispatches structured manual gate releases with an approved decision", async () => {
+    const spawned: string[] = [];
+    const ao = createAo((taskId) => spawned.push(taskId));
+    const plan = createPlan([
+      createTask({
+        taskId: "TASK-001",
+        title: "Completed dependency",
+        description: "Completed dependency.",
+        status: "completed"
+      }),
+      createTask({
+        taskId: "TASK-002",
+        title: "Released manual gate task",
+        description: "Released manual gate task.",
+        type: "verification",
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        aoRole: "qa",
+        acceptanceCriteria: ["Verified"],
+        aoPrompt: "[WF-001 / TASK-002] Verify."
+      }),
+      createTask({
+        taskId: "TASK-003",
+        title: "Blocked manual gate task",
+        description: "Blocked manual gate task.",
+        type: "verification",
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        aoRole: "qa",
+        acceptanceCriteria: ["Verified"],
+        aoPrompt: "[WF-001 / TASK-003] Verify."
+      })
+    ]);
+
+    const result = await executePlan({
+      plan,
+      ao: ao as AoCliAdapter,
+      releasedManualGateTaskIds: [
+        { taskId: "TASK-002", decision: "approved", rationale: "人工确认" },
+        { taskId: "TASK-003", decision: "requires_replan", rationale: "需要重规划" }
+      ]
+    });
+
+    expect(spawned).toEqual(["TASK-002"]);
+    expect(result.blockedTasks).toEqual([
+      {
+        taskId: "TASK-003",
+        kind: "manual_gate",
+        reason: "manual_gate requires human approval before dispatch"
+      }
+    ]);
+  });
 });
 
 function createAo(onSpawn: (taskId: string) => void): Pick<AoCliAdapter, "spawnTask"> {

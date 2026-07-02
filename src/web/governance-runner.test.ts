@@ -50,6 +50,10 @@ describe("runGovernanceWorkflow", () => {
     await expect(readFile(join(result.artifactDir, "task-plan-reviews.json"), "utf8")).resolves.toContain(
       '"reviewDecision": "approved"'
     );
+    await expect(readFile(join(result.artifactDir, "task-plan-approval-report.json"), "utf8")).resolves.toContain(
+      '"approved": true'
+    );
+    expect(result.taskPlanApprovalReport?.approved).toBe(true);
     expect(result.taskPlanReviews).toHaveLength(1);
   });
 
@@ -346,6 +350,10 @@ describe("runGovernanceWorkflow", () => {
         review.findings.some((finding) => finding.id === "TPG-PREVIOUS-TPF-RAWIP")
       )
     ).toBe(true);
+    expect(planned.taskPlanApprovalReport?.approved).toBe(false);
+    await expect(readFile(join(planned.artifactDir, "task-plan-approval-report.json"), "utf8")).resolves.toContain(
+      '"approved": false'
+    );
   });
 
   it("blocks after repeated local gate failures exhaust task-plan review rounds", async () => {

@@ -146,6 +146,7 @@ export async function createTaskPlanStage(input: {
           : []
     },
     taskPlanReviews,
+    taskPlanApprovalReport: planLoop.approvalReport,
     draftPlan: planLoop.approved ? undefined : planLoop.plan,
     plan: nextPlan
   };
