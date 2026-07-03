@@ -6,7 +6,6 @@ import { AoCliAdapter } from "./adapters/ao.js";
 import { ClaudeCodeCliAdapter, StructuredOutputError } from "./adapters/claude-code.js";
 import { CodexCliAdapter } from "./adapters/codex.js";
 import { designReviewSchema } from "./schemas/design-review.js";
-import { taskPlanSchema } from "./schemas/task-plan.js";
 import {
   createCompletionReport,
   normalizeAoSessions,
@@ -14,6 +13,7 @@ import {
 } from "./workflow/ao-status.js";
 import { executePlan } from "./workflow/plan-execution.js";
 import { runWorkflow } from "./workflow/run-workflow.js";
+import { TASK_PLAN_NORMALIZATION_SOURCE, parseTaskPlanWithNormalization } from "./workflow/task-plan-normalizer.js";
 import { startWebServer } from "./web/server.js";
 import { stopServiceOnPort } from "./web/service-control.js";
 
@@ -274,7 +274,10 @@ await program.parseAsync();
 
 async function readTaskPlan(file: string) {
   const parsed = await readJson(file);
-  return taskPlanSchema.parse(parsed);
+  return parseTaskPlanWithNormalization(parsed, {
+    workflowId: inferWorkflowId(parsed),
+    source: TASK_PLAN_NORMALIZATION_SOURCE.cli
+  }, `Task plan file ${file} is invalid`);
 }
 
 async function readDesignReviews(file: string) {
@@ -288,4 +291,10 @@ async function readDesignReviews(file: string) {
 async function readJson(file: string): Promise<unknown> {
   const raw = await readFile(file, "utf8");
   return JSON.parse(raw) as unknown;
+}
+
+function inferWorkflowId(value: unknown): string | undefined {
+  return typeof value === "object" && value !== null && "workflowId" in value && typeof value.workflowId === "string"
+    ? value.workflowId
+    : undefined;
 }

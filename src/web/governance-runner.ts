@@ -8,6 +8,7 @@ import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { Workflow } from "../schemas/workflow.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
 import { runDesignReviewLoop } from "../workflow/design-review-loop.js";
+import type { TaskPlanNormalizationReport } from "../workflow/task-plan-normalizer.js";
 import { runTaskPlanReviewLoop } from "../workflow/task-plan-review-loop.js";
 import { ArtifactStore, type GovernanceArtifacts } from "./artifact-store.js";
 import { buildRequirementDescription } from "./request-formatting.js";
@@ -31,6 +32,7 @@ export interface GovernanceRunResult extends GovernanceArtifacts {
 export type TaskPlanStageEvent =
   | { type: "planning_started"; deferredFindings: DesignReview["findings"]; startingRound: number }
   | { type: "task_plan_generated"; round: number; planVersion: string; plan: TaskPlan }
+  | { type: "task_plan_normalized"; round: number; report: TaskPlanNormalizationReport }
   | { type: "task_plan_review_started"; round: number; planVersion: string }
   | { type: "task_plan_review_completed"; review: TaskPlanReview }
   | { type: "task_plan_local_gate_started"; round: number; planVersion: string }
@@ -101,6 +103,7 @@ export async function createTaskPlanStage(input: {
   const existingTaskPlanReviews = artifacts.taskPlanReviews ?? [];
   const deferredFindings = collectDeferredFindings(artifacts.reviews);
   const startingRound = existingTaskPlanReviews.length + 1;
+  const taskPlanNormalizationReports: TaskPlanNormalizationReport[] = [];
   await input.onEvent?.({ type: "planning_started", deferredFindings, startingRound });
   const planLoop = await runTaskPlanReviewLoop({
     workflowId: artifacts.workflow.workflowId,
@@ -116,7 +119,11 @@ export async function createTaskPlanStage(input: {
     previousReviews: existingTaskPlanReviews,
     signal: input.signal,
     hooks: {
-      onPlan: async ({ round, planVersion, plan }) => {
+      onPlan: async ({ round, planVersion, plan, normalizationReport }) => {
+        if (normalizationReport) {
+          taskPlanNormalizationReports.push(normalizationReport);
+          await input.onEvent?.({ type: "task_plan_normalized", round, report: normalizationReport });
+        }
         await input.onEvent?.({ type: "task_plan_generated", round, planVersion, plan });
       },
       onReviewStart: async ({ round, planVersion }) => {
@@ -143,12 +150,21 @@ export async function createTaskPlanStage(input: {
     workflow: {
       ...artifacts.workflow,
       status: planLoop.approved ? "executing" : "blocked_for_human",
+      lastNormalization: taskPlanNormalizationReports.at(-1)
+        ? {
+            round: taskPlanNormalizationReports.at(-1)?.round ?? 0,
+            reportPath: `task-plan-normalization-report-${taskPlanNormalizationReports.at(-1)?.round ?? 0}.json`,
+            changeCount: taskPlanNormalizationReports.at(-1)?.changes.length ?? 0,
+            outcome: taskPlanNormalizationReports.at(-1)?.outcome ?? "passed"
+          }
+        : artifacts.workflow.lastNormalization,
       tasks: planLoop.approved
         ? planLoop.plan.tasks.map((task) => task.taskId)
         : []
     },
     taskPlanReviews,
     taskPlanApprovalReport: planLoop.approvalReport,
+    taskPlanNormalizationReports,
     draftPlan: planLoop.approved ? undefined : planLoop.plan,
     plan: planLoop.approved ? planLoop.plan : undefined
   };

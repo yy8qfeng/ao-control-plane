@@ -6,6 +6,13 @@ import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
 import { taskPlanSchema } from "../schemas/task-plan.js";
 import { createLocalGateReview, validateTaskPlanApprovalGate } from "./task-plan-gates.js";
+import {
+  TASK_PLAN_NORMALIZATION_SOURCE,
+  cloneTaskPlanNormalizationReport,
+  getTaskPlanNormalizationReport,
+  type TaskPlanNormalizationSource,
+  type TaskPlanNormalizationReport
+} from "./task-plan-normalizer.js";
 
 export interface TaskPlanReviewLoopOptions {
   maxTaskPlanReviewRounds: number;
@@ -13,7 +20,12 @@ export interface TaskPlanReviewLoopOptions {
 }
 
 export interface TaskPlanReviewLoopHooks {
-  onPlan?: (input: { planVersion: string; plan: TaskPlan; round: number }) => Promise<void> | void;
+  onPlan?: (input: {
+    planVersion: string;
+    plan: TaskPlan;
+    round: number;
+    normalizationReport?: TaskPlanNormalizationReport;
+  }) => Promise<void> | void;
   onReviewStart?: (input: { round: number; planVersion: string }) => Promise<void> | void;
   onReview?: (input: { review: TaskPlanReview }) => Promise<void> | void;
   onLocalGateStart?: (input: { round: number; planVersion: string }) => Promise<void> | void;
@@ -38,21 +50,27 @@ export async function runTaskPlanReviewLoop(input: {
   codex: CodexAdapter;
   claudeCode: ClaudeCodeAdapter;
   options: TaskPlanReviewLoopOptions;
+  normalizationSource?: TaskPlanNormalizationSource;
   hooks?: TaskPlanReviewLoopHooks;
   signal?: AbortSignal;
   initialPlan?: TaskPlan;
   previousReviews?: TaskPlanReview[];
 }): Promise<TaskPlanReviewLoopResult> {
   throwIfAborted(input.signal);
-  let plan = input.initialPlan
-    ? taskPlanSchema.parse(input.initialPlan)
-    : taskPlanSchema.parse(
-        await input.codex.createTaskPlan({
-          workflowId: input.workflowId,
-          approvedDesign: input.approvedDesign,
-          deferredFindings: input.deferredFindings
-        }, { signal: input.signal })
-      );
+  const initialPlan = input.initialPlan
+    ? input.initialPlan
+    : await input.codex.createTaskPlan({
+      workflowId: input.workflowId,
+      approvedDesign: input.approvedDesign,
+      deferredFindings: input.deferredFindings
+    }, { signal: input.signal });
+  let normalizationReport = materializeNormalizationReport(
+    initialPlan,
+    input.options.startingRound ?? 1,
+    getTaskPlanNormalizationReport(initialPlan),
+    input.initialPlan ? input.normalizationSource ?? TASK_PLAN_NORMALIZATION_SOURCE.artifact : TASK_PLAN_NORMALIZATION_SOURCE.codex
+  );
+  let plan = taskPlanSchema.parse(initialPlan);
   const reviews: TaskPlanReview[] = [];
   const previousReviews = input.previousReviews ?? [];
   const planVersion = "task-plan-current";
@@ -61,7 +79,8 @@ export async function runTaskPlanReviewLoop(input: {
 
   for (let round = startingRound; round <= finalRound; round += 1) {
     throwIfAborted(input.signal);
-    await input.hooks?.onPlan?.({ planVersion, plan, round });
+    normalizationReport = materializeNormalizationReport(plan, round, normalizationReport, normalizationReport.source);
+    await input.hooks?.onPlan?.({ planVersion, plan, round, normalizationReport });
     await input.hooks?.onReviewStart?.({ round, planVersion });
     const review = await input.claudeCode.reviewTaskPlan({
       workflowId: input.workflowId,
@@ -100,13 +119,13 @@ export async function runTaskPlanReviewLoop(input: {
         }
 
         await input.hooks?.onRevisionStart?.({ round, review: localGateReview });
-        plan = taskPlanSchema.parse(
-          await input.codex.reviseTaskPlan({
-            currentPlan: plan,
-            review: localGateReview,
-            approvedDesign: input.approvedDesign
-          }, { signal: input.signal })
-        );
+        const revisedPlan = await input.codex.reviseTaskPlan({
+          currentPlan: plan,
+          review: localGateReview,
+          approvedDesign: input.approvedDesign
+        }, { signal: input.signal });
+        normalizationReport = materializeRevisedNormalizationReport(revisedPlan, round + 1, normalizationReport);
+        plan = taskPlanSchema.parse(revisedPlan);
         continue;
       }
 
@@ -117,7 +136,7 @@ export async function runTaskPlanReviewLoop(input: {
         reviews,
         blockedForHuman: false,
         finalReviewDecision: review.reviewDecision,
-        approvalReport: gate.approvalReport
+        approvalReport: attachNormalizationSummary(gate.approvalReport, normalizationReport)
       };
     }
 
@@ -126,14 +145,23 @@ export async function runTaskPlanReviewLoop(input: {
     }
 
     await input.hooks?.onRevisionStart?.({ round, review });
-    plan = taskPlanSchema.parse(
-      await input.codex.reviseTaskPlan({
-        currentPlan: plan,
-        review,
-        approvedDesign: input.approvedDesign
-      }, { signal: input.signal })
-    );
+    const revisedPlan = await input.codex.reviseTaskPlan({
+      currentPlan: plan,
+      review,
+      approvedDesign: input.approvedDesign
+    }, { signal: input.signal });
+    normalizationReport = materializeRevisedNormalizationReport(revisedPlan, round + 1, normalizationReport);
+    plan = taskPlanSchema.parse(revisedPlan);
   }
+
+  const approvalReport = validateTaskPlanApprovalGate({
+    workflowId: input.workflowId,
+    planVersion,
+    approvedDesign: input.approvedDesign,
+    deferredFindings: input.deferredFindings,
+    plan,
+    previousReviews: [...previousReviews, ...reviews]
+  }).approvalReport;
 
   return {
     approved: false,
@@ -142,14 +170,84 @@ export async function runTaskPlanReviewLoop(input: {
     reviews,
     blockedForHuman: true,
     finalReviewDecision: reviews.at(-1)?.reviewDecision,
-    approvalReport: validateTaskPlanApprovalGate({
-      workflowId: input.workflowId,
-      planVersion,
-      approvedDesign: input.approvedDesign,
-      deferredFindings: input.deferredFindings,
-      plan,
-      previousReviews: [...previousReviews, ...reviews]
-    }).approvalReport
+    approvalReport: attachNormalizationSummary(approvalReport, normalizationReport)
+  };
+}
+
+function materializeNormalizationReport(
+  plan: TaskPlan,
+  round: number,
+  previous?: TaskPlanNormalizationReport,
+  source: TaskPlanNormalizationSource = TASK_PLAN_NORMALIZATION_SOURCE.artifact
+): TaskPlanNormalizationReport {
+  const boundReport = getTaskPlanNormalizationReport(plan);
+  const report = boundReport ?? previous;
+  if (report) {
+    return appendSourceHistory(
+      cloneTaskPlanNormalizationReport(report, { round }),
+      round,
+      boundReport ? "bound normalization report" : "previous normalization report carried forward"
+    );
+  }
+  return appendSourceHistory({
+    workflowId: plan.workflowId,
+    round,
+    generatedAt: new Date().toISOString(),
+    source,
+    rawSchemaErrors: [],
+    changes: [],
+    droppedEntries: [],
+    strictSchemaErrors: [],
+    outcome: "passed"
+  }, round, "fallback normalization report created");
+}
+
+function materializeRevisedNormalizationReport(
+  revisedPlan: TaskPlan,
+  round: number,
+  previousReport: TaskPlanNormalizationReport
+): TaskPlanNormalizationReport {
+  if (!previousReport) {
+    throw new Error("Task-plan revision normalization requires a previous normalization report");
+  }
+  const revisedReport = getTaskPlanNormalizationReport(revisedPlan);
+  return materializeNormalizationReport(
+    revisedPlan,
+    round,
+    revisedReport ?? previousReport,
+    revisedReport?.source ?? previousReport.source
+  );
+}
+
+function appendSourceHistory(
+  report: TaskPlanNormalizationReport,
+  round: number,
+  reason: string
+): TaskPlanNormalizationReport {
+  const history = [...(report.sourceHistory ?? [])];
+  const last = history.at(-1);
+  if (last?.round !== round || last.source !== report.source) {
+    history.push({ round, source: report.source, reason });
+  }
+  return { ...report, sourceHistory: history };
+}
+
+function attachNormalizationSummary(
+  approvalReport: TaskPlanApprovalReport,
+  report: TaskPlanNormalizationReport | undefined
+): TaskPlanApprovalReport {
+  if (!report) {
+    return approvalReport;
+  }
+  return {
+    ...approvalReport,
+    normalizationReport: {
+      round: report.round,
+      reportPath: `task-plan-normalization-report-${report.round}.json`,
+      outcome: report.outcome,
+      changeCount: report.changes.length,
+      droppedEntryCount: report.droppedEntries.length
+    }
   };
 }
 

@@ -4,12 +4,13 @@ import { taskPlanSchema, type TaskPlan } from "../schemas/task-plan.js";
 import { CodexCliAdapter, PlaceholderCodexAdapter } from "./codex.js";
 
 const { codexOutput, execaMock } = vi.hoisted(() => {
-  const codexOutput = { value: "# Design\n\nGenerated design." };
-  const execaMock = vi.fn(async (_command: string, args: string[]) => {
+  const codexOutput = { value: "# Design\n\nGenerated design.", queue: [] as string[] };
+  const execaMock = vi.fn(async (_command: string, args: string[], options?: { input?: string }) => {
+    void options;
     const { writeFile } = await import("node:fs/promises");
     const outputFlagIndex = args.indexOf("--output-last-message");
     if (outputFlagIndex >= 0) {
-      await writeFile(args[outputFlagIndex + 1] ?? "", codexOutput.value);
+      await writeFile(args[outputFlagIndex + 1] ?? "", codexOutput.queue.shift() ?? codexOutput.value);
     }
     return { exitCode: 0, stdout: "", stderr: "" };
   });
@@ -23,6 +24,7 @@ vi.mock("execa", () => ({
 describe("CodexCliAdapter", () => {
   beforeEach(() => {
     codexOutput.value = "# Design\n\nGenerated design.";
+    codexOutput.queue = [];
     execaMock.mockClear();
   });
 
@@ -225,6 +227,95 @@ describe("CodexCliAdapter", () => {
 
     expect(plan.tasks[0]?.type).toBe("review");
     expect(plan.tasks[0]?.phase).toBe("calibration");
+  });
+
+  it("repairs invalid task-plan schema output before returning a plan", async () => {
+    codexOutput.queue = [
+      JSON.stringify({
+        workflowId: "WF-001",
+        title: "Plan",
+        tasks: [
+          {
+            taskId: "TASK-001",
+            workflowId: "WF-001",
+            title: "Implement feature",
+            description: "Implement the feature.",
+            type: "implementation",
+            dependencies: ["TASK-404"],
+            dependencyCondition: "all_completed",
+            aoRole: "backend-senior",
+            acceptanceCriteria: ["Feature works"],
+            aoPrompt: "[WF-001 / TASK-001] Implement feature.",
+            status: "pending"
+          }
+        ]
+      }),
+      JSON.stringify({
+        workflowId: "WF-001",
+        title: "Plan",
+        tasks: [
+          {
+            taskId: "TASK-001",
+            workflowId: "WF-001",
+            title: "Implement feature",
+            description: "Implement the feature.",
+            type: "implementation",
+            dependencies: [],
+            dependencyCondition: "all_completed",
+            aoRole: "backend-senior",
+            acceptanceCriteria: ["Feature works"],
+            aoPrompt: "[WF-001 / TASK-001] Implement feature.",
+            status: "pending"
+          }
+        ]
+      })
+    ];
+    const codex = new CodexCliAdapter({ codexBin: "codex-test" });
+
+    const plan = await codex.createTaskPlan({
+      workflowId: "WF-001",
+      approvedDesign: "# Design\n\nApproved design."
+    });
+
+    expect(plan.tasks[0]?.dependencies).toEqual([]);
+    expect(execaMock).toHaveBeenCalledTimes(2);
+    const repairPrompt = execaMock.mock.calls[1]?.[2]?.input as string;
+    expect(repairPrompt).toContain("schema repair");
+    expect(repairPrompt).toContain("Unknown dependency");
+  });
+
+  it("throws a structured repair error when schema repair rounds are exhausted", async () => {
+    codexOutput.value = JSON.stringify({
+      workflowId: "WF-001",
+      title: "Plan",
+      tasks: [
+        {
+          taskId: "TASK-001",
+          workflowId: "WF-001",
+          title: "Implement feature",
+          description: "Implement the feature.",
+          type: "implementation",
+          dependencies: ["TASK-404"],
+          dependencyCondition: "all_completed",
+          aoRole: "backend-senior",
+          acceptanceCriteria: ["Feature works"],
+          aoPrompt: "[WF-001 / TASK-001] Implement feature.",
+          status: "pending"
+        }
+      ]
+    });
+    const codex = new CodexCliAdapter({ codexBin: "codex-test", schemaRepairRounds: 1 });
+
+    await expect(
+      codex.createTaskPlan({
+        workflowId: "WF-001",
+        approvedDesign: "# Design\n\nApproved design."
+      })
+    ).rejects.toMatchObject({
+      name: "TaskPlanSchemaRepairError",
+      repairAttempts: 1
+    });
+    expect(execaMock).toHaveBeenCalledTimes(2);
   });
 });
 

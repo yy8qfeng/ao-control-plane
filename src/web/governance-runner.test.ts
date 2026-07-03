@@ -9,6 +9,7 @@ import type { DesignReview } from "../schemas/design-review.js";
 import { defaultExecutionPolicy } from "../schemas/execution-policy.js";
 import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
+import { parseTaskPlanWithNormalization } from "../workflow/task-plan-normalizer.js";
 import {
   createTaskPlanStage,
   runDesignReviewStage,
@@ -182,6 +183,97 @@ describe("runGovernanceWorkflow", () => {
     await expect(readFile(join(planned.artifactDir, "task-plan.json"), "utf8")).resolves.toContain(
       "Existing draft criterion"
     );
+  });
+
+  it("persists and restores task plan normalization reports for web planning", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-"));
+    const store = new ArtifactStore(tempDir);
+    const workflowId = "WF-WEB-NORMALIZATION-REPORT";
+    await store.saveWorkflow({
+      requirement: {
+        id: workflowId,
+        title: "Web normalization report",
+        source: "test",
+        description: "Persist normalization reports.",
+        acceptanceCriteria: [],
+        constraints: []
+      },
+      workflow: {
+        workflowId,
+        title: "Web normalization report",
+        rawRequirement: "Persist normalization reports.",
+        status: "ready_for_planning",
+        designRounds: 1,
+        maxDesignReviewRounds: 1,
+        approvedDesignVersion: "design-current",
+        tasks: []
+      },
+      design: "# Web normalization report",
+      reviews: [
+        {
+          workflowId,
+          round: 1,
+          designer: "codex",
+          reviewer: "claude-code",
+          designVersion: "design-current",
+          reviewDecision: "approved",
+          findings: []
+        }
+      ]
+    });
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(): Promise<TaskPlan> {
+        return parseTaskPlanWithNormalization(
+          {
+            workflowId,
+            title: "Plan",
+            tasks: [
+              {
+                taskId: "TASK-001",
+                workflowId,
+                title: "G0 reality check",
+                description: "Calibrate repository reality.",
+                type: "calibration",
+                dependencies: [],
+                dependencyCondition: "all_completed",
+                aoRole: "architect",
+                acceptanceCriteria: ["G0 result is documented"],
+                aoPrompt: `[${workflowId} / TASK-001] G0 reality check.`,
+                status: "pending"
+              }
+            ]
+          },
+          { workflowId, source: "codex" }
+        );
+      },
+      async reviseTaskPlan(input): Promise<TaskPlan> {
+        return input.currentPlan;
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return {
+          workflowId,
+          round: input.round,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: input.planVersion,
+          reviewDecision: "approved",
+          findings: []
+        };
+      }
+    };
+
+    const planned = await createTaskPlanStage({ store, workflowId, codex, claudeCode });
+    const restored = await store.readWorkflow(workflowId);
+
+    expect(planned.taskPlanNormalizationReports).toHaveLength(1);
+    expect(restored.taskPlanNormalizationReports).toHaveLength(1);
+    expect(restored.taskPlanNormalizationReports?.[0]?.changes[0]?.path).toBe("tasks.0.type");
+    expect(restored.workflow.lastNormalization?.reportPath).toBe("task-plan-normalization-report-1.json");
   });
 
   it("reviews the approved plan instead of a stale draft for executing workflows", async () => {

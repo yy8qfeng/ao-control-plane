@@ -1181,6 +1181,14 @@ export function renderIndexHtml(): string {
       return state.result?.plan || state.job?.plan || state.job?.result?.plan || null;
     }
 
+    function getTaskPlanNormalizationReports() {
+      return state.result?.taskPlanNormalizationReports || state.job?.result?.taskPlanNormalizationReports || [];
+    }
+
+    function getTaskPlanNormalizationReportErrors() {
+      return state.result?.taskPlanNormalizationReportErrors || state.job?.result?.taskPlanNormalizationReportErrors || [];
+    }
+
     function formatPlanTabContent() {
       const report = getTaskPlanApprovalReport();
       const plan = getCurrentPlan();
@@ -1204,7 +1212,10 @@ export function renderIndexHtml(): string {
       const unresolvedFindings = (report.findingSummary || [])
         .filter((finding) => finding.status === "unresolved")
         .map((finding) => finding.id);
+      const normalizationSummary = formatTaskPlanNormalizationSummary(report);
       return [
+        normalizationSummary,
+        "",
         "审批状态：" + (report.approved ? "通过" : "未通过"),
         "可实施状态：" + formatPlanReadiness(report.planReadiness),
         "可派发任务：" + Number(dispatch.dispatchableTaskCount || 0),
@@ -1214,6 +1225,102 @@ export function renderIndexHtml(): string {
         "覆盖缺口：" + (missingCoverage.length ? missingCoverage.join("、") : "无"),
         "待处理 finding：" + (unresolvedFindings.length ? unresolvedFindings.join("、") : "无")
       ].join("\\n");
+    }
+
+    function formatTaskPlanNormalizationSummary(approvalReport) {
+      const reports = getTaskPlanNormalizationReports();
+      const reportErrors = getTaskPlanNormalizationReportErrors();
+      const latestReport = reports.length ? reports[reports.length - 1] : null;
+      const reportSummary = latestReport || approvalReport?.normalizationReport || state.result?.workflow?.lastNormalization || state.job?.result?.workflow?.lastNormalization;
+      if (!reportSummary && !latestReport && !reportErrors.length) {
+        return "归一化状态：暂无。";
+      }
+      const round = latestReport?.round ?? reportSummary?.round ?? 0;
+      const outcome = latestReport?.outcome ?? reportSummary?.outcome ?? "passed";
+      const changeCount = latestReport?.changes?.length ?? reportSummary?.changeCount ?? 0;
+      const droppedEntryCount = latestReport?.droppedEntries?.length ?? reportSummary?.droppedEntryCount ?? 0;
+      const reportPath = latestReport ? "task-plan-normalization-report-" + round + ".json" : reportSummary?.reportPath || (round ? "task-plan-normalization-report-" + round + ".json" : "");
+      const rawErrors = latestReport?.rawSchemaErrors?.length || 0;
+      const strictErrors = latestReport?.strictSchemaErrors?.length || 0;
+      const sourceHistory = latestReport?.sourceHistory || [];
+      const lines = [
+        "归一化状态：" + formatNormalizationOutcome(outcome),
+        "归一化轮次：" + round,
+        "归一化变更：" + changeCount,
+        "丢弃条目：" + droppedEntryCount,
+        "格式错误：" + rawErrors,
+        "严格校验错误：" + strictErrors,
+        "归一化报告：" + (reportPath || "未记录")
+      ];
+      if (reportErrors.length) {
+        lines.push("损坏报告：" + formatNormalizationReportErrors(reportErrors));
+        lines.push("损坏报告明细：");
+        formatNormalizationReportErrorGroups(reportErrors).forEach((group) => {
+          lines.push("- round " + group.round + "：" + group.errors.length + " 个");
+          group.errors.forEach((error) => {
+            lines.push("  - " + formatNormalizationReportErrorDetail(error));
+          });
+        });
+      }
+      if (sourceHistory.length) {
+        lines.push("来源演化：");
+        sourceHistory.forEach((entry) => {
+          lines.push("- " + entry.source + " / round " + entry.round + " / " + entry.reason);
+        });
+      }
+      return lines.join("\\n");
+    }
+
+    function formatNormalizationReportErrors(errors) {
+      const critical = errors.filter((error) => error.severity === "critical").length;
+      const warning = errors.length - critical;
+      return errors.length + "（critical " + critical + " / warning " + warning + "）";
+    }
+
+    function formatNormalizationReportErrorGroups(errors) {
+      const groups = new Map();
+      errors.forEach((error) => {
+        const round = Number(error.round || 0);
+        if (!groups.has(round)) groups.set(round, []);
+        groups.get(round).push(error);
+      });
+      return Array.from(groups.entries())
+        .sort((left, right) => left[0] - right[0])
+        .map(([round, groupedErrors]) => ({
+          round,
+          errors: groupedErrors.slice().sort(compareNormalizationReportErrors)
+        }));
+    }
+
+    function formatNormalizationReportErrorDetail(error) {
+      return error.severity + " / " + error.message + (error.details ? " / details " + error.details : "") + formatNormalizationReportErrorDetailFields(error);
+    }
+
+    function formatNormalizationReportErrorDetailFields(error) {
+      const fields = (error.issues || [])
+        .flatMap((issue) => Object.entries(issue.detailFields || {}).map(([key, value]) => issue.path + "." + key + "=" + value));
+      return fields.length ? " / fields " + fields.join(", ") : "";
+    }
+
+    function getNormalizationErrorSeverityRank(error) {
+      return error.severity === "critical" ? 0 : 1;
+    }
+
+    function compareNormalizationReportErrors(left, right) {
+      const severity = getNormalizationErrorSeverityRank(left) - getNormalizationErrorSeverityRank(right);
+      if (severity !== 0) return severity;
+      const leftIssue = (left.issues || [])[0] || {};
+      const rightIssue = (right.issues || [])[0] || {};
+      const code = String(leftIssue.code || "").localeCompare(String(rightIssue.code || ""));
+      if (code !== 0) return code;
+      return String(leftIssue.path || left.path || "").localeCompare(String(rightIssue.path || right.path || ""));
+    }
+
+    function formatNormalizationOutcome(outcome) {
+      if (outcome === "passed") return "已通过";
+      if (outcome === "raw_failed") return "原始结构失败";
+      if (outcome === "strict_failed") return "严格校验失败";
+      return "未知（" + String(outcome || "未记录") + "）";
     }
 
     function formatPlanReadiness(readiness) {

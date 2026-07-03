@@ -3,11 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { StructuredOutputError, type ClaudeCodeAdapter } from "../adapters/claude-code.js";
-import type { CodexAdapter } from "../adapters/codex.js";
+import { TaskPlanSchemaRepairError, type CodexAdapter } from "../adapters/codex.js";
 import type { DesignReview } from "../schemas/design-review.js";
 import { defaultExecutionPolicy } from "../schemas/execution-policy.js";
 import type { TaskPlanReview } from "../schemas/task-plan-review.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
+import { parseTaskPlanWithNormalization } from "./task-plan-normalizer.js";
 import { runWorkflow } from "./run-workflow.js";
 
 describe("runWorkflow", () => {
@@ -81,6 +82,68 @@ describe("runWorkflow", () => {
     await expect(
       readFile(join(root, "artifacts", "WF-001", "task-plan-reviews.json"), "utf8")
     ).resolves.toContain('"planVersion": "task-plan-current"');
+  });
+
+  it("persists task-plan normalization reports and workflow summary", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ao-control-plane-workflow-"));
+    const requirementFile = join(root, "requirement.json");
+    await writeFile(
+      requirementFile,
+      JSON.stringify({
+        id: "WF-NORMALIZATION-REPORT",
+        title: "Feature",
+        source: "test",
+        description: "Build the feature.",
+        maxDesignReviewRounds: 1
+      }),
+      "utf8"
+    );
+
+    const codex: CodexAdapter = {
+      async createDesign() {
+        return "# Feature\n\n## 背景与问题定义\nBuild it.";
+      },
+      async reviseDesign() {
+        throw new Error("should not revise approved design");
+      },
+      async createTaskPlan(input): Promise<TaskPlan> {
+        return createPlanWithNormalization(input.workflowId);
+      },
+      reviseTaskPlan: unusedTaskPlanRevision
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      async reviewDesign(input): Promise<DesignReview> {
+        return {
+          workflowId: input.workflowId,
+          round: input.round,
+          designer: "codex",
+          reviewer: "claude-code",
+          designVersion: input.designVersion,
+          reviewDecision: "approved",
+          findings: []
+        };
+      },
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return approveTaskPlan(input);
+      }
+    };
+
+    await runWorkflow({
+      requirementFile,
+      artifactRoot: join(root, "artifacts"),
+      codex,
+      claudeCode
+    });
+
+    await expect(
+      readFile(join(root, "artifacts", "WF-NORMALIZATION-REPORT", "task-plan-normalization-report-1.json"), "utf8")
+    ).resolves.toContain('"path": "tasks.0.type"');
+    await expect(
+      readFile(join(root, "artifacts", "WF-NORMALIZATION-REPORT", "workflow.json"), "utf8")
+    ).resolves.toContain('"lastNormalization"');
+    await expect(
+      readFile(join(root, "artifacts", "WF-NORMALIZATION-REPORT", "task-plan-approval-report.json"), "utf8")
+    ).resolves.toContain('"normalizationReport"');
   });
 
   it("plans deferred implementation findings instead of blocking for human", async () => {
@@ -354,6 +417,84 @@ describe("runWorkflow", () => {
     ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("blocks for human and writes repair artifacts when task-plan schema repair is exhausted", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ao-control-plane-workflow-"));
+    const requirementFile = join(root, "requirement.json");
+    await writeFile(
+      requirementFile,
+      JSON.stringify({
+        id: "WF-SCHEMA-REPAIR-BLOCKED",
+        title: "Feature",
+        source: "test",
+        description: "Build the feature.",
+        maxDesignReviewRounds: 1
+      }),
+      "utf8"
+    );
+
+    const codex: CodexAdapter = {
+      async createDesign() {
+        return "# Feature\n\n## 背景与问题定义\nBuild it.";
+      },
+      async reviseDesign() {
+        throw new Error("should not revise approved design");
+      },
+      async createTaskPlan(): Promise<TaskPlan> {
+        throw new TaskPlanSchemaRepairError(
+          "schema repair exhausted",
+          "{\"workflowId\":\"WF-SCHEMA-REPAIR-BLOCKED\"}",
+          {
+            workflowId: "WF-SCHEMA-REPAIR-BLOCKED",
+            round: 2,
+            generatedAt: "2026-07-02T00:00:00.000Z",
+            source: "codex",
+            rawSchemaErrors: [{ path: "tasks", message: "Required" }],
+            changes: [],
+            droppedEntries: [],
+            strictSchemaErrors: [],
+            outcome: "raw_failed"
+          },
+          2
+        );
+      },
+      reviseTaskPlan: unusedTaskPlanRevision
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      async reviewDesign(input): Promise<DesignReview> {
+        return {
+          workflowId: input.workflowId,
+          round: input.round,
+          designer: "codex",
+          reviewer: "claude-code",
+          designVersion: input.designVersion,
+          reviewDecision: "approved",
+          findings: []
+        };
+      },
+      async reviewTaskPlan(): Promise<TaskPlanReview> {
+        throw new Error("should not review invalid task plan");
+      }
+    };
+
+    const result = await runWorkflow({
+      requirementFile,
+      artifactRoot: join(root, "artifacts"),
+      codex,
+      claudeCode
+    });
+
+    expect(result.workflow.status).toBe("blocked_for_human");
+    await expect(
+      readFile(join(root, "artifacts", "WF-SCHEMA-REPAIR-BLOCKED", "human-review-required.json"), "utf8")
+    ).resolves.toContain("task-plan-schema-repair");
+    await expect(
+      readFile(join(root, "artifacts", "WF-SCHEMA-REPAIR-BLOCKED", "invalid-task-plan-output.txt"), "utf8")
+    ).resolves.toContain("WF-SCHEMA-REPAIR-BLOCKED");
+    await expect(
+      readFile(join(root, "artifacts", "WF-SCHEMA-REPAIR-BLOCKED", "task-plan-normalization-report-2.json"), "utf8")
+    ).resolves.toContain('"outcome": "raw_failed"');
+  });
+
   it("continues task-plan review from an existing draft after a blocked run", async () => {
     const root = await mkdtemp(join(tmpdir(), "ao-control-plane-workflow-"));
     const requirementFile = join(root, "requirement.json");
@@ -603,6 +744,31 @@ function createPlan(workflowId: string, criterion: string): TaskPlan {
       }
     ]
   };
+}
+
+function createPlanWithNormalization(workflowId: string): TaskPlan {
+  return parseTaskPlanWithNormalization(
+    {
+      workflowId,
+      title: "Plan",
+      tasks: [
+        {
+          taskId: "TASK-001",
+          workflowId,
+          title: "Review G0",
+          description: "Human review and release gate for G0.",
+          type: "calibration",
+          dependencies: [],
+          dependencyCondition: "manual_gate",
+          aoRole: "human-reviewer",
+          acceptanceCriteria: ["G0 reviewed"],
+          aoPrompt: `[${workflowId} / TASK-001]\n任务名称：Review G0\nAO 角色：reviewer\n验收标准：\n1. G0 reviewed\n上下文摘要：Follow the approved design.`,
+          status: "pending"
+        }
+      ]
+    },
+    { workflowId, source: "codex" }
+  );
 }
 
 function approveTaskPlan(input: {

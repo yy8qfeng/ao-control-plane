@@ -5,6 +5,13 @@ export const taskPlanApprovalReportSchema = z.object({
   workflowId: z.string().min(1),
   planVersion: z.string().min(1),
   generatedAt: z.string().min(1),
+  normalizationReport: z.object({
+    round: z.number().int().nonnegative(),
+    reportPath: z.string().min(1).optional(),
+    outcome: z.enum(["passed", "raw_failed", "strict_failed"]),
+    changeCount: z.number().int().nonnegative(),
+    droppedEntryCount: z.number().int().nonnegative()
+  }).optional(),
   approved: z.boolean(),
   planReadiness: planReadinessSchema,
   dispatchSummary: z.object({

@@ -22,6 +22,12 @@ export const workflowSchema = z.object({
   designRounds: z.number().int().nonnegative().default(0),
   maxDesignReviewRounds: z.number().int().positive().default(3),
   approvedDesignVersion: z.string().min(1).optional(),
+  lastNormalization: z.object({
+    round: z.number().int().nonnegative(),
+    reportPath: z.string().min(1),
+    changeCount: z.number().int().nonnegative(),
+    outcome: z.enum(["passed", "raw_failed", "strict_failed"])
+  }).optional(),
   tasks: z.array(z.string().min(1)).default([])
 });
 

@@ -2,7 +2,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import type { ClaudeCodeAdapter } from "../adapters/claude-code.js";
 import { StructuredOutputError } from "../adapters/claude-code.js";
-import type { CodexAdapter } from "../adapters/codex.js";
+import { TaskPlanSchemaRepairError, type CodexAdapter } from "../adapters/codex.js";
 import type { DesignReview } from "../schemas/design-review.js";
 import { requirementInputSchema, buildRequirementFromInput } from "../schemas/requirement-input.js";
 import type { Requirement } from "../schemas/requirement.js";
@@ -12,6 +12,11 @@ import type { TaskPlan } from "../schemas/task-plan.js";
 import { taskPlanSchema } from "../schemas/task-plan.js";
 import type { Workflow } from "../schemas/workflow.js";
 import { runDesignReviewLoop } from "./design-review-loop.js";
+import {
+  TASK_PLAN_NORMALIZATION_SOURCE,
+  normalizeTaskPlanModelOutput,
+  type TaskPlanNormalizationReport
+} from "./task-plan-normalizer.js";
 import { runTaskPlanReviewLoop } from "./task-plan-review-loop.js";
 
 export interface RunWorkflowResult {
@@ -39,6 +44,7 @@ export type RunWorkflowEvent =
   | { type: "revision_started"; round: number }
   | { type: "planning_started"; deferredFindings: DesignReview["findings"] }
   | { type: "task_plan_generated"; round: number; planVersion: string; plan: TaskPlan; path: string }
+  | { type: "task_plan_normalized"; round: number; report: TaskPlanNormalizationReport; path: string }
   | { type: "task_plan_review_started"; round: number; planVersion: string }
   | { type: "task_plan_review_completed"; review: TaskPlanReview; path: string }
   | { type: "task_plan_local_gate_started"; round: number; planVersion: string }
@@ -46,6 +52,7 @@ export type RunWorkflowEvent =
   | { type: "task_plan_revision_started"; round: number }
   | { type: "planning_completed"; plan: TaskPlan; path: string; approvalReport: TaskPlanApprovalReport; approvalReportPath: string }
   | { type: "workflow_completed"; result: RunWorkflowResult }
+  | { type: "workflow_blocked_for_human"; message: string }
   | { type: "workflow_failed"; message: string };
 
 export async function runWorkflow(input: {
@@ -74,6 +81,7 @@ export async function runWorkflow(input: {
   const startingRound = existingState.reviews.length + 1;
   const reviews: DesignReview[] = [...existingState.reviews];
   const taskPlanReviews: TaskPlanReview[] = [...existingState.taskPlanReviews];
+  let latestDesign = existingState.design;
 
   await writeJson(join(artifactDir, "requirement.json"), requirement);
   await writeJson(join(artifactDir, "workflow.json"), workflow);
@@ -102,6 +110,7 @@ export async function runWorkflow(input: {
         onDesign: async ({ designVersion, design }) => {
           await input.onEvent?.({ type: "design_started", designVersion });
           workflow.status = "design_reviewing";
+          latestDesign = design;
           const designPath = join(artifactDir, "design.md");
           await writeFile(designPath, design, "utf8");
           await writeJson(join(artifactDir, "workflow.json"), workflow);
@@ -134,6 +143,7 @@ export async function runWorkflow(input: {
 
     workflow.designRounds = reviews.length;
     workflow.approvedDesignVersion = reviewLoop.approved ? reviewLoop.designVersion : undefined;
+    latestDesign = reviewLoop.design;
 
     if (!reviewLoop.approved) {
       workflow.status = "blocked_for_human";
@@ -170,9 +180,26 @@ export async function runWorkflow(input: {
       initialPlan: existingState.plan,
       previousReviews: existingState.taskPlanReviews,
       hooks: {
-        onPlan: async ({ round, planVersion, plan }) => {
+        onPlan: async ({ round, planVersion, plan, normalizationReport }) => {
           const draftPath = join(artifactDir, "task-plan-draft.json");
+          if (normalizationReport) {
+            const normalizationReportPath = join(artifactDir, `task-plan-normalization-report-${round}.json`);
+            await writeJson(normalizationReportPath, normalizationReport);
+            workflow.lastNormalization = {
+              round,
+              reportPath: `task-plan-normalization-report-${round}.json`,
+              changeCount: normalizationReport.changes.length,
+              outcome: normalizationReport.outcome
+            };
+            await input.onEvent?.({
+              type: "task_plan_normalized",
+              round,
+              report: normalizationReport,
+              path: normalizationReportPath
+            });
+          }
           await writeJson(draftPath, plan);
+          await writeJson(join(artifactDir, "workflow.json"), workflow);
           await input.onEvent?.({
             type: "task_plan_generated",
             round,
@@ -267,6 +294,42 @@ export async function runWorkflow(input: {
     await input.onEvent?.({ type: "workflow_completed", result });
     return result;
   } catch (error) {
+    if (error instanceof TaskPlanSchemaRepairError) {
+      workflow.status = "blocked_for_human";
+      workflow.tasks = [];
+      const rawOutputPath = join(artifactDir, "invalid-task-plan-output.txt");
+      const normalizationReportPath = join(artifactDir, `task-plan-normalization-report-${error.report.round || 0}.json`);
+      await writeFile(rawOutputPath, error.rawOutput, "utf8");
+      await writeJson(normalizationReportPath, error.report);
+      workflow.lastNormalization = {
+        round: error.report.round,
+        reportPath: `task-plan-normalization-report-${error.report.round || 0}.json`,
+        changeCount: error.report.changes.length,
+        outcome: error.report.outcome
+      };
+      await writeJson(join(artifactDir, "human-review-required.json"), {
+        reason: error.message,
+        category: "task-plan-schema-repair",
+        repairAttempts: error.repairAttempts,
+        rawOutputPath,
+        normalizationReportPath
+      });
+      await writeJson(join(artifactDir, "workflow.json"), workflow);
+      await input.onEvent?.({ type: "workflow_blocked_for_human", message: error.message });
+      const result = {
+        workflow,
+        requirement,
+        artifactDir,
+        design: latestDesign,
+        reviews,
+        taskPlanReviews,
+        designPath: join(artifactDir, "design.md"),
+        reviewsPath: join(artifactDir, "reviews.json")
+      };
+      await input.onEvent?.({ type: "workflow_completed", result });
+      return result;
+    }
+
     workflow.status = input.signal?.aborted ? "stopped" : "failed";
     await writeJson(join(artifactDir, "workflow.json"), workflow);
 
@@ -302,17 +365,30 @@ async function readExistingWorkflowState(artifactDir: string): Promise<{
     readOptionalText(join(artifactDir, "design.md")),
     readOptionalJson<DesignReview[]>(join(artifactDir, "reviews.json")),
     readOptionalJson<TaskPlanReview[]>(join(artifactDir, "task-plan-reviews.json")),
-    readOptionalJson<TaskPlan>(join(artifactDir, "task-plan-draft.json")),
-    readOptionalJson<TaskPlan>(join(artifactDir, "task-plan.json"))
+    readOptionalJson<unknown>(join(artifactDir, "task-plan-draft.json")),
+    readOptionalJson<unknown>(join(artifactDir, "task-plan.json"))
   ]);
+  const workflowId = inferWorkflowIdFromPlan(draftPlan) ?? inferWorkflowIdFromPlan(finalPlan);
+  const normalizedDraft = draftPlan && workflowId
+    ? normalizeTaskPlanModelOutput(draftPlan, { workflowId, source: TASK_PLAN_NORMALIZATION_SOURCE.artifact }).plan
+    : undefined;
+  const normalizedFinal = finalPlan && workflowId
+    ? normalizeTaskPlanModelOutput(finalPlan, { workflowId, source: TASK_PLAN_NORMALIZATION_SOURCE.artifact }).plan
+    : undefined;
 
   return {
     design,
     reviews: reviews ?? [],
     taskPlanReviews: taskPlanReviews ?? [],
     // Prefer the draft when continuing planning so blocked or interrupted revisions keep iterating in place.
-    plan: draftPlan ?? finalPlan
+    plan: normalizedDraft ?? normalizedFinal
   };
+}
+
+function inferWorkflowIdFromPlan(value: unknown): string | undefined {
+  return typeof value === "object" && value !== null && "workflowId" in value && typeof value.workflowId === "string"
+    ? value.workflowId
+    : undefined;
 }
 
 function createContinuationReview(

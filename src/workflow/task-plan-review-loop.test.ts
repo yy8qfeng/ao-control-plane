@@ -153,6 +153,150 @@ describe("runTaskPlanReviewLoop", () => {
     expect(result.plan.tasks[0]?.acceptanceCriteria).toContain("已有计划");
   });
 
+  it("uses codex as the fallback normalization source for newly generated plans", async () => {
+    const reports: string[] = [];
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(input): Promise<TaskPlan> {
+        return createPlan(input.workflowId, "初版验收");
+      },
+      async reviseTaskPlan(input): Promise<TaskPlan> {
+        return input.currentPlan;
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return approveTaskPlan(input);
+      }
+    };
+
+    await runTaskPlanReviewLoop({
+      workflowId: "WF-NORMALIZATION-SOURCE",
+      approvedDesign: "# Design",
+      deferredFindings: [],
+      codex,
+      claudeCode,
+      options: { maxTaskPlanReviewRounds: 1 },
+      hooks: {
+        onPlan: ({ normalizationReport }) => {
+          reports.push(normalizationReport?.source ?? "");
+        }
+      }
+    });
+
+    expect(reports).toEqual(["codex"]);
+  });
+
+  it("uses artifact as the fallback normalization source for continued plans", async () => {
+    const reports: string[] = [];
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(): Promise<TaskPlan> {
+        throw new Error("should continue from initial plan");
+      },
+      async reviseTaskPlan(input): Promise<TaskPlan> {
+        return input.currentPlan;
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return approveTaskPlan(input);
+      }
+    };
+
+    await runTaskPlanReviewLoop({
+      workflowId: "WF-NORMALIZATION-SOURCE-CONTINUE",
+      approvedDesign: "# Design",
+      deferredFindings: [],
+      codex,
+      claudeCode,
+      options: { maxTaskPlanReviewRounds: 1 },
+      initialPlan: createPlan("WF-NORMALIZATION-SOURCE-CONTINUE", "已有计划"),
+      hooks: {
+        onPlan: ({ normalizationReport }) => {
+          reports.push(normalizationReport?.source ?? "");
+        }
+      }
+    });
+
+    expect(reports).toEqual(["artifact"]);
+  });
+
+  it("keeps the previous normalization source when revised plans have no bound report", async () => {
+    const reports: Array<{ source: string; sourceHistory: Array<{ round: number; source: string }> }> = [];
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(): Promise<TaskPlan> {
+        throw new Error("should continue from initial plan");
+      },
+      async reviseTaskPlan(input): Promise<TaskPlan> {
+        return {
+          ...input.currentPlan,
+          tasks: input.currentPlan.tasks.map((task) => ({
+            ...task,
+            acceptanceCriteria: [...task.acceptanceCriteria, "已整改"]
+          }))
+        };
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return input.round === 1
+          ? {
+              workflowId: input.workflowId,
+              round: input.round,
+              planner: "codex",
+              reviewer: "claude-code",
+              planVersion: input.planVersion,
+              reviewDecision: "changes_requested",
+              findings: [
+                {
+                  id: "TPF-001",
+                  title: "需要整改",
+                  body: "需要补充验收标准。",
+                  severity: "major",
+                  status: "unresolved"
+                }
+              ]
+            }
+          : approveTaskPlan(input);
+      }
+    };
+
+    await runTaskPlanReviewLoop({
+      workflowId: "WF-NORMALIZATION-SOURCE-REVISION",
+      approvedDesign: "# Design",
+      deferredFindings: [],
+      codex,
+      claudeCode,
+      options: { maxTaskPlanReviewRounds: 2 },
+      initialPlan: createPlan("WF-NORMALIZATION-SOURCE-REVISION", "已有计划"),
+      hooks: {
+        onPlan: ({ normalizationReport }) => {
+          reports.push({
+            source: normalizationReport?.source ?? "",
+            sourceHistory: normalizationReport?.sourceHistory ?? []
+          });
+        }
+      }
+    });
+
+    expect(reports.map((report) => report.source)).toEqual(["artifact", "artifact"]);
+    expect(reports[0]?.sourceHistory).toEqual([
+      { round: 1, source: "artifact", reason: "fallback normalization report created" }
+    ]);
+    expect(reports[1]?.sourceHistory).toEqual([
+      { round: 1, source: "artifact", reason: "fallback normalization report created" },
+      { round: 2, source: "artifact", reason: "previous normalization report carried forward" }
+    ]);
+  });
+
   it("does not approve a task plan when the local gate finds unresolved prior findings", async () => {
     let reviseTaskPlanCalls = 0;
     const codex: CodexAdapter = {
