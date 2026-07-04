@@ -366,6 +366,313 @@ describe("runTaskPlanReviewLoop", () => {
     expect(result.plan.tasks[0]?.acceptanceCriteria).toContain("补齐 RawIpAdapter 权限失败错误契约 TPF-RAWIP");
   });
 
+  it("lets ClaudeCode approve a task plan after arbitrating local gate findings", async () => {
+    let reviseTaskPlanCalls = 0;
+    let arbitrationCalls = 0;
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(input): Promise<TaskPlan> {
+        return createPlan(input.workflowId, "Final approved criterion");
+      },
+      async reviseTaskPlan(input): Promise<TaskPlan> {
+        reviseTaskPlanCalls += 1;
+        return input.currentPlan;
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return approveTaskPlan(input);
+      },
+      async reviewTaskPlanLocalGate(input): Promise<TaskPlanReview> {
+        arbitrationCalls += 1;
+        expect(input.localGateReview.findings[0]?.id).toBe("TPG-PREVIOUS-TPF-RAWIP");
+        return {
+          workflowId: input.workflowId,
+          round: input.round,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: input.planVersion,
+          reviewDecision: "approved",
+          findings: [
+            {
+              id: "TPF-LOCAL-GATE-ACCEPTED",
+              title: "本地门禁意见经仲裁不阻断",
+              body: "ClaudeCode 判断该本地门禁意见不推翻 approved 结论。",
+              severity: "observation",
+              status: "accepted_as_is"
+            }
+          ]
+        };
+      }
+    };
+
+    const result = await runTaskPlanReviewLoop({
+      workflowId: "WF-LOCAL-GATE-ARBITRATION-APPROVED",
+      approvedDesign: "# Design",
+      deferredFindings: [],
+      codex,
+      claudeCode,
+      options: { maxTaskPlanReviewRounds: 1 },
+      previousReviews: [
+        {
+          workflowId: "WF-LOCAL-GATE-ARBITRATION-APPROVED",
+          round: 1,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: "task-plan-current",
+          reviewDecision: "changes_requested",
+          findings: [
+            {
+              id: "TPF-RAWIP",
+              title: "RawIpAdapter 权限失败错误契约缺失",
+              body: "RawIpAdapter 必须补齐固定错误码和结构化日志字段。",
+              severity: "blocking",
+              status: "unresolved"
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(result.approved).toBe(true);
+    expect(arbitrationCalls).toBe(1);
+    expect(reviseTaskPlanCalls).toBe(0);
+    expect(result.reviews.map((review) => review.reviewDecision)).toEqual([
+      "approved",
+      "changes_requested",
+      "approved"
+    ]);
+    expect(result.approvalReport.approved).toBe(true);
+    expect(result.approvalReport.findingSummary[0]?.status).toBe("accepted_as_is");
+    expect(result.approvalReport.localGateArbitration?.decision).toBe("approved");
+    expect(result.approvalReport.localGateArbitration?.localGateFindingSummary[0]?.id).toBe("TPG-PREVIOUS-TPF-RAWIP");
+  });
+
+  it("keeps local gate findings in the approval report when arbitration approves without findings", async () => {
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(input): Promise<TaskPlan> {
+        return createPlan(input.workflowId, "Final approved criterion");
+      },
+      async reviseTaskPlan(input): Promise<TaskPlan> {
+        return input.currentPlan;
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return approveTaskPlan(input);
+      },
+      async reviewTaskPlanLocalGate(input): Promise<TaskPlanReview> {
+        return approveTaskPlan(input);
+      }
+    };
+
+    const result = await runTaskPlanReviewLoop({
+      workflowId: "WF-LOCAL-GATE-EMPTY-ARBITRATION",
+      approvedDesign: "# Design",
+      deferredFindings: [],
+      codex,
+      claudeCode,
+      options: { maxTaskPlanReviewRounds: 1 },
+      previousReviews: [createPreviousRawIpFindingReview("WF-LOCAL-GATE-EMPTY-ARBITRATION")]
+    });
+
+    expect(result.approved).toBe(true);
+    expect(result.approvalReport.findingSummary).toEqual([
+      expect.objectContaining({
+        id: "TPG-PREVIOUS-TPF-RAWIP",
+        status: "accepted_as_is"
+      })
+    ]);
+    expect(result.approvalReport.localGateArbitration?.arbitrationFindingSummary).toEqual([]);
+  });
+
+  it("creates a ClaudeCode-shaped fallback arbitration review when the adapter lacks local gate arbitration", async () => {
+    let reviseTaskPlanCalls = 0;
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(input): Promise<TaskPlan> {
+        return createPlan(input.workflowId, "Final approved criterion");
+      },
+      async reviseTaskPlan(input): Promise<TaskPlan> {
+        reviseTaskPlanCalls += 1;
+        return input.currentPlan;
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return approveTaskPlan(input);
+      }
+    };
+
+    const result = await runTaskPlanReviewLoop({
+      workflowId: "WF-LOCAL-GATE-MISSING-ARBITRATION",
+      approvedDesign: "# Design",
+      deferredFindings: [],
+      codex,
+      claudeCode,
+      options: { maxTaskPlanReviewRounds: 1 },
+      previousReviews: [createPreviousRawIpFindingReview("WF-LOCAL-GATE-MISSING-ARBITRATION")]
+    });
+
+    expect(result.approved).toBe(false);
+    expect(reviseTaskPlanCalls).toBe(0);
+    const fallbackReview = result.reviews.at(-1);
+    expect(fallbackReview).toMatchObject({
+      reviewer: "claude-code",
+      reviewDecision: "changes_requested"
+    });
+    expect(fallbackReview?.findings[0]?.id).toContain("TPF-ARBITRATION-MISSING-001-TPG-PREVIOUS-TPF-RAWIP");
+    expect(fallbackReview?.findings[0]?.body).toContain("adapter 未实现 reviewTaskPlanLocalGate");
+  });
+
+  it("revises task plans only after ClaudeCode agrees local gate findings are blocking", async () => {
+    let reviseTaskPlanCalls = 0;
+    let arbitrationCalls = 0;
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(input): Promise<TaskPlan> {
+        return createPlan(input.workflowId, "Final approved criterion");
+      },
+      async reviseTaskPlan(input): Promise<TaskPlan> {
+        reviseTaskPlanCalls += 1;
+        return {
+          ...input.currentPlan,
+          tasks: input.currentPlan.tasks.map((task) => ({
+            ...task,
+            acceptanceCriteria: [...task.acceptanceCriteria, "补齐 RawIpAdapter 权限失败错误契约 TPF-RAWIP"],
+            aoPrompt: `${task.aoPrompt}\n任务计划审查整改：补齐 RawIpAdapter 权限失败错误契约 TPF-RAWIP。`
+          }))
+        };
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return approveTaskPlan(input);
+      },
+      async reviewTaskPlanLocalGate(input): Promise<TaskPlanReview> {
+        arbitrationCalls += 1;
+        return {
+          workflowId: input.workflowId,
+          round: input.round,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: input.planVersion,
+          reviewDecision: "changes_requested",
+          findings: input.localGateReview.findings.map((finding, index) => ({
+            ...finding,
+            id: `TPF-ARBITRATION-${String(index + 1).padStart(3, "0")}-${finding.id}`,
+            body: `${finding.body}\nClaudeCode 仲裁：该本地门禁意见有效，需要 Codex 整改。`,
+            status: "unresolved" as const
+          }))
+        };
+      }
+    };
+
+    const result = await runTaskPlanReviewLoop({
+      workflowId: "WF-LOCAL-GATE-ARBITRATION-REVISE",
+      approvedDesign: "# Design",
+      deferredFindings: [],
+      codex,
+      claudeCode,
+      options: { maxTaskPlanReviewRounds: 2 },
+      previousReviews: [
+        {
+          workflowId: "WF-LOCAL-GATE-ARBITRATION-REVISE",
+          round: 1,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: "task-plan-current",
+          reviewDecision: "changes_requested",
+          findings: [
+            {
+              id: "TPF-RAWIP",
+              title: "RawIpAdapter 权限失败错误契约缺失",
+              body: "RawIpAdapter 必须补齐固定错误码和结构化日志字段。",
+              severity: "blocking",
+              status: "unresolved"
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(result.approved).toBe(true);
+    expect(arbitrationCalls).toBe(1);
+    expect(reviseTaskPlanCalls).toBe(1);
+    expect(result.reviews.map((review) => review.reviewDecision)).toEqual([
+      "approved",
+      "changes_requested",
+      "changes_requested",
+      "approved"
+    ]);
+    expect(result.plan.tasks[0]?.acceptanceCriteria).toContain("补齐 RawIpAdapter 权限失败错误契约 TPF-RAWIP");
+  });
+
+  it("blocks for human when arbitration rejects local gate findings at the final round", async () => {
+    let reviseTaskPlanCalls = 0;
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(input): Promise<TaskPlan> {
+        return createPlan(input.workflowId, "Final approved criterion");
+      },
+      async reviseTaskPlan(input): Promise<TaskPlan> {
+        reviseTaskPlanCalls += 1;
+        return input.currentPlan;
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return approveTaskPlan(input);
+      },
+      async reviewTaskPlanLocalGate(input): Promise<TaskPlanReview> {
+        return {
+          workflowId: input.workflowId,
+          round: input.round,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: input.planVersion,
+          reviewDecision: "changes_requested",
+          findings: input.localGateReview.findings.map((finding, index) => ({
+            ...finding,
+            id: `TPF-ARBITRATION-${String(index + 1).padStart(3, "0")}-${finding.id}`,
+            body: `${finding.body}\nClaudeCode 仲裁：该本地门禁意见有效，需要 Codex 整改。`,
+            status: "unresolved" as const
+          }))
+        };
+      }
+    };
+
+    const result = await runTaskPlanReviewLoop({
+      workflowId: "WF-LOCAL-GATE-ARBITRATION-BLOCKED",
+      approvedDesign: "# Design",
+      deferredFindings: [],
+      codex,
+      claudeCode,
+      options: { maxTaskPlanReviewRounds: 1 },
+      previousReviews: [createPreviousRawIpFindingReview("WF-LOCAL-GATE-ARBITRATION-BLOCKED")]
+    });
+
+    expect(result.approved).toBe(false);
+    expect(result.blockedForHuman).toBe(true);
+    expect(reviseTaskPlanCalls).toBe(0);
+    expect(result.reviews.map((review) => review.reviewDecision)).toEqual([
+      "approved",
+      "changes_requested",
+      "changes_requested"
+    ]);
+  });
+
   it("passes approvedDesign into the local gate and revises missing deliverable coverage", async () => {
     let reviseTaskPlanCalls = 0;
     const codex: CodexAdapter = {
@@ -446,6 +753,26 @@ function approveTaskPlan(input: {
     planVersion: input.planVersion,
     reviewDecision: "approved",
     findings: []
+  };
+}
+
+function createPreviousRawIpFindingReview(workflowId: string): TaskPlanReview {
+  return {
+    workflowId,
+    round: 1,
+    planner: "codex",
+    reviewer: "claude-code",
+    planVersion: "task-plan-current",
+    reviewDecision: "changes_requested",
+    findings: [
+      {
+        id: "TPF-RAWIP",
+        title: "RawIpAdapter 权限失败错误契约缺失",
+        body: "RawIpAdapter 必须补齐固定错误码和结构化日志字段。",
+        severity: "blocking",
+        status: "unresolved"
+      }
+    ]
   };
 }
 

@@ -30,6 +30,21 @@ export interface ClaudeCodeAdapter {
     plan: TaskPlan;
     approvedDesign: string;
   }, options?: { signal?: AbortSignal }): Promise<TaskPlanReview>;
+  /**
+   * Production adapters should implement this arbitration hook. It is optional
+   * only to keep older test doubles and custom adapters source-compatible; the
+   * workflow loop creates an explicit ClaudeCode-shaped fallback review when it
+   * is absent.
+   */
+  reviewTaskPlanLocalGate?(input: {
+    workflowId: string;
+    round: number;
+    planVersion: string;
+    plan: TaskPlan;
+    approvedDesign: string;
+    approvedReview: TaskPlanReview;
+    localGateReview: TaskPlanReview;
+  }, options?: { signal?: AbortSignal }): Promise<TaskPlanReview>;
 }
 
 export interface ClaudeCodeCliAdapterOptions {
@@ -252,6 +267,112 @@ export class ClaudeCodeCliAdapter implements ClaudeCodeAdapter {
     });
   }
 
+  async reviewTaskPlanLocalGate(
+    input: {
+      workflowId: string;
+      round: number;
+      planVersion: string;
+      plan: TaskPlan;
+      approvedDesign: string;
+      approvedReview: TaskPlanReview;
+      localGateReview: TaskPlanReview;
+    },
+    options: { signal?: AbortSignal } = {}
+  ): Promise<TaskPlanReview> {
+    const rawOutput = await this.runClaude([
+      "你是需求治理层的 ClaudeCode 任务计划本地门禁仲裁员。你刚才已经批准了 task-plan，但 ao-control-plane 本地确定性门禁提出了复核意见。请判断这些本地门禁意见是否足以推翻 approved 结论。",
+      "",
+      "必须只输出一个 JSON 对象，不要使用 Markdown 代码块，不要输出解释文字。",
+      "JSON 必须符合以下 TypeScript 形状：",
+      "{",
+      '  "workflowId": "string",',
+      '  "round": number,',
+      '  "planner": "codex",',
+      '  "reviewer": "claude-code",',
+      '  "planVersion": "string",',
+      '  "reviewDecision": "approved" | "changes_requested",',
+      '  "findings": [{',
+      '    "id": "TPF-001",',
+      '    "title": "string",',
+      '    "body": "string",',
+      '    "severity": "blocking" | "major" | "minor" | "warning" | "observation",',
+      '    "status": "addressed" | "accepted_as_is" | "unresolved",',
+      '    "rationale": "optional string"',
+      "  }]",
+      "}",
+      "",
+      "仲裁规则：",
+      "- 本地门禁意见是确定性代码复核结果，不是最终裁决；你需要结合已批准设计稿、task-plan 和本地 finding 判断其是否构成真实阻断。",
+      "- 如果 task-plan 已经有足够证据覆盖本地门禁意见，或本地门禁属于误报、过度保守、与设计边界不一致，输出 approved；approved 时不得包含 unresolved finding，可把本地 finding 作为 accepted_as_is 或 addressed 说明理由。",
+      "- 如果任一本地门禁意见指出真实缺口，输出 changes_requested；必须保留对应 unresolved finding，并说明 Codex 应如何修改任务计划。",
+      "- 不要因为你上一轮已经 approved 就机械维持 approved；也不要因为本地门禁失败就机械 changes_requested。",
+      "- reviewer 字段固定为 `claude-code`。",
+      "- 仲裁 finding 的 id 必须使用 `TPF-ARBITRATION-*` 前缀，不要复用本地门禁 finding id。",
+      "- 只能输出上面列出的两种 reviewDecision。",
+      "",
+      `workflowId: ${input.workflowId}`,
+      `round: ${input.round}`,
+      `planVersion: ${input.planVersion}`,
+      "",
+      "上一轮 ClaudeCode approved 审查 JSON：",
+      JSON.stringify(input.approvedReview, null, 2),
+      "",
+      "本地门禁复核意见 JSON：",
+      JSON.stringify(input.localGateReview, null, 2),
+      "",
+      "task-plan JSON：",
+      JSON.stringify(input.plan, null, 2),
+      "",
+      "已批准设计稿：",
+      input.approvedDesign
+    ].join("\n"), options);
+
+    return parseStructuredOutputWithRepair({
+      rawOutput,
+      schema: taskPlanReviewSchema,
+      errorMessage: `ClaudeCode local gate arbitration JSON is invalid for round ${input.round} (${input.planVersion})`,
+      repairAttempts: this.options.structuredOutputRepairAttempts ?? 1,
+      repair: async ({ error, rawOutput: invalidOutput }) =>
+        this.runClaude([
+          "你刚才作为 ClaudeCode 任务计划本地门禁仲裁员的输出没有通过结构化 JSON 校验。",
+          "请把上一条仲裁输出修复为严格 JSON。只能输出 JSON 对象，不要使用 Markdown 代码块，不要输出解释文字。",
+          "",
+          "修复规则：",
+          "- 不要重新仲裁，只把上一条仲裁结论和 findings 转换为合法 JSON。",
+          "- 如果上一条输出表达本地门禁意见不构成阻断，reviewDecision 必须是 approved。",
+          "- 如果上一条输出表达仍需整改，reviewDecision 必须是 changes_requested，且至少包含一个 unresolved finding。",
+          "- approved 时 findings 中不得包含 unresolved。",
+          "- reviewer 字段固定为 `claude-code`，仲裁 finding 的 id 必须使用 `TPF-ARBITRATION-*` 前缀。",
+          "",
+          "JSON 必须符合以下 TypeScript 形状：",
+          "{",
+          '  "workflowId": "string",',
+          '  "round": number,',
+          '  "planner": "codex",',
+          '  "reviewer": "claude-code",',
+          '  "planVersion": "string",',
+          '  "reviewDecision": "approved" | "changes_requested",',
+          '  "findings": [{',
+          '    "id": "TPF-001",',
+          '    "title": "string",',
+          '    "body": "string",',
+          '    "severity": "blocking" | "major" | "minor" | "warning" | "observation",',
+          '    "status": "addressed" | "accepted_as_is" | "unresolved",',
+          '    "rationale": "optional string"',
+          "  }]",
+          "}",
+          "",
+          `workflowId: ${input.workflowId}`,
+          `round: ${input.round}`,
+          `planVersion: ${input.planVersion}`,
+          `校验错误：${error.message}`,
+          "",
+          "上一条无效输出：",
+          invalidOutput
+        ].join("\n"), options)
+    });
+  }
+
   private async runClaude(prompt: string, options: { signal?: AbortSignal }): Promise<string> {
     const args = [
       "-p",
@@ -390,6 +511,48 @@ export class PlaceholderClaudeCodeAdapter implements ClaudeCodeAdapter {
       planVersion: input.planVersion,
       reviewDecision: "approved",
       findings: []
+    };
+  }
+
+  async reviewTaskPlanLocalGate(input: {
+    workflowId: string;
+    round: number;
+    planVersion: string;
+    localGateReview: TaskPlanReview;
+  }): Promise<TaskPlanReview> {
+    const blockingFindings = input.localGateReview.findings.filter(
+      (finding) => finding.severity === "blocking" || finding.severity === "major"
+    );
+    if (blockingFindings.length === 0) {
+      return {
+        workflowId: input.workflowId,
+        round: input.round,
+        planner: "codex",
+        reviewer: "claude-code",
+        planVersion: input.planVersion,
+        reviewDecision: "approved",
+        findings: input.localGateReview.findings.map((finding, index) => ({
+          ...finding,
+          id: `TPF-ARBITRATION-PLACEHOLDER-${String(index + 1).padStart(3, "0")}-${finding.id}`,
+          body: `${finding.body}\nClaudeCode 仲裁：占位审查认为该本地门禁意见不构成阻断。`,
+          status: "accepted_as_is" as const
+        }))
+      };
+    }
+
+    return {
+      workflowId: input.workflowId,
+      round: input.round,
+      planner: "codex",
+      reviewer: "claude-code",
+      planVersion: input.planVersion,
+      reviewDecision: "changes_requested",
+      findings: blockingFindings.map((finding, index) => ({
+        ...finding,
+        id: `TPF-ARBITRATION-PLACEHOLDER-${String(index + 1).padStart(3, "0")}-${finding.id}`,
+        body: `${finding.body}\nClaudeCode 仲裁：本地门禁意见构成真实整改项。`,
+        status: "unresolved" as const
+      }))
     };
   }
 }

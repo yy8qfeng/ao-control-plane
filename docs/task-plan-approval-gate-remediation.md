@@ -55,7 +55,7 @@
 3. `defer_to_implementation` 的设计遗留项必须在任务计划中有可追踪承接点。
 4. `executionPolicy` 规则必须在 schema、Codex 生成提示、ClaudeCode 审查提示、本地校验中保持一致。
 5. 任务计划通过后，系统应能输出“为什么可以通过”的结构化依据。
-6. 任务计划不满足硬门禁时，应强制转为 `changes_requested` 或 `blocked_for_human`，不能进入 `executing`。
+6. 任务计划不满足本地确定性门禁时，应先把本地门禁意见交给 ClaudeCode 仲裁；只有 ClaudeCode 仲裁仍认为任务计划可接受时才能进入 `executing`，否则转为 `changes_requested` 或 `blocked_for_human`。
 
 ## 4. 必须整改项
 
@@ -139,7 +139,7 @@ interface TaskPlanGateResult {
 
 修改 `src/workflow/task-plan-review-loop.ts`。
 
-当前逻辑：
+本轮改动前已存在的本地门禁失败兜底逻辑：
 
 ```ts
 if (review.reviewDecision === "approved") {
@@ -164,17 +164,31 @@ if (review.reviewDecision === "approved" && gate.passed) {
 }
 
 if (review.reviewDecision === "approved" && !gate.passed) {
-  const syntheticReview = convertGateFailuresToTaskPlanReview(gate);
-  reviews.push(syntheticReview);
-  // 若还有轮次，则交给 Codex 继续整改；若已到最大轮次，则 blocked_for_human。
+  const localGateReview = convertGateFailuresToTaskPlanReview(gate);
+  reviews.push(localGateReview);
+
+  const arbitrationReview = await claudeCode.reviewTaskPlanLocalGate({
+    approvedReview: review,
+    localGateReview,
+    plan,
+    approvedDesign
+  });
+  reviews.push(arbitrationReview);
+
+  if (arbitrationReview.reviewDecision === "approved") {
+    return { approved: true, ... };
+  }
+
+  // 若还有轮次，则交给 Codex 按 ClaudeCode 仲裁意见继续整改；若已到最大轮次，则 blocked_for_human。
 }
 ```
 
 要求：
 
-- 本地门禁失败时，不允许进入 `executing`。
-- 本地门禁发现的问题要写入 `task-plan-reviews.json`，方便用户看见真实阻断原因。
+- 本地门禁失败时，不允许仅凭本地代码直接进入 `executing` 或直接打回 Codex，必须先提交 ClaudeCode 仲裁。
+- 本地门禁发现的问题和 ClaudeCode 仲裁结论都要写入 `task-plan-reviews.json`，方便用户看见真实阻断原因和最终判断依据。
 - 本地门禁问题的 reviewer 可标记为 `local-gate` 或在 finding body 中明确来源。
+- 如果 ClaudeCode 仲裁认为本地门禁意见是误报、过度保守或与设计边界不一致，可以继续放行；如果仲裁认为意见有效，Codex 必须按仲裁 finding 整改。
 
 ### 4.4 增加跨轮 finding 闭环校验
 
@@ -235,18 +249,21 @@ implementationFindingTrace: Array<{
 - 最终审查轮次。
 - ClaudeCode 审查结论。
 - 本地门禁结论。
+- 本地门禁仲裁结论 `localGateArbitration`，包含 ClaudeCode 仲裁轮次、原 local-gate finding 摘要和仲裁 finding 摘要。
 - 被承接的设计遗留 finding 列表。
 - 被关闭的任务计划审查 finding 列表。
 - 仍作为 accepted_as_is 的问题及原因。
 - manual_gate 状态。
 
-### 5.2 UI 显示本地门禁阶段日志
+### 5.2 UI 显示本地门禁与 ClaudeCode 仲裁阶段日志
 
 在 `/api/governance/plan` 阶段日志中增加：
 
 - “开始本地任务计划门禁校验”。
 - “本地门禁通过，共检查 N 项规则”。
-- “本地门禁失败，发现 N 个阻断项，已转入整改轮次”。
+- “本地门禁发现 N 个复核项，已提交 ClaudeCode 仲裁”。
+- “ClaudeCode 本地门禁仲裁结论：approved / changes_requested”。
+- 事件名使用 `task_plan_local_gate_arbitration_required` 表示“本地门禁未通过并进入仲裁”，避免把该阶段误解为最终失败。
 
 ### 5.3 对样本 workflow 提供重审命令
 
@@ -291,10 +308,11 @@ pnpm exec tsx src/cli.ts review-task-plan --workflow-id WF-20260630T031508Z --ar
   - 拒绝未承接 `defer_to_implementation` blocking/major finding 的任务计划。
 
 - `src/workflow/task-plan-review-loop.test.ts`
-  - ClaudeCode 返回 `approved`，但本地门禁失败时，不得 approved。
-  - 本地门禁失败后，如果还有轮次，应调用 Codex 修订任务计划。
-  - 本地门禁失败且达到最大轮次，应 `blockedForHuman=true`。
-  - 本地门禁失败 finding 应写入 reviews。
+  - ClaudeCode 返回 `approved`，但本地门禁失败时，应先调用 ClaudeCode 仲裁。
+  - 本地门禁失败后，若 ClaudeCode 仲裁仍为 `approved`，应允许通过并记录 accepted_as_is / addressed 依据。
+  - 本地门禁失败后，若 ClaudeCode 仲裁为 `changes_requested`，如果还有轮次，应调用 Codex 修订任务计划。
+  - 本地门禁失败且 ClaudeCode 仲裁不通过并达到最大轮次，应 `blockedForHuman=true`。
+  - 本地门禁 finding 和 ClaudeCode 仲裁 finding 应写入 reviews。
 
 - `src/schemas/execution-policy.test.ts`
   - 验证字段完整性。
@@ -307,12 +325,13 @@ pnpm exec tsx src/cli.ts review-task-plan --workflow-id WF-20260630T031508Z --ar
 新增或修改：
 
 - `src/web/governance-runner.test.ts`
-  - `/api/governance/plan` 中 ClaudeCode approved 但本地门禁失败，workflow 不得进入 `executing`。
+  - `/api/governance/plan` 中 ClaudeCode approved 但本地门禁失败，应先产生 ClaudeCode 仲裁记录。
+  - ClaudeCode 仲裁 approved 后才写入最终 `task-plan.json`。
   - 本地门禁通过后才写入最终 `task-plan.json`。
   - 失败时保留 `task-plan-draft.json` 与完整 `task-plan-reviews.json`。
 
 - `src/web/server.test.ts`
-  - 阶段日志包含本地门禁开始、通过、失败信息。
+  - 阶段日志包含本地门禁开始、复核项、ClaudeCode 仲裁信息。
   - 真实 adapter 路径与注入 adapter 路径行为一致。
 
 ### 6.3 样本回归验证
@@ -323,7 +342,7 @@ pnpm exec tsx src/cli.ts review-task-plan --workflow-id WF-20260630T031508Z --ar
 2. 确认全默认 `executionPolicy` 不再被放行，或已按统一新规则完成差异化。
 3. 确认 `DRF-IMPL-001` 至 `DRF-IMPL-006` 都能在任务计划承接表或任务验收标准中找到对应证据。
 4. 确认 task-plan review 第 1 轮 unresolved finding 在后续轮次中逐项 addressed 或 accepted_as_is，并有理由。
-5. 确认 workflow 只有在 ClaudeCode approved 且本地门禁 passed 时才进入 `executing`。
+5. 确认 workflow 只有在 ClaudeCode approved 且本地门禁 passed，或本地门禁失败但 ClaudeCode 仲裁 approved 时，才进入 `executing`。
 
 ### 6.4 必跑命令
 
@@ -354,7 +373,7 @@ pnpm test
 
 整改完成后，必须同时满足：
 
-- ClaudeCode 返回 `approved` 但本地门禁失败时，系统不会放行。
+- ClaudeCode 返回 `approved` 但本地门禁失败时，系统不会仅凭本地代码直接放行或直接打回；必须经过 ClaudeCode 仲裁。
 - blocking、major unresolved finding 不会无证据消失。
 - `defer_to_implementation` 遗留项都有任务承接证据。
 - `executionPolicy` 生成、schema、审查、本地门禁规则一致。

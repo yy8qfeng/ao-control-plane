@@ -30,6 +30,8 @@ export interface TaskPlanReviewLoopHooks {
   onReview?: (input: { review: TaskPlanReview }) => Promise<void> | void;
   onLocalGateStart?: (input: { round: number; planVersion: string }) => Promise<void> | void;
   onLocalGate?: (input: { review: TaskPlanReview }) => Promise<void> | void;
+  onLocalGateArbitrationStart?: (input: { round: number; planVersion: string; review: TaskPlanReview }) => Promise<void> | void;
+  onLocalGateArbitration?: (input: { review: TaskPlanReview }) => Promise<void> | void;
   onRevisionStart?: (input: { round: number; review: TaskPlanReview }) => Promise<void> | void;
 }
 
@@ -114,14 +116,50 @@ export async function runTaskPlanReviewLoop(input: {
         reviews.push(localGateReview);
         await input.hooks?.onLocalGate?.({ review: localGateReview });
 
+        await input.hooks?.onLocalGateArbitrationStart?.({ round, planVersion, review: localGateReview });
+        const arbitrationReview = input.claudeCode.reviewTaskPlanLocalGate
+          ? await input.claudeCode.reviewTaskPlanLocalGate({
+              workflowId: input.workflowId,
+              round,
+              planVersion,
+              plan,
+              approvedDesign: input.approvedDesign,
+              approvedReview: review,
+              localGateReview
+            }, { signal: input.signal })
+          : createMissingLocalGateArbitrationReview({
+              workflowId: input.workflowId,
+              round,
+              planVersion,
+              localGateReview
+            });
+
+        reviews.push(arbitrationReview);
+        await input.hooks?.onLocalGateArbitration?.({ review: arbitrationReview });
+
+        if (arbitrationReview.reviewDecision === "approved") {
+          return {
+            approved: true,
+            plan,
+            planVersion,
+            reviews,
+            blockedForHuman: false,
+            finalReviewDecision: arbitrationReview.reviewDecision,
+            approvalReport: attachNormalizationSummary(
+              applyLocalGateArbitrationApproval(gate.approvalReport, localGateReview, arbitrationReview),
+              normalizationReport
+            )
+          };
+        }
+
         if (round === finalRound) {
           break;
         }
 
-        await input.hooks?.onRevisionStart?.({ round, review: localGateReview });
+        await input.hooks?.onRevisionStart?.({ round, review: arbitrationReview });
         const revisedPlan = await input.codex.reviseTaskPlan({
           currentPlan: plan,
-          review: localGateReview,
+          review: arbitrationReview,
           approvedDesign: input.approvedDesign
         }, { signal: input.signal });
         normalizationReport = materializeRevisedNormalizationReport(revisedPlan, round + 1, normalizationReport);
@@ -248,6 +286,65 @@ function attachNormalizationSummary(
       changeCount: report.changes.length,
       droppedEntryCount: report.droppedEntries.length
     }
+  };
+}
+
+function applyLocalGateArbitrationApproval(
+  approvalReport: TaskPlanApprovalReport,
+  localGateReview: TaskPlanReview,
+  arbitrationReview: TaskPlanReview
+): TaskPlanApprovalReport {
+  const acceptedLocalGateFindings = localGateReview.findings.map((finding) => ({
+    id: finding.id,
+    title: finding.title,
+    severity: finding.severity,
+    status: "accepted_as_is" as const
+  }));
+  const arbitrationFindingSummary = arbitrationReview.findings.map((finding) => ({
+    id: finding.id,
+    title: finding.title,
+    severity: finding.severity,
+    status: finding.status
+  }));
+  return {
+    ...approvalReport,
+    approved: true,
+    dispatchSummary: {
+      ...approvalReport.dispatchSummary,
+      blockingFindingCount: 0
+    },
+    localGateArbitration: {
+      decision: arbitrationReview.reviewDecision,
+      reviewer: "claude-code",
+      round: arbitrationReview.round,
+      localGateFindingSummary: acceptedLocalGateFindings,
+      arbitrationFindingSummary
+    },
+    findingSummary: arbitrationFindingSummary.length > 0
+      ? [...acceptedLocalGateFindings, ...arbitrationFindingSummary]
+      : acceptedLocalGateFindings
+  };
+}
+
+function createMissingLocalGateArbitrationReview(input: {
+  workflowId: string;
+  round: number;
+  planVersion: string;
+  localGateReview: TaskPlanReview;
+}): TaskPlanReview {
+  return {
+    workflowId: input.workflowId,
+    round: input.round,
+    planner: "codex",
+    reviewer: "claude-code",
+    planVersion: input.planVersion,
+    reviewDecision: "changes_requested",
+    findings: input.localGateReview.findings.map((finding, index) => ({
+      ...finding,
+      id: `TPF-ARBITRATION-MISSING-${String(index + 1).padStart(3, "0")}-${finding.id}`,
+      body: `${finding.body}\nClaudeCode 仲裁：adapter 未实现 reviewTaskPlanLocalGate，按本地门禁意见处理。`,
+      status: "unresolved" as const
+    }))
   };
 }
 

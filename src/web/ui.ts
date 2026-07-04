@@ -224,7 +224,7 @@ export function renderIndexHtml(): string {
 
     .summary {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 8px;
       padding: 12px 16px;
       border-bottom: 1px solid var(--line);
@@ -388,6 +388,7 @@ export function renderIndexHtml(): string {
           <div class="metric"><span>Workflow</span><strong id="workflowId">未生成</strong></div>
           <div class="metric"><span>状态</span><strong id="workflowStatus">-</strong></div>
           <div class="metric"><span>审查轮次</span><strong id="reviewCount">0</strong></div>
+          <div class="metric"><span>任务数量</span><strong id="taskCount">0</strong></div>
           <div class="metric"><span>已等待</span><strong id="elapsedSeconds">0s</strong></div>
         </div>
         <div class="tabs">
@@ -395,6 +396,7 @@ export function renderIndexHtml(): string {
           <button class="tab" type="button" data-tab="design">设计稿</button>
           <button class="tab" type="button" data-tab="reviews">审查</button>
           <button class="tab" type="button" data-tab="plan">任务计划</button>
+          <button class="tab" type="button" data-tab="planReview">计划审查</button>
           <button class="tab" type="button" data-tab="execution">AO 执行</button>
         </div>
       </div>
@@ -1023,6 +1025,7 @@ export function renderIndexHtml(): string {
       document.querySelector("#workflowId").textContent = result?.workflow?.workflowId || job?.result?.workflow?.workflowId || state.workflowId || "未生成";
       document.querySelector("#workflowStatus").textContent = job?.currentStep || result?.workflow?.status || job?.status || "-";
       document.querySelector("#reviewCount").textContent = String(result?.reviews?.length || job?.reviews?.length || 0);
+      document.querySelector("#taskCount").textContent = formatTaskCount();
       document.querySelector("#elapsedSeconds").textContent = String(job?.elapsedSeconds || 0) + "s";
       reviewButton.disabled = running;
       rerunButton.disabled = false;
@@ -1083,6 +1086,8 @@ export function renderIndexHtml(): string {
         }
       } else if (state.activeTab === "plan") {
         output.textContent = formatPlanTabContent();
+      } else if (state.activeTab === "planReview") {
+        output.textContent = formatPlanReviewTabContent();
       } else {
         output.textContent = JSON.stringify(state.execution || { message: "尚未执行 AO 派发。" }, null, 2);
       }
@@ -1178,8 +1183,15 @@ export function renderIndexHtml(): string {
       return state.result?.taskPlanApprovalReport || state.job?.result?.taskPlanApprovalReport || null;
     }
 
+    function getActivePlan() {
+      const finalPlan = state.result?.plan || state.job?.plan || state.job?.result?.plan || null;
+      if (finalPlan) return { plan: finalPlan, isDraft: false };
+      const draftPlan = state.result?.draftPlan || state.job?.result?.draftPlan || null;
+      return draftPlan ? { plan: draftPlan, isDraft: true } : { plan: null, isDraft: false };
+    }
+
     function getCurrentPlan() {
-      return state.result?.plan || state.job?.plan || state.job?.result?.plan || null;
+      return getActivePlan().plan;
     }
 
     function getTaskPlanNormalizationReports() {
@@ -1190,18 +1202,40 @@ export function renderIndexHtml(): string {
       return state.result?.taskPlanNormalizationReportErrors || state.job?.result?.taskPlanNormalizationReportErrors || [];
     }
 
+    function getTaskPlanReviews() {
+      return state.result?.taskPlanReviews || state.job?.taskPlanReviews || state.job?.result?.taskPlanReviews || [];
+    }
+
+    function formatTaskCount() {
+      const activePlan = getActivePlan();
+      if (!activePlan.plan?.tasks) return "-";
+      return String(activePlan.plan.tasks.length) + (activePlan.isDraft ? "（草稿）" : "");
+    }
+
     function formatPlanTabContent() {
+      const activePlan = getActivePlan();
+      const plan = activePlan.plan;
+      if (!plan) return "任务计划：暂无。";
+      return [
+        activePlan.isDraft ? "任务计划草稿：尚未通过最终审查或仲裁。" : "任务计划：已通过。",
+        "",
+        JSON.stringify(plan, null, 2)
+      ].join("\\n");
+    }
+
+    function formatPlanReviewTabContent() {
       const report = getTaskPlanApprovalReport();
-      const plan = getCurrentPlan();
+      const reviews = getTaskPlanReviews();
+      const latestReview = reviews.length ? reviews[reviews.length - 1] : null;
       const summary = report ? formatTaskPlanApprovalSummary(report) : "审批报告：暂无。";
       return [
         summary,
         "",
-        "审批报告 JSON：",
-        JSON.stringify(report, null, 2),
+        "最新任务计划审查：",
+        JSON.stringify(latestReview, null, 2),
         "",
-        "任务计划 JSON：",
-        JSON.stringify(plan, null, 2)
+        "审批报告 JSON：",
+        JSON.stringify(report, null, 2)
       ].join("\\n");
     }
 

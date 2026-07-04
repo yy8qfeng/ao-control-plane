@@ -360,10 +360,22 @@ function recordTaskPlanStageEvent(
         message: `本地任务计划门禁正在校验第 ${event.round} 轮 approved 结论。`
       });
       break;
-    case "task_plan_local_gate_failed":
+    case "task_plan_local_gate_arbitration_required":
       workflowJobs.recordLog(jobId, {
         currentStep: `任务计划第 ${event.review.round} 轮本地门禁未通过`,
-        message: `本地任务计划门禁发现 ${event.review.findings.length} 个阻断项，已转入整改。`
+        message: `本地任务计划门禁发现 ${event.review.findings.length} 个复核项，已提交 ClaudeCode 仲裁。`
+      });
+      break;
+    case "task_plan_local_gate_arbitration_started":
+      workflowJobs.recordLog(jobId, {
+        currentStep: `等待 ClaudeCode 仲裁第 ${event.round} 轮本地门禁意见`,
+        message: `ClaudeCode 正在仲裁第 ${event.round} 轮本地任务计划门禁意见。`
+      });
+      break;
+    case "task_plan_local_gate_arbitration_completed":
+      workflowJobs.recordLog(jobId, {
+        currentStep: `第 ${event.review.round} 轮本地门禁仲裁已完成`,
+        message: `ClaudeCode 本地门禁仲裁结论：${event.review.reviewDecision}。`
       });
       break;
     case "task_plan_revision_started":

@@ -48,7 +48,14 @@ export type RunWorkflowEvent =
   | { type: "task_plan_review_started"; round: number; planVersion: string }
   | { type: "task_plan_review_completed"; review: TaskPlanReview; path: string }
   | { type: "task_plan_local_gate_started"; round: number; planVersion: string }
-  | { type: "task_plan_local_gate_failed"; review: TaskPlanReview; path: string }
+  | { type: "task_plan_local_gate_arbitration_required"; review: TaskPlanReview; path: string }
+  | {
+      type: "task_plan_local_gate_arbitration_started";
+      round: number;
+      planVersion: string;
+      review: TaskPlanReview;
+    }
+  | { type: "task_plan_local_gate_arbitration_completed"; review: TaskPlanReview; path: string }
   | { type: "task_plan_revision_started"; round: number }
   | { type: "planning_completed"; plan: TaskPlan; path: string; approvalReport: TaskPlanApprovalReport; approvalReportPath: string }
   | { type: "workflow_completed"; result: RunWorkflowResult }
@@ -213,8 +220,7 @@ export async function runWorkflow(input: {
         },
         onReview: async ({ review }) => {
           taskPlanReviews.push(review);
-          const reviewPath = join(artifactDir, `task-plan-review-${review.round}.json`);
-          await writeJson(reviewPath, review);
+          const reviewPath = await writeTaskPlanReviewArtifact(artifactDir, review, "model");
           await writeJson(join(artifactDir, "task-plan-reviews.json"), taskPlanReviews);
           await input.onEvent?.({ type: "task_plan_review_completed", review, path: reviewPath });
         },
@@ -223,10 +229,27 @@ export async function runWorkflow(input: {
         },
         onLocalGate: async ({ review }) => {
           taskPlanReviews.push(review);
-          const reviewPath = join(artifactDir, `task-plan-review-${review.round}-local-gate.json`);
-          await writeJson(reviewPath, review);
+          const reviewPath = await writeTaskPlanReviewArtifact(artifactDir, review, "local-gate");
           await writeJson(join(artifactDir, "task-plan-reviews.json"), taskPlanReviews);
-          await input.onEvent?.({ type: "task_plan_local_gate_failed", review, path: reviewPath });
+          await input.onEvent?.({ type: "task_plan_local_gate_arbitration_required", review, path: reviewPath });
+        },
+        onLocalGateArbitrationStart: async ({ round, planVersion, review }) => {
+          await input.onEvent?.({
+            type: "task_plan_local_gate_arbitration_started",
+            round,
+            planVersion,
+            review
+          });
+        },
+        onLocalGateArbitration: async ({ review }) => {
+          taskPlanReviews.push(review);
+          const reviewPath = await writeTaskPlanReviewArtifact(artifactDir, review, "local-gate-arbitration");
+          await writeJson(join(artifactDir, "task-plan-reviews.json"), taskPlanReviews);
+          await input.onEvent?.({
+            type: "task_plan_local_gate_arbitration_completed",
+            review,
+            path: reviewPath
+          });
         },
         onRevisionStart: async ({ round }) => {
           await input.onEvent?.({ type: "task_plan_revision_started", round });
@@ -438,6 +461,18 @@ async function readOptionalText(file: string): Promise<string | undefined> {
 async function writeJson(file: string, value: unknown): Promise<void> {
   await mkdir(dirname(file), { recursive: true });
   await writeFile(file, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+async function writeTaskPlanReviewArtifact(
+  artifactDir: string,
+  review: TaskPlanReview,
+  kind: "model" | "local-gate" | "local-gate-arbitration"
+): Promise<string> {
+  const suffix = kind === "model" ? "" : `-${kind}`;
+  const reviewPath = join(artifactDir, `task-plan-review-${review.round}${suffix}.json`);
+  await writeJson(reviewPath, review);
+  await writeJson(join(artifactDir, "task-plan-review-latest.json"), review);
+  return reviewPath;
 }
 
 async function removeOptionalFile(file: string): Promise<void> {

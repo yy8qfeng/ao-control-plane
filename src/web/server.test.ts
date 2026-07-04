@@ -907,6 +907,9 @@ describe("web server", () => {
     expect(html).toContain("来源演化：");
     expect(html).toContain("- \" + entry.source + \" / round \" + entry.round + \" / \" + entry.reason");
     expect(html).toContain("formatTaskPlanNormalizationSummary");
+    expect(html).toContain("function getActivePlan()");
+    expect(html).toContain("任务计划草稿：尚未通过最终审查或仲裁。");
+    expect(html).toContain("（草稿）");
     expect(html).toContain("未知（\" + String(outcome || \"未记录\") + \"）");
     expect(html).toContain("可实施状态：");
     expect(html).toContain("覆盖缺口：");

@@ -182,10 +182,19 @@ export class WorkflowJobStore {
         job.currentStep = `本地门禁校验任务计划第 ${event.round} 轮`;
         job.logs.push(`本地任务计划门禁正在校验第 ${event.round} 轮 approved 结论。`);
         break;
-      case "task_plan_local_gate_failed":
+      case "task_plan_local_gate_arbitration_required":
         job.taskPlanReviews.push(event.review);
         job.currentStep = `任务计划第 ${event.review.round} 轮本地门禁未通过`;
-        job.logs.push(`本地任务计划门禁发现 ${event.review.findings.length} 个阻断项，已转入整改：${event.path}`);
+        job.logs.push(`本地任务计划门禁发现 ${event.review.findings.length} 个复核项，已提交 ClaudeCode 仲裁：${event.path}`);
+        break;
+      case "task_plan_local_gate_arbitration_started":
+        job.currentStep = `等待 ClaudeCode 仲裁第 ${event.round} 轮本地门禁意见`;
+        job.logs.push(`ClaudeCode 正在仲裁第 ${event.round} 轮本地任务计划门禁意见。`);
+        break;
+      case "task_plan_local_gate_arbitration_completed":
+        job.taskPlanReviews.push(event.review);
+        job.currentStep = `第 ${event.review.round} 轮本地门禁仲裁已完成`;
+        job.logs.push(`ClaudeCode 本地门禁仲裁结论：${event.review.reviewDecision}。`);
         break;
       case "task_plan_revision_started":
         job.currentStep = `等待 Codex 整改任务计划第 ${event.round} 轮意见`;

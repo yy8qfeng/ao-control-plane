@@ -330,4 +330,62 @@ describe("PlaceholderClaudeCodeAdapter", () => {
 
     expect(review.reviewDecision).toBe("approved");
   });
+
+  it("arbitrates placeholder local gate findings by severity", async () => {
+    const adapter = new PlaceholderClaudeCodeAdapter();
+
+    const accepted = await adapter.reviewTaskPlanLocalGate({
+      workflowId: "WF-001",
+      round: 1,
+      planVersion: "task-plan-current",
+      localGateReview: {
+        workflowId: "WF-001",
+        round: 1,
+        planner: "codex",
+        reviewer: "claude-code",
+        planVersion: "task-plan-current",
+        reviewDecision: "changes_requested",
+        findings: [
+          {
+            id: "TPG-MINOR-001",
+            title: "次要复核项",
+            body: "[local-gate] 次要复核项。",
+            severity: "minor",
+            status: "unresolved"
+          }
+        ]
+      }
+    });
+
+    expect(accepted.reviewDecision).toBe("approved");
+    expect(accepted.findings[0]?.id).toContain("TPF-ARBITRATION-PLACEHOLDER");
+    expect(accepted.findings[0]?.status).toBe("accepted_as_is");
+
+    const rejected = await adapter.reviewTaskPlanLocalGate({
+      workflowId: "WF-001",
+      round: 1,
+      planVersion: "task-plan-current",
+      localGateReview: {
+        workflowId: "WF-001",
+        round: 1,
+        planner: "codex",
+        reviewer: "claude-code",
+        planVersion: "task-plan-current",
+        reviewDecision: "changes_requested",
+        findings: [
+          {
+            id: "TPG-BLOCKING-001",
+            title: "阻断复核项",
+            body: "[local-gate] 阻断复核项。",
+            severity: "blocking",
+            status: "unresolved"
+          }
+        ]
+      }
+    });
+
+    expect(rejected.reviewDecision).toBe("changes_requested");
+    expect(rejected.findings[0]?.id).toContain("TPF-ARBITRATION-PLACEHOLDER");
+    expect(rejected.findings[0]?.status).toBe("unresolved");
+  });
 });

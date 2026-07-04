@@ -954,9 +954,129 @@ describe("runGovernanceWorkflow", () => {
       )
     ).toBe(true);
     expect(planned.taskPlanApprovalReport?.approved).toBe(false);
+    expect(planned.taskPlanReviews?.at(-1)?.reviewer).toBe("claude-code");
+    expect(planned.taskPlanReviews?.at(-1)?.findings[0]?.id).toContain("TPF-ARBITRATION-MISSING");
     await expect(readFile(join(planned.artifactDir, "task-plan-approval-report.json"), "utf8")).resolves.toContain(
       '"approved": false'
     );
+    await expect(readFile(join(planned.artifactDir, "task-plan.json"), "utf8")).rejects.toMatchObject({
+      code: "ENOENT"
+    });
+    await expect(readFile(join(planned.artifactDir, "task-plan-draft.json"), "utf8")).resolves.toContain(
+      "Final approved criterion"
+    );
+  });
+
+  it("writes the final task plan when ClaudeCode arbitration accepts local gate findings", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-"));
+    const store = new ArtifactStore(tempDir);
+    const workflowId = "WF-LOCAL-GATE-ARBITRATION-APPROVED";
+    await store.saveWorkflow({
+      requirement: {
+        id: workflowId,
+        title: "Local gate arbitration approved",
+        source: "test",
+        description: "Accept local gate finding after arbitration.",
+        acceptanceCriteria: [],
+        constraints: []
+      },
+      workflow: {
+        workflowId,
+        title: "Local gate arbitration approved",
+        rawRequirement: "Accept local gate finding after arbitration.",
+        status: "blocked_for_human",
+        designRounds: 1,
+        maxDesignReviewRounds: 1,
+        approvedDesignVersion: "design-current",
+        tasks: []
+      },
+      design: "# Local gate arbitration approved",
+      reviews: [
+        {
+          workflowId,
+          round: 1,
+          designer: "codex",
+          reviewer: "claude-code",
+          designVersion: "design-current",
+          reviewDecision: "approved",
+          findings: []
+        }
+      ],
+      taskPlanReviews: [
+        {
+          workflowId,
+          round: 1,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: "task-plan-current",
+          reviewDecision: "changes_requested",
+          findings: [
+            {
+              id: "TPF-RAWIP",
+              title: "RawIpAdapter 权限失败错误契约缺失",
+              body: "RawIpAdapter 必须补齐固定错误码和结构化日志字段。",
+              severity: "blocking",
+              status: "unresolved"
+            }
+          ]
+        }
+      ],
+      draftPlan: createPlan(workflowId, "Final approved criterion")
+    });
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(): Promise<TaskPlan> {
+        throw new Error("should continue from draft");
+      },
+      async reviseTaskPlan(input): Promise<TaskPlan> {
+        return input.currentPlan;
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return {
+          workflowId: input.workflowId,
+          round: input.round,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: input.planVersion,
+          reviewDecision: "approved",
+          findings: []
+        };
+      },
+      async reviewTaskPlanLocalGate(input): Promise<TaskPlanReview> {
+        return {
+          workflowId: input.workflowId,
+          round: input.round,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: input.planVersion,
+          reviewDecision: "approved",
+          findings: []
+        };
+      }
+    };
+
+    const planned = await createTaskPlanStage({
+      store,
+      workflowId,
+      codex,
+      claudeCode
+    });
+
+    expect(planned.workflow.status).toBe("executing");
+    expect(planned.plan?.tasks[0]?.acceptanceCriteria).toContain("Final approved criterion");
+    expect(planned.draftPlan).toBeUndefined();
+    expect(planned.taskPlanApprovalReport?.approved).toBe(true);
+    expect(planned.taskPlanApprovalReport?.localGateArbitration?.decision).toBe("approved");
+    await expect(readFile(join(planned.artifactDir, "task-plan.json"), "utf8")).resolves.toContain(
+      "Final approved criterion"
+    );
+    await expect(readFile(join(planned.artifactDir, "task-plan-draft.json"), "utf8")).rejects.toMatchObject({
+      code: "ENOENT"
+    });
   });
 
   it("blocks after repeated local gate failures exhaust task-plan review rounds", async () => {
@@ -1052,8 +1172,8 @@ describe("runGovernanceWorkflow", () => {
     expect(planned.workflow.status).toBe("blocked_for_human");
     expect(planned.plan).toBeUndefined();
     expect(reviseTaskPlanCalls).toBe(3);
-    expect(planned.taskPlanReviews).toHaveLength(7);
-    expect(planned.taskPlanReviews?.at(-1)?.findings[0]?.id).toBe("TPG-PREVIOUS-TPF-CLOCK");
+    expect(planned.taskPlanReviews).toHaveLength(10);
+    expect(planned.taskPlanReviews?.at(-1)?.findings[0]?.id).toContain("TPF-ARBITRATION-MISSING");
   });
 });
 

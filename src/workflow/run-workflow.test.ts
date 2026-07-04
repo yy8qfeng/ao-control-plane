@@ -77,6 +77,9 @@ describe("runWorkflow", () => {
       '"taskId": "TASK-001"'
     );
     await expect(
+      readFile(join(root, "artifacts", "WF-001", "task-plan-review-latest.json"), "utf8")
+    ).resolves.toContain('"reviewDecision": "approved"');
+    await expect(
       readFile(join(root, "artifacts", "WF-001", "task-plan-review-1.json"), "utf8")
     ).resolves.toContain('"reviewDecision": "approved"');
     await expect(

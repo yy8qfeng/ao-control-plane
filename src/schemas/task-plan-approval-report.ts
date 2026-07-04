@@ -20,6 +20,27 @@ export const taskPlanApprovalReportSchema = z.object({
     manualGateTaskCount: z.number().int().nonnegative(),
     blockingFindingCount: z.number().int().nonnegative()
   }),
+  localGateArbitration: z.object({
+    decision: z.enum(["approved", "changes_requested"]),
+    reviewer: z.literal("claude-code"),
+    round: z.number().int().positive(),
+    localGateFindingSummary: z.array(
+      z.object({
+        id: z.string().min(1),
+        title: z.string().min(1),
+        severity: z.enum(["blocking", "major", "minor", "warning", "observation"]),
+        status: z.enum(["unresolved", "addressed", "accepted_as_is"])
+      })
+    ),
+    arbitrationFindingSummary: z.array(
+      z.object({
+        id: z.string().min(1),
+        title: z.string().min(1),
+        severity: z.enum(["blocking", "major", "minor", "warning", "observation"]),
+        status: z.enum(["unresolved", "addressed", "accepted_as_is"])
+      })
+    )
+  }).optional(),
   designCoverageTrace: z.array(designCoverageTraceSchema),
   findingSummary: z.array(
     z.object({

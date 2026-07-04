@@ -36,7 +36,9 @@ export type TaskPlanStageEvent =
   | { type: "task_plan_review_started"; round: number; planVersion: string }
   | { type: "task_plan_review_completed"; review: TaskPlanReview }
   | { type: "task_plan_local_gate_started"; round: number; planVersion: string }
-  | { type: "task_plan_local_gate_failed"; review: TaskPlanReview }
+  | { type: "task_plan_local_gate_arbitration_required"; review: TaskPlanReview }
+  | { type: "task_plan_local_gate_arbitration_started"; round: number; planVersion: string; review: TaskPlanReview }
+  | { type: "task_plan_local_gate_arbitration_completed"; review: TaskPlanReview }
   | { type: "task_plan_revision_started"; round: number };
 
 export async function runDesignReviewStage(input: {
@@ -184,7 +186,15 @@ export async function createTaskPlanStage(input: {
       onLocalGate: async ({ review }) => {
         persistedTaskPlanReviews.push(review);
         await persistTaskPlanCheckpoint();
-        await input.onEvent?.({ type: "task_plan_local_gate_failed", review });
+        await input.onEvent?.({ type: "task_plan_local_gate_arbitration_required", review });
+      },
+      onLocalGateArbitrationStart: async ({ round, planVersion, review }) => {
+        await input.onEvent?.({ type: "task_plan_local_gate_arbitration_started", round, planVersion, review });
+      },
+      onLocalGateArbitration: async ({ review }) => {
+        persistedTaskPlanReviews.push(review);
+        await persistTaskPlanCheckpoint();
+        await input.onEvent?.({ type: "task_plan_local_gate_arbitration_completed", review });
       },
       onRevisionStart: async ({ round }) => {
         await input.onEvent?.({ type: "task_plan_revision_started", round });
