@@ -105,6 +105,22 @@ async function routeRequest(input: {
     return;
   }
 
+  if (method === "GET" && url.pathname.startsWith("/api/governance/workflows/")) {
+    const workflowId = decodeURIComponent(url.pathname.replace("/api/governance/workflows/", ""));
+    if (!workflowId.trim()) {
+      sendJson(input.response, 400, { error: "workflowId is required" });
+      return;
+    }
+    const projectRoot = url.searchParams.get("projectRoot") ?? undefined;
+    const store = createRequestStore({ projectRoot }, input.defaultArtifactRoot);
+    const artifacts = await store.readWorkflow(workflowId);
+    sendJson(input.response, 200, {
+      ...artifacts,
+      artifactDir: store.getWorkflowDir(workflowId)
+    });
+    return;
+  }
+
   if (method === "GET" && url.pathname.startsWith("/api/governance/jobs/")) {
     const jobId = decodeURIComponent(url.pathname.replace("/api/governance/jobs/", ""));
     const job = input.workflowJobs.getJob(jobId);

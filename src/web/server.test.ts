@@ -135,6 +135,36 @@ describe("web server", () => {
     expect(execution.sessions).toHaveLength(1);
   });
 
+  it("reads persisted workflow artifacts so restored drafts can show task counts", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    const projectRoot = join(tempDir, "project");
+    const workflowId = "WF-RESTORE-COUNT";
+    await mkdir(projectRoot);
+    await seedReadyForPlanningWorkflow(projectRoot, workflowId);
+    await writeJson(
+      join(projectRoot, ".ao-control-plane", workflowId, "task-plan-draft.json"),
+      createWebPlan(workflowId)
+    );
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir
+    });
+
+    const response = await fetch(
+      `${server.url}/api/governance/workflows/${encodeURIComponent(workflowId)}?projectRoot=${encodeURIComponent(projectRoot)}`
+    );
+    const restored = (await response.json()) as {
+      draftPlan?: { tasks: unknown[] };
+      workflow?: { workflowId: string };
+      artifactDir?: string;
+    };
+
+    expect(response.status).toBe(200);
+    expect(restored.workflow?.workflowId).toBe(workflowId);
+    expect(restored.draftPlan?.tasks).toHaveLength(1);
+    expect(restored.artifactDir).toBe(join(projectRoot, ".ao-control-plane", workflowId));
+  });
+
   it("releases manual gate tasks through the AO execute API in dry-run mode", async () => {
     tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
     const projectRoot = join(tempDir, "project");

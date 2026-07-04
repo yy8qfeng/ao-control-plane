@@ -479,10 +479,10 @@ export function renderIndexHtml(): string {
     form.addEventListener("input", () => scheduleDraftSave());
     form.addEventListener("change", () => scheduleDraftSave());
 
-    draftHistory.addEventListener("change", () => {
+    draftHistory.addEventListener("change", async () => {
       const selected = state.requirementDrafts[Number(draftHistory.value)];
       if (!selected) return;
-      restoreDraft(selected);
+      await restoreDraft(selected);
     });
 
     deleteDraftButton.addEventListener("click", async () => {
@@ -497,7 +497,7 @@ export function renderIndexHtml(): string {
           state.workflowId = "";
         }
         renderDraftHistory(config.requirementDrafts || []);
-        restoreDraft(config.requirementDraft || config.requirementDrafts?.[0]);
+        await restoreDraft(config.requirementDraft || config.requirementDrafts?.[0]);
         setDraftStatus("warn", "已删除所选历史草稿。");
       } catch (error) {
         setDraftStatus("bad", error.message || String(error));
@@ -766,7 +766,7 @@ export function renderIndexHtml(): string {
         if (config.selectedProjectRoot) {
           projectRootInput.value = config.selectedProjectRoot;
         }
-        restoreDraft(config.requirementDraft);
+        await restoreDraft(config.requirementDraft);
       } catch (error) {
         setStatus("bad", error.message || String(error));
       }
@@ -917,7 +917,7 @@ export function renderIndexHtml(): string {
       renderDraftHistory(config.requirementDrafts || []);
     }
 
-    function restoreDraft(draft) {
+    async function restoreDraft(draft) {
       if (!draft) {
         state.workflowId = "";
         state.result = null;
@@ -941,6 +941,25 @@ export function renderIndexHtml(): string {
       renderActiveTab();
       setDraftStatus("ok", "已恢复上次需求草稿" + (draft.updatedAt ? "，保存时间：" + draft.updatedAt : "") + "。");
       setStatus("ok", "已恢复上次需求草稿。");
+      await loadWorkflowSnapshot(draft);
+    }
+
+    async function loadWorkflowSnapshot(draft) {
+      const workflowId = draft?.workflowId || state.workflowId;
+      if (!workflowId) return;
+      const projectRoot = String(draft.projectRoot || projectRootInput.value || "").trim();
+      const query = projectRoot ? "?projectRoot=" + encodeURIComponent(projectRoot) : "";
+      try {
+        const response = await fetch("/api/governance/workflows/" + encodeURIComponent(workflowId) + query);
+        state.result = await readResponse(response);
+        state.job = null;
+        updateSummary();
+        renderActiveTab();
+      } catch (error) {
+        state.result = null;
+        updateSummary();
+        setStatus("warn", "已恢复需求草稿，但未读取到已生成的工作流产物：" + (error.message || String(error)));
+      }
     }
 
     function selectDraftInHistory(draft) {

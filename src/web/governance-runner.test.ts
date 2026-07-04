@@ -596,7 +596,7 @@ describe("runGovernanceWorkflow", () => {
         throw new Error("should continue from draft");
       },
       async reviseTaskPlan(): Promise<TaskPlan> {
-        return createPlan(workflowId, "Addresses TPF-OLD and TPF-ROUND-2");
+        return createPlan(workflowId, "Addresses TPF-ROUND-2");
       }
     };
     const claudeCode: ClaudeCodeAdapter = {
@@ -635,7 +635,7 @@ describe("runGovernanceWorkflow", () => {
 
     expect(planned.workflow.status).toBe("executing");
     expect(planned.taskPlanReviews?.map((review) => review.round)).toEqual([1, 2, 3]);
-    expect(planned.plan?.tasks[0]?.acceptanceCriteria).toContain("Addresses TPF-OLD and TPF-ROUND-2");
+    expect(planned.plan?.tasks[0]?.acceptanceCriteria).toContain("Addresses TPF-ROUND-2");
   });
 
   it("persists task-plan review checkpoints before a later continuation failure", async () => {
@@ -701,7 +701,7 @@ describe("runGovernanceWorkflow", () => {
         throw new Error("should continue from draft");
       },
       async reviseTaskPlan(): Promise<TaskPlan> {
-        return createPlan(workflowId, "Checkpointed draft addresses TPF-OLD and TPF-ROUND-2");
+        return createPlan(workflowId, "Checkpointed draft addresses TPF-ROUND-2");
       }
     };
     const claudeCode: ClaudeCodeAdapter = {
@@ -743,12 +743,12 @@ describe("runGovernanceWorkflow", () => {
     const checkpoint = await store.readWorkflow(workflowId);
     expect(checkpoint.taskPlanReviews?.map((review) => review.round)).toEqual([1, 2]);
     expect(checkpoint.draftPlan?.tasks[0]?.acceptanceCriteria).toContain(
-      "Checkpointed draft addresses TPF-OLD and TPF-ROUND-2"
+      "Checkpointed draft addresses TPF-ROUND-2"
     );
     expect(checkpoint.taskPlanApprovalReport).toBeUndefined();
   });
 
-  it("revises a rejected draft before reviewing again when continuation resumes after revision start", async () => {
+  it("reviews an existing rejected draft without revising from the previous review first", async () => {
     tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-"));
     const store = new ArtifactStore(tempDir);
     const workflowId = "WF-RESUME-REVISION-FIRST";
@@ -824,14 +824,14 @@ describe("runGovernanceWorkflow", () => {
         throw new Error("should continue from draft");
       },
       async reviseTaskPlan(): Promise<TaskPlan> {
-        return createPlan(workflowId, "TPF-NEEDS-REVISION revised marker");
+        throw new Error("should not revise before re-reviewing the current draft");
       }
     };
     const claudeCode: ClaudeCodeAdapter = {
       reviewDesign: unusedDesignReview,
       async reviewTaskPlan(input): Promise<TaskPlanReview> {
         expect(input.round).toBe(29);
-        expect(input.plan.tasks[0]?.acceptanceCriteria).toContain("TPF-NEEDS-REVISION revised marker");
+        expect(input.plan.tasks[0]?.acceptanceCriteria).toContain("Old unreviewed criterion");
         return {
           workflowId: input.workflowId,
           round: input.round,
@@ -853,7 +853,7 @@ describe("runGovernanceWorkflow", () => {
     });
 
     expect(planned.workflow.status).toBe("executing");
-    expect(planned.plan?.tasks[0]?.acceptanceCriteria).toContain("TPF-NEEDS-REVISION revised marker");
+    expect(planned.plan?.tasks[0]?.acceptanceCriteria).toContain("Old unreviewed criterion");
     expect(planned.taskPlanReviews?.map((review) => review.round)).toEqual([28, 29]);
   });
 
@@ -888,8 +888,16 @@ describe("runGovernanceWorkflow", () => {
           designer: "codex",
           reviewer: "claude-code",
           designVersion: "design-current",
-          reviewDecision: "approved",
-          findings: []
+          reviewDecision: "defer_to_implementation",
+          findings: [
+            {
+              id: "TPF-RAWIP",
+              title: "RawIpAdapter 权限失败错误契约缺失",
+              body: "RawIpAdapter 必须补齐固定错误码和结构化日志字段。",
+              severity: "blocking",
+              status: "unresolved"
+            }
+          ]
         }
       ],
       taskPlanReviews: [
@@ -950,7 +958,7 @@ describe("runGovernanceWorkflow", () => {
     expect(planned.draftPlan?.tasks[0]?.acceptanceCriteria).toContain("Final approved criterion");
     expect(
       planned.taskPlanReviews?.some((review) =>
-        review.findings.some((finding) => finding.id === "TPG-PREVIOUS-TPF-RAWIP")
+        review.findings.some((finding) => finding.id === "TPG-DEFERRED-TPF-RAWIP")
       )
     ).toBe(true);
     expect(planned.taskPlanApprovalReport?.approved).toBe(false);
@@ -998,8 +1006,16 @@ describe("runGovernanceWorkflow", () => {
           designer: "codex",
           reviewer: "claude-code",
           designVersion: "design-current",
-          reviewDecision: "approved",
-          findings: []
+          reviewDecision: "defer_to_implementation",
+          findings: [
+            {
+              id: "TPF-RAWIP",
+              title: "RawIpAdapter 权限失败错误契约缺失",
+              body: "RawIpAdapter 必须补齐固定错误码和结构化日志字段。",
+              severity: "blocking",
+              status: "unresolved"
+            }
+          ]
         }
       ],
       taskPlanReviews: [
@@ -1079,7 +1095,7 @@ describe("runGovernanceWorkflow", () => {
     });
   });
 
-  it("blocks after repeated local gate failures exhaust task-plan review rounds", async () => {
+  it("does not let stale previous task-plan findings block a re-review of the current draft", async () => {
     tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-"));
     const store = new ArtifactStore(tempDir);
     const workflowId = "WF-LOCAL-GATE-REPEATED";
@@ -1169,11 +1185,10 @@ describe("runGovernanceWorkflow", () => {
       claudeCode
     });
 
-    expect(planned.workflow.status).toBe("blocked_for_human");
-    expect(planned.plan).toBeUndefined();
-    expect(reviseTaskPlanCalls).toBe(3);
-    expect(planned.taskPlanReviews).toHaveLength(10);
-    expect(planned.taskPlanReviews?.at(-1)?.findings[0]?.id).toContain("TPF-ARBITRATION-MISSING");
+    expect(planned.workflow.status).toBe("executing");
+    expect(planned.plan?.tasks[0]?.acceptanceCriteria).toContain("Final approved criterion");
+    expect(reviseTaskPlanCalls).toBe(0);
+    expect(planned.taskPlanReviews?.map((review) => review.round)).toEqual([1, 2]);
   });
 });
 

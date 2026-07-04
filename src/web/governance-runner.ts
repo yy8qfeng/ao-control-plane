@@ -130,21 +130,6 @@ export async function createTaskPlanStage(input: {
 
   await input.onEvent?.({ type: "planning_started", deferredFindings, startingRound });
 
-  const latestExistingReview = getLatestTaskPlanReview(existingTaskPlanReviews);
-  if (
-    latestDraftPlan &&
-    latestExistingReview?.reviewDecision === "changes_requested" &&
-    getLatestNormalizationRound(taskPlanNormalizationReports) <= latestExistingReview.round
-  ) {
-    await input.onEvent?.({ type: "task_plan_revision_started", round: latestExistingReview.round });
-    latestDraftPlan = await codex.reviseTaskPlan({
-      currentPlan: latestDraftPlan,
-      review: latestExistingReview,
-      approvedDesign: artifacts.design
-    }, { signal: input.signal });
-    await persistTaskPlanCheckpoint();
-  }
-
   const planLoop = await runTaskPlanReviewLoop({
     workflowId: artifacts.workflow.workflowId,
     approvedDesign: artifacts.design,
@@ -158,7 +143,7 @@ export async function createTaskPlanStage(input: {
       startingRound
     },
     initialPlan: latestDraftPlan,
-    previousReviews: existingTaskPlanReviews,
+    previousReviews: [],
     signal: input.signal,
     hooks: {
       onPlan: async ({ round, planVersion, plan, normalizationReport }) => {
@@ -264,19 +249,6 @@ function normalizeTaskPlanReviewRounds(value: number): number {
 
 function getNextTaskPlanReviewRound(reviews: TaskPlanReview[]): number {
   return Math.max(0, ...reviews.map((review) => review.round)) + 1;
-}
-
-function getLatestTaskPlanReview(reviews: TaskPlanReview[]): TaskPlanReview | undefined {
-  return reviews.reduce<TaskPlanReview | undefined>((latest, review) => {
-    if (!latest || review.round >= latest.round) {
-      return review;
-    }
-    return latest;
-  }, undefined);
-}
-
-function getLatestNormalizationRound(reports: TaskPlanNormalizationReport[]): number {
-  return Math.max(0, ...reports.map((report) => report.round));
 }
 
 function upsertNormalizationReport(
