@@ -180,7 +180,7 @@ async function routeRequest(input: {
   }
 
   if (method === "POST" && url.pathname === "/api/governance/plan") {
-    const body = (await readJsonBody(input.request)) as { workflowId?: string } & ProjectScopedRequest;
+    const body = (await readJsonBody(input.request)) as { workflowId?: string; maxDesignReviewRounds?: number } & ProjectScopedRequest;
     if (!body.workflowId) {
       sendJson(input.response, 400, { error: "workflowId is required" });
       return;
@@ -193,6 +193,7 @@ async function routeRequest(input: {
     void createTaskPlanStage({
         workflowId: body.workflowId,
         store: createRequestStore(body, input.defaultArtifactRoot),
+        maxTaskPlanReviewRounds: normalizeReviewRoundLimit(body.maxDesignReviewRounds),
         codex: createCodexAdapterForRequest(input.createCodexAdapter, body, input.aoProjectRoot),
         claudeCode: createClaudeCodeAdapterForRequest(input.createClaudeCodeAdapter, body, input.aoProjectRoot),
         onEvent: (event) => recordTaskPlanStageEvent(input.workflowJobs, job.snapshot.jobId, event),
@@ -300,6 +301,17 @@ function normalizeGovernanceRequest(request: GovernanceRequest): GovernanceReque
     acceptanceCriteria: normalizeLines(request.acceptanceCriteria),
     constraints: normalizeLines(request.constraints)
   };
+}
+
+function normalizeReviewRoundLimit(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return undefined;
+  }
+  return Math.min(20, Math.max(1, Math.trunc(numeric)));
 }
 
 function createRequestStore(

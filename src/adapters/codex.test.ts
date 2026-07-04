@@ -44,6 +44,57 @@ describe("CodexCliAdapter", () => {
     expect(args[args.indexOf("-m") + 1]).toBe("gpt-5.5");
   });
 
+  it("requires project gates and forbids hard-requirement downgrades in design prompts", async () => {
+    const codex = new CodexCliAdapter({ codexBin: "codex-test" });
+
+    await codex.createDesign({
+      id: "REQ-001",
+      source: "test",
+      title: "Transport",
+      description: "完整支持自定义 IPv4/IPv6 协议。",
+      acceptanceCriteria: ["Windows 7/10/11 都成功编译运行。"],
+      constraints: ["不得降级硬需求。"]
+    });
+
+    const prompt = execaMock.mock.calls[0]?.[2]?.input as string;
+    expect(prompt).toContain("项目门禁边界与放行策略");
+    expect(prompt).toContain("禁止把硬需求降级为非一期、条件兼容、可选扩展、实验性、默认关闭、不作为发布阻塞项或仅预留接口");
+    expect(prompt).toContain("禁止用抽象适配器、预留接口、feature gate、默认关闭、实验性能力或其他替代边界");
+    expect(prompt).toContain("若需求明确要求某类协议、平台、性能、交付形态或兼容矩阵，必须将其作为本次项目门禁定义能力范围、覆盖矩阵和验收证据");
+    expect(prompt).toContain("降级表达字典：非一期、二期、后续版本、未来扩展、延后到、条件兼容、可选扩展、实验性、默认关闭、不作为发布阻塞项、仅预留接口");
+    expect(prompt).not.toContain("RawIpAdapter");
+  });
+
+  it("requires the same project gate rules when revising designs", async () => {
+    const codex = new CodexCliAdapter({ codexBin: "codex-test" });
+
+    await codex.reviseDesign({
+      currentDesign: "# Design\n\n## 项目门禁边界与放行策略\n- Old gate.",
+      review: {
+        workflowId: "WF-001",
+        round: 1,
+        designer: "codex",
+        reviewer: "claude-code",
+        designVersion: "design-current",
+        reviewDecision: "changes_requested",
+        findings: [
+          {
+            id: "DRF-001",
+            title: "补齐门禁",
+            body: "必须把 Windows 7/10/11 成功编译运行转成项目门禁。",
+            severity: "blocking",
+            status: "unresolved"
+          }
+        ]
+      }
+    });
+
+    const prompt = execaMock.mock.calls[0]?.[2]?.input as string;
+    expect(prompt).toContain("必须包含并更新二级标题：项目门禁边界与放行策略");
+    expect(prompt).toContain("requirement.description、acceptanceCriteria、constraints 里的硬需求逐条转成项目门禁");
+    expect(prompt).toContain("降级表达字典：非一期、二期、后续版本、未来扩展、延后到、条件兼容、可选扩展、实验性、默认关闭、不作为发布阻塞项、仅预留接口");
+  });
+
   it("normalizes Codex task-plan output that puts rationale fields inside executionPolicy", async () => {
     codexOutput.value = JSON.stringify({
       workflowId: "WF-001",
@@ -320,6 +371,74 @@ describe("CodexCliAdapter", () => {
 });
 
 describe("PlaceholderCodexAdapter", () => {
+  it("creates project gates for requirement description, acceptance criteria and constraints", async () => {
+    const codex = new PlaceholderCodexAdapter();
+
+    const design = await codex.createDesign({
+      id: "WF-001",
+      source: "test",
+      title: "Transport",
+      description: "完整支持自定义 IPv4/IPv6 协议。",
+      acceptanceCriteria: ["Windows 7/10/11 都成功编译运行。"],
+      constraints: ["不得用替代适配器模糊协议支持。"]
+    });
+
+    expect(design).toContain("## 项目门禁边界与放行策略");
+    expect(design).toContain("GATE-REQ-001");
+    expect(design).toContain("来源：requirement.description");
+    expect(design).toContain("GATE-AC-001");
+    expect(design).toContain("来源：requirement.acceptanceCriteria[0]");
+    expect(design).toContain("GATE-C-001");
+    expect(design).toContain("来源：requirement.constraints[0]");
+    expect(design).toContain("必需证据");
+    expect(design).toContain("阻断策略");
+  });
+
+  it("rewrites the project gate section when revising designs", async () => {
+    const codex = new PlaceholderCodexAdapter();
+
+    const revised = await codex.reviseDesign({
+      currentDesign: [
+        "# Design",
+        "",
+        "## 背景与问题定义",
+        "Build it.",
+        "",
+        "## 目标与非目标",
+        "Do it.",
+        "",
+        "## 影响范围",
+        "Code."
+      ].join("\n"),
+      review: {
+        workflowId: "WF-001",
+        round: 2,
+        designer: "codex",
+        reviewer: "claude-code",
+        designVersion: "design-current",
+        reviewDecision: "changes_requested",
+        findings: [
+          {
+            id: "DRF-SUPPLEMENT-001",
+            title: "根据最新需求补充更新设计稿",
+            body: "请吸收新增验收标准。",
+            severity: "major",
+            status: "unresolved",
+            rationale: "新增要求：Windows 7/10/11 都成功编译运行。"
+          }
+        ]
+      }
+    });
+
+    expect(revised).toContain("## 项目门禁边界与放行策略");
+    expect(revised).toContain("GATE-DRF-SUPPLEMENT-001");
+    expect(revised).toContain("新增要求：Windows 7/10/11 都成功编译运行。");
+    expect(revised.indexOf("## 项目门禁边界与放行策略")).toBeLessThan(
+      revised.indexOf("## 影响范围")
+    );
+    expect(revised).toContain("## 第 2 轮审查整改记录");
+  });
+
   it("keeps revised task plans valid with the default execution policy", async () => {
     const codex = new PlaceholderCodexAdapter();
     const currentPlan: TaskPlan = taskPlanSchema.parse({

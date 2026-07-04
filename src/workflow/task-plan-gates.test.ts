@@ -119,6 +119,74 @@ describe("validateTaskPlanApprovalGate", () => {
     expect(result.findings.some((finding) => finding.id === "TPG-PREVIOUS-TPF-001")).toBe(true);
   });
 
+  it("does not rewrap synthetic previous-finding gate findings", () => {
+    const plan = createPlan([createTask("TASK-001", "implementation")]);
+    const previousReview: TaskPlanReview = {
+      workflowId: plan.workflowId,
+      round: 2,
+      planner: "codex",
+      reviewer: "claude-code",
+      planVersion: "task-plan-current",
+      reviewDecision: "changes_requested",
+      findings: [
+        {
+          id: "TPG-PREVIOUS-TPF-001",
+          title: "上一轮任务计划审查问题未闭环：TPF-001",
+          body: "[local-gate] 上一轮 unresolved blocking finding 没有在新版任务计划中找到承接证据。",
+          severity: "blocking",
+          status: "unresolved"
+        }
+      ]
+    };
+
+    const result = validateTaskPlanApprovalGate({
+      workflowId: plan.workflowId,
+      deferredFindings: [],
+      plan,
+      previousReviews: [previousReview]
+    });
+
+    expect(result.findings.some((finding) => finding.id === "TPG-PREVIOUS-TPG-PREVIOUS-TPF-001")).toBe(false);
+  });
+
+  it("does not carry local-gate findings through previous-review closure", () => {
+    const plan = createPlan([
+      createTask("TASK-001", "implementation", {
+        acceptanceCriteria: ["实现功能并完成自测。"]
+      }),
+      createTask("TASK-002", "docs", {
+        aoRole: "docs",
+        executionPolicy: getExecutionPolicyForTaskType("docs")
+      })
+    ]);
+    const previousReview: TaskPlanReview = {
+      workflowId: plan.workflowId,
+      round: 2,
+      planner: "codex",
+      reviewer: "claude-code",
+      planVersion: "task-plan-current",
+      reviewDecision: "changes_requested",
+      findings: [
+        {
+          id: "TPG-POLICY-001",
+          title: "executionPolicy 缺少差异化",
+          body: "[local-gate] 多类型任务不能全部使用同一套默认 executionPolicy。",
+          severity: "blocking",
+          status: "unresolved"
+        }
+      ]
+    };
+
+    const result = validateTaskPlanApprovalGate({
+      workflowId: plan.workflowId,
+      deferredFindings: [],
+      plan,
+      previousReviews: [previousReview]
+    });
+
+    expect(result.findings.some((finding) => finding.id === "TPG-PREVIOUS-TPG-POLICY-001")).toBe(false);
+  });
+
   it("rejects cross-platform implementation tasks that do not depend on shared contract tasks", () => {
     const plan = createPlan([
       createTask("TASK-001", "implementation", { title: "实现 Linux io_uring 后端" }),
@@ -195,6 +263,39 @@ describe("validateTaskPlanApprovalGate", () => {
 
     expect(result.passed).toBe(false);
     expect(result.findings.some((finding) => finding.id === "TPG-G0-002")).toBe(true);
+  });
+
+  it("allows G0 calibration tasks to run before the G0 manual gate", () => {
+    const plan = createPlan([
+      createTask("TASK-001", "review", {
+        title: "G0 仓库现实校准",
+        phase: "calibration",
+        aoRole: "architect",
+        acceptanceCriteria: ["完成 JAR、发布路径、模块边界和仓库现实校准。"],
+        executionPolicy: getExecutionPolicyForTaskType("review")
+      }),
+      createTask("TASK-002", "review", {
+        title: "G0 人工复核放行",
+        aoRole: "reviewer",
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        executionPolicy: getExecutionPolicyForTaskType("review")
+      }),
+      createTask("TASK-003", "implementation", {
+        title: "实现后续功能",
+        dependencies: ["TASK-002"]
+      })
+    ]);
+
+    const result = validateTaskPlanApprovalGate({
+      workflowId: plan.workflowId,
+      approvedDesign: "当前为预实施冻结稿，G0 后必须人工复核放行。",
+      deferredFindings: [],
+      plan,
+      previousReviews: []
+    });
+
+    expect(result.findings.some((finding) => finding.id === "TPG-G0-002")).toBe(false);
   });
 
   it("accepts implementation tasks that transitively depend on the G0 manual gate", () => {

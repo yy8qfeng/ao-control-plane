@@ -73,6 +73,12 @@ export class ClaudeCodeCliAdapter implements ClaudeCodeAdapter {
       "",
       "审查规则：",
       "- 如果设计缺少关键章节、风险、验收或可实施性信息，输出 changes_requested。",
+      "- 设计稿必须包含 `## 项目门禁边界与放行策略`，并把需求描述、acceptanceCriteria、constraints 中的硬需求逐条转成项目门禁；缺失时输出 changes_requested。",
+      "- 项目门禁必须说明来源文本、硬需求边界、通过条件、必需证据和阻断处理策略；只写原则性口号或散落在其他章节中，输出 changes_requested。",
+      "- 如果设计稿把需求中的必须支持、成功编译运行、硬验收、约束或关键指标降级为非一期、条件兼容、可选扩展、实验性、默认关闭、不作为发布阻塞项或仅预留接口，输出 changes_requested。",
+      "- 如果需求明确要求某类协议、平台、性能、交付形态或兼容矩阵，设计稿不得用抽象适配器、预留接口、feature gate、默认关闭、实验性能力或其他替代边界模糊、弱化或替代该硬需求；必须定义本次门禁边界、覆盖矩阵和验收证据，否则输出 changes_requested。",
+      "- 降级表达字典：非一期、二期、后续版本、未来扩展、延后到、条件兼容、可选扩展、实验性、默认关闭、不作为发布阻塞项、仅预留接口；这些表达只允许出现在禁止、不得、不能降级的规则说明中，不得用于描述硬需求边界。",
+      "- `目标与非目标` 不得排除或弱化 acceptanceCriteria、constraints 或讨论记录中的硬需求。",
       "- 如果设计整体可实施，但仍有适合在实施阶段解决的问题，输出 defer_to_implementation。",
       "- 只能输出上面列出的三种 reviewDecision；人工介入由系统根据轮次控制。",
       "- approved 时不得包含 unresolved finding。",
@@ -291,6 +297,7 @@ export class PlaceholderClaudeCodeAdapter implements ClaudeCodeAdapter {
     const requiredSections = [
       "## 背景与问题定义",
       "## 目标与非目标",
+      "## 项目门禁边界与放行策略",
       "## 影响范围",
       "## 方案概述",
       "## 接口、数据或关键契约变化",
@@ -299,8 +306,12 @@ export class PlaceholderClaudeCodeAdapter implements ClaudeCodeAdapter {
       "## 可测试性自评"
     ];
     const missingSections = requiredSections.filter((section) => !input.design.includes(section));
+    const gateStructureFindings = missingSections.includes("## 项目门禁边界与放行策略")
+      ? []
+      : findProjectGateStructureFindings(input.design);
+    const downgradeFindings = findDowngradeFindings(input.design);
 
-    if (missingSections.length > 0) {
+    if (missingSections.length > 0 || gateStructureFindings.length > 0 || downgradeFindings.length > 0) {
       return {
         workflowId: input.workflowId,
         round: input.round,
@@ -308,13 +319,29 @@ export class PlaceholderClaudeCodeAdapter implements ClaudeCodeAdapter {
         reviewer: "claude-code",
         designVersion: input.designVersion,
         reviewDecision: "changes_requested",
-        findings: missingSections.map((section, index) => ({
+        findings: [
+          ...missingSections.map((section, index) => ({
           id: `DRF-${String(index + 1).padStart(3, "0")}`,
           title: "设计稿结构缺失",
           body: `缺少必需章节：${section}`,
-          severity: "blocking",
-          status: "unresolved"
-        }))
+          severity: "blocking" as const,
+          status: "unresolved" as const
+          })),
+          ...gateStructureFindings.map((finding, index) => ({
+            id: `DRF-GATE-STRUCTURE-${String(index + 1).padStart(3, "0")}`,
+            title: "项目门禁章节不完整",
+            body: finding,
+            severity: "blocking" as const,
+            status: "unresolved" as const
+          })),
+          ...downgradeFindings.map((finding, index) => ({
+            id: `DRF-DOWNGRADE-${String(index + 1).padStart(3, "0")}`,
+            title: "项目硬需求存在降级表达",
+            body: finding,
+            severity: "blocking" as const,
+            status: "unresolved" as const
+          }))
+        ]
       };
     }
 
@@ -365,6 +392,71 @@ export class PlaceholderClaudeCodeAdapter implements ClaudeCodeAdapter {
       findings: []
     };
   }
+}
+
+const downgradeTerms = [
+  "非一期",
+  "二期",
+  "后续版本",
+  "未来扩展",
+  "延后到",
+  "条件兼容",
+  "可选扩展",
+  "实验性",
+  "默认关闭",
+  "不作为发布阻塞项",
+  "仅预留接口"
+];
+
+const downgradeAllowanceTerms = [
+  "禁止",
+  "不得",
+  "不能",
+  "不可",
+  "不允许",
+  "只允许",
+  "降级表达字典"
+];
+
+const requiredProjectGateFields = ["来源文本", "硬需求边界", "通过条件", "必需证据", "阻断策略"];
+
+function findProjectGateStructureFindings(design: string): string[] {
+  const gateLines = extractMarkdownSectionLines(design, "## 项目门禁边界与放行策略")
+    .filter((line) => line.trim().startsWith("- GATE-"));
+
+  if (gateLines.length === 0) {
+    return ["`## 项目门禁边界与放行策略` 只写了原则性说明，未提供任何 `GATE-*` 项目门禁。"];
+  }
+
+  return gateLines.flatMap((line, index) => {
+    const missingFields = requiredProjectGateFields.filter((field) => !line.includes(field));
+    if (missingFields.length === 0) {
+      return [];
+    }
+    return [
+      `项目门禁 GATE 行字段不完整：第 ${index + 1} 条缺少 ${missingFields.join("、")}；原文：${line}`
+    ];
+  });
+}
+
+function findDowngradeFindings(design: string): string[] {
+  return design
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .filter((line) => downgradeTerms.some((term) => line.includes(term)))
+    .filter((line) => !downgradeAllowanceTerms.some((term) => line.includes(term)))
+    .map((line) => `设计稿含降级表达，需改为明确的本次门禁边界和放行策略：${line}`);
+}
+
+function extractMarkdownSectionLines(markdown: string, heading: string): string[] {
+  const lines = markdown.split("\n");
+  const start = lines.findIndex((line) => line.trim() === heading);
+  if (start < 0) {
+    return [];
+  }
+  const end = lines.findIndex((line, index) => index > start && /^##\s+/.test(line));
+  return lines.slice(start + 1, end < 0 ? lines.length : end).filter((line) => line.trim().length > 0);
 }
 
 export function parseStructuredOutput<T>(

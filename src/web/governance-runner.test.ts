@@ -533,6 +533,330 @@ describe("runGovernanceWorkflow", () => {
     );
   });
 
+  it("uses the requested review round limit when continuing a task-plan draft", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-"));
+    const store = new ArtifactStore(tempDir);
+    const workflowId = "WF-CONTINUE-PLAN-ROUNDS";
+    await store.saveWorkflow({
+      requirement: {
+        id: workflowId,
+        title: "Continue plan rounds",
+        source: "test",
+        description: "Continue task-plan review with an increased round limit.",
+        acceptanceCriteria: [],
+        constraints: []
+      },
+      workflow: {
+        workflowId,
+        title: "Continue plan rounds",
+        rawRequirement: "Continue task-plan review with an increased round limit.",
+        status: "blocked_for_human",
+        designRounds: 1,
+        maxDesignReviewRounds: 1,
+        approvedDesignVersion: "design-current",
+        tasks: []
+      },
+      design: "# Continue plan rounds",
+      reviews: [
+        {
+          workflowId,
+          round: 1,
+          designer: "codex",
+          reviewer: "claude-code",
+          designVersion: "design-current",
+          reviewDecision: "approved",
+          findings: []
+        }
+      ],
+      taskPlanReviews: [
+        {
+          workflowId,
+          round: 1,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: "task-plan-current",
+          reviewDecision: "changes_requested",
+          findings: [
+            {
+              id: "TPF-OLD",
+              title: "旧任务计划问题",
+              body: "旧问题需要在续审计划中承接。",
+              severity: "major",
+              status: "unresolved"
+            }
+          ]
+        }
+      ],
+      draftPlan: createPlan(workflowId, "Initial draft criterion")
+    });
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(): Promise<TaskPlan> {
+        throw new Error("should continue from draft");
+      },
+      async reviseTaskPlan(): Promise<TaskPlan> {
+        return createPlan(workflowId, "Addresses TPF-OLD and TPF-ROUND-2");
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        return {
+          workflowId: input.workflowId,
+          round: input.round,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: input.planVersion,
+          reviewDecision: input.round === 2 ? "changes_requested" : "approved",
+          findings:
+            input.round === 2
+              ? [
+                  {
+                    id: "TPF-ROUND-2",
+                    title: "第二轮任务计划问题",
+                    body: "第二轮问题需要在下一版计划中承接。",
+                    severity: "major",
+                    status: "unresolved"
+                  }
+                ]
+              : []
+        };
+      }
+    };
+
+    const planned = await createTaskPlanStage({
+      store,
+      workflowId,
+      maxTaskPlanReviewRounds: 2,
+      codex,
+      claudeCode
+    });
+
+    expect(planned.workflow.status).toBe("executing");
+    expect(planned.taskPlanReviews?.map((review) => review.round)).toEqual([1, 2, 3]);
+    expect(planned.plan?.tasks[0]?.acceptanceCriteria).toContain("Addresses TPF-OLD and TPF-ROUND-2");
+  });
+
+  it("persists task-plan review checkpoints before a later continuation failure", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-"));
+    const store = new ArtifactStore(tempDir);
+    const workflowId = "WF-CONTINUE-PLAN-CHECKPOINT";
+    await store.saveWorkflow({
+      requirement: {
+        id: workflowId,
+        title: "Continue plan checkpoint",
+        source: "test",
+        description: "Persist task-plan continuation checkpoints.",
+        acceptanceCriteria: [],
+        constraints: []
+      },
+      workflow: {
+        workflowId,
+        title: "Continue plan checkpoint",
+        rawRequirement: "Persist task-plan continuation checkpoints.",
+        status: "blocked_for_human",
+        designRounds: 1,
+        maxDesignReviewRounds: 1,
+        approvedDesignVersion: "design-current",
+        tasks: []
+      },
+      design: "# Continue plan checkpoint",
+      reviews: [
+        {
+          workflowId,
+          round: 1,
+          designer: "codex",
+          reviewer: "claude-code",
+          designVersion: "design-current",
+          reviewDecision: "approved",
+          findings: []
+        }
+      ],
+      taskPlanReviews: [
+        {
+          workflowId,
+          round: 1,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: "task-plan-current",
+          reviewDecision: "changes_requested",
+          findings: [
+            {
+              id: "TPF-OLD",
+              title: "旧任务计划问题",
+              body: "旧问题需要在续审计划中承接。",
+              severity: "major",
+              status: "unresolved"
+            }
+          ]
+        }
+      ],
+      draftPlan: createPlan(workflowId, "Initial draft criterion")
+    });
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(): Promise<TaskPlan> {
+        throw new Error("should continue from draft");
+      },
+      async reviseTaskPlan(): Promise<TaskPlan> {
+        return createPlan(workflowId, "Checkpointed draft addresses TPF-OLD and TPF-ROUND-2");
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        if (input.round === 3) {
+          throw new Error("ClaudeCode network failure");
+        }
+        return {
+          workflowId: input.workflowId,
+          round: input.round,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: input.planVersion,
+          reviewDecision: "changes_requested",
+          findings: [
+            {
+              id: "TPF-ROUND-2",
+              title: "第二轮任务计划问题",
+              body: "第二轮问题需要在下一版计划中承接。",
+              severity: "major",
+              status: "unresolved"
+            }
+          ]
+        };
+      }
+    };
+
+    await expect(
+      createTaskPlanStage({
+        store,
+        workflowId,
+        maxTaskPlanReviewRounds: 3,
+        codex,
+        claudeCode
+      })
+    ).rejects.toThrow("ClaudeCode network failure");
+
+    const checkpoint = await store.readWorkflow(workflowId);
+    expect(checkpoint.taskPlanReviews?.map((review) => review.round)).toEqual([1, 2]);
+    expect(checkpoint.draftPlan?.tasks[0]?.acceptanceCriteria).toContain(
+      "Checkpointed draft addresses TPF-OLD and TPF-ROUND-2"
+    );
+    expect(checkpoint.taskPlanApprovalReport).toBeUndefined();
+  });
+
+  it("revises a rejected draft before reviewing again when continuation resumes after revision start", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-"));
+    const store = new ArtifactStore(tempDir);
+    const workflowId = "WF-RESUME-REVISION-FIRST";
+    await store.saveWorkflow({
+      requirement: {
+        id: workflowId,
+        title: "Resume revision first",
+        source: "test",
+        description: "Resume after review requested changes.",
+        acceptanceCriteria: [],
+        constraints: []
+      },
+      workflow: {
+        workflowId,
+        title: "Resume revision first",
+        rawRequirement: "Resume after review requested changes.",
+        status: "blocked_for_human",
+        designRounds: 1,
+        maxDesignReviewRounds: 1,
+        approvedDesignVersion: "design-current",
+        tasks: []
+      },
+      design: "# Approved design",
+      reviews: [
+        {
+          workflowId,
+          round: 1,
+          designer: "codex",
+          reviewer: "claude-code",
+          designVersion: "design-current",
+          reviewDecision: "approved",
+          findings: []
+        }
+      ],
+      taskPlanReviews: [
+        {
+          workflowId,
+          round: 28,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: "task-plan-current",
+          reviewDecision: "changes_requested",
+          findings: [
+            {
+              id: "TPF-NEEDS-REVISION",
+              title: "缺少 revised marker",
+              body: "任务计划必须包含 revised marker。",
+              severity: "blocking",
+              status: "unresolved"
+            }
+          ]
+        }
+      ],
+      taskPlanNormalizationReports: [
+        {
+          workflowId,
+          round: 28,
+          generatedAt: "2026-07-03T00:00:00.000Z",
+          source: "codex",
+          rawSchemaErrors: [],
+          changes: [],
+          droppedEntries: [],
+          strictSchemaErrors: [],
+          outcome: "passed"
+        }
+      ],
+      draftPlan: createPlan(workflowId, "Old unreviewed criterion")
+    });
+    const codex: CodexAdapter = {
+      createDesign: unusedDesignMethod,
+      reviseDesign: unusedDesignRevision,
+      async createTaskPlan(): Promise<TaskPlan> {
+        throw new Error("should continue from draft");
+      },
+      async reviseTaskPlan(): Promise<TaskPlan> {
+        return createPlan(workflowId, "TPF-NEEDS-REVISION revised marker");
+      }
+    };
+    const claudeCode: ClaudeCodeAdapter = {
+      reviewDesign: unusedDesignReview,
+      async reviewTaskPlan(input): Promise<TaskPlanReview> {
+        expect(input.round).toBe(29);
+        expect(input.plan.tasks[0]?.acceptanceCriteria).toContain("TPF-NEEDS-REVISION revised marker");
+        return {
+          workflowId: input.workflowId,
+          round: input.round,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: input.planVersion,
+          reviewDecision: "approved",
+          findings: []
+        };
+      }
+    };
+
+    const planned = await createTaskPlanStage({
+      store,
+      workflowId,
+      maxTaskPlanReviewRounds: 1,
+      codex,
+      claudeCode
+    });
+
+    expect(planned.workflow.status).toBe("executing");
+    expect(planned.plan?.tasks[0]?.acceptanceCriteria).toContain("TPF-NEEDS-REVISION revised marker");
+    expect(planned.taskPlanReviews?.map((review) => review.round)).toEqual([28, 29]);
+  });
+
   it("blocks task planning when ClaudeCode approves but the local gate still finds unresolved findings", async () => {
     tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-"));
     const store = new ArtifactStore(tempDir);
@@ -727,7 +1051,7 @@ describe("runGovernanceWorkflow", () => {
 
     expect(planned.workflow.status).toBe("blocked_for_human");
     expect(planned.plan).toBeUndefined();
-    expect(reviseTaskPlanCalls).toBe(2);
+    expect(reviseTaskPlanCalls).toBe(3);
     expect(planned.taskPlanReviews).toHaveLength(7);
     expect(planned.taskPlanReviews?.at(-1)?.findings[0]?.id).toBe("TPG-PREVIOUS-TPF-CLOCK");
   });

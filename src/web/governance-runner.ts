@@ -79,6 +79,7 @@ export async function runDesignReviewStage(input: {
 export async function createTaskPlanStage(input: {
   workflowId: string;
   store: ArtifactStore;
+  maxTaskPlanReviewRounds?: number;
   codex?: CodexAdapter;
   claudeCode?: ClaudeCodeAdapter;
   onEvent?: (event: TaskPlanStageEvent) => Promise<void> | void;
@@ -102,26 +103,69 @@ export async function createTaskPlanStage(input: {
 
   const existingTaskPlanReviews = artifacts.taskPlanReviews ?? [];
   const deferredFindings = collectDeferredFindings(artifacts.reviews);
-  const startingRound = existingTaskPlanReviews.length + 1;
-  const taskPlanNormalizationReports: TaskPlanNormalizationReport[] = [];
+  const startingRound = getNextTaskPlanReviewRound(existingTaskPlanReviews);
+  const codex = input.codex ?? new PlaceholderCodexAdapter();
+  const claudeCode = input.claudeCode ?? new PlaceholderClaudeCodeAdapter();
+  const persistedTaskPlanReviews: TaskPlanReview[] = [...existingTaskPlanReviews];
+  const taskPlanNormalizationReports: TaskPlanNormalizationReport[] = [
+    ...(artifacts.taskPlanNormalizationReports ?? [])
+  ];
+  let latestDraftPlan = initialPlan;
+  const persistTaskPlanCheckpoint = async () => {
+    await input.store.saveWorkflow({
+      ...artifacts,
+      workflow: {
+        ...artifacts.workflow,
+        lastNormalization: summarizeLastNormalization(taskPlanNormalizationReports)
+      },
+      taskPlanReviews: persistedTaskPlanReviews,
+      taskPlanApprovalReport: undefined,
+      taskPlanNormalizationReports,
+      draftPlan: latestDraftPlan,
+      plan: artifacts.plan
+    });
+  };
+
   await input.onEvent?.({ type: "planning_started", deferredFindings, startingRound });
+
+  const latestExistingReview = getLatestTaskPlanReview(existingTaskPlanReviews);
+  if (
+    latestDraftPlan &&
+    latestExistingReview?.reviewDecision === "changes_requested" &&
+    getLatestNormalizationRound(taskPlanNormalizationReports) <= latestExistingReview.round
+  ) {
+    await input.onEvent?.({ type: "task_plan_revision_started", round: latestExistingReview.round });
+    latestDraftPlan = await codex.reviseTaskPlan({
+      currentPlan: latestDraftPlan,
+      review: latestExistingReview,
+      approvedDesign: artifacts.design
+    }, { signal: input.signal });
+    await persistTaskPlanCheckpoint();
+  }
+
   const planLoop = await runTaskPlanReviewLoop({
     workflowId: artifacts.workflow.workflowId,
     approvedDesign: artifacts.design,
     deferredFindings,
-    codex: input.codex ?? new PlaceholderCodexAdapter(),
-    claudeCode: input.claudeCode ?? new PlaceholderClaudeCodeAdapter(),
+    codex,
+    claudeCode,
     options: {
-      maxTaskPlanReviewRounds: artifacts.workflow.maxDesignReviewRounds,
+      maxTaskPlanReviewRounds: normalizeTaskPlanReviewRounds(
+        input.maxTaskPlanReviewRounds ?? artifacts.workflow.maxDesignReviewRounds
+      ),
       startingRound
     },
-    initialPlan,
+    initialPlan: latestDraftPlan,
     previousReviews: existingTaskPlanReviews,
     signal: input.signal,
     hooks: {
       onPlan: async ({ round, planVersion, plan, normalizationReport }) => {
         if (normalizationReport) {
-          taskPlanNormalizationReports.push(normalizationReport);
+          upsertNormalizationReport(taskPlanNormalizationReports, normalizationReport);
+        }
+        latestDraftPlan = plan;
+        await persistTaskPlanCheckpoint();
+        if (normalizationReport) {
           await input.onEvent?.({ type: "task_plan_normalized", round, report: normalizationReport });
         }
         await input.onEvent?.({ type: "task_plan_generated", round, planVersion, plan });
@@ -130,12 +174,16 @@ export async function createTaskPlanStage(input: {
         await input.onEvent?.({ type: "task_plan_review_started", round, planVersion });
       },
       onReview: async ({ review }) => {
+        persistedTaskPlanReviews.push(review);
+        await persistTaskPlanCheckpoint();
         await input.onEvent?.({ type: "task_plan_review_completed", review });
       },
       onLocalGateStart: async ({ round, planVersion }) => {
         await input.onEvent?.({ type: "task_plan_local_gate_started", round, planVersion });
       },
       onLocalGate: async ({ review }) => {
+        persistedTaskPlanReviews.push(review);
+        await persistTaskPlanCheckpoint();
         await input.onEvent?.({ type: "task_plan_local_gate_failed", review });
       },
       onRevisionStart: async ({ round }) => {
@@ -195,6 +243,57 @@ export async function runGovernanceWorkflow(input: {
     workflowId: reviewed.workflow.workflowId,
     store: input.store
   });
+}
+
+function normalizeTaskPlanReviewRounds(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 3;
+  }
+  return Math.min(20, Math.max(1, Math.trunc(value)));
+}
+
+function getNextTaskPlanReviewRound(reviews: TaskPlanReview[]): number {
+  return Math.max(0, ...reviews.map((review) => review.round)) + 1;
+}
+
+function getLatestTaskPlanReview(reviews: TaskPlanReview[]): TaskPlanReview | undefined {
+  return reviews.reduce<TaskPlanReview | undefined>((latest, review) => {
+    if (!latest || review.round >= latest.round) {
+      return review;
+    }
+    return latest;
+  }, undefined);
+}
+
+function getLatestNormalizationRound(reports: TaskPlanNormalizationReport[]): number {
+  return Math.max(0, ...reports.map((report) => report.round));
+}
+
+function upsertNormalizationReport(
+  reports: TaskPlanNormalizationReport[],
+  report: TaskPlanNormalizationReport
+): void {
+  const existingIndex = reports.findIndex((item) => item.round === report.round);
+  if (existingIndex >= 0) {
+    reports[existingIndex] = report;
+    return;
+  }
+  reports.push(report);
+}
+
+function summarizeLastNormalization(
+  reports: TaskPlanNormalizationReport[]
+): Workflow["lastNormalization"] {
+  const latest = reports.at(-1);
+  if (!latest) {
+    return undefined;
+  }
+  return {
+    round: latest.round,
+    reportPath: `task-plan-normalization-report-${latest.round}.json`,
+    changeCount: latest.changes.length,
+    outcome: latest.outcome
+  };
 }
 
 function buildRequirement(request: GovernanceRequest): Requirement {

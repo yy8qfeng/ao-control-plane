@@ -242,7 +242,7 @@ function validatePostG0TaskDependencies(manualGateTasks: ExecutionTask[], plan: 
   const manualGateIds = new Set(manualGateTasks.map((task) => task.taskId));
   const gatedTaskIds = new Set(
     plan.tasks
-      .filter((task) => !manualGateIds.has(task.taskId) && requiresPostG0Gate(task))
+      .filter((task) => !manualGateIds.has(task.taskId) && !isG0CalibrationTask(task) && requiresPostG0Gate(task))
       .filter((task) => !dependsOnAny(task.taskId, manualGateIds, plan))
       .map((task) => task.taskId)
   );
@@ -395,7 +395,13 @@ function validateDeferredFindings(deferredFindings: DesignReview["findings"], pl
 
 function validatePreviousUnresolvedFindings(previousReviews: TaskPlanReview[], plan: TaskPlan): TaskPlanGateFinding[] {
   const unresolved = previousReviews.flatMap((review) =>
-    review.findings.filter((finding) => finding.status === "unresolved" && (finding.severity === "blocking" || finding.severity === "major"))
+    review.findings.filter(
+      (finding) =>
+        finding.status === "unresolved" &&
+        (finding.severity === "blocking" || finding.severity === "major") &&
+        !isLocalGateFinding(finding) &&
+        !isSyntheticPreviousFinding(finding.id)
+    )
   );
   const latestById = new Map(unresolved.map((finding) => [finding.id, finding]));
 
@@ -674,6 +680,23 @@ function requiresPostG0Gate(task: ExecutionTask): boolean {
     task.type === "refactor" ||
     containsAny(text, ["重构", "发布", "release", "JAR", "Gradle", "Maven", "io_uring", "epoll", "IOCP", "kqueue"])
   );
+}
+
+function isG0CalibrationTask(task: ExecutionTask): boolean {
+  const text = taskText(task);
+  return (
+    task.phase === "calibration" ||
+    (containsAny(text, ["G0", "Repo Reality Check", "仓库现实校准", "校准"]) &&
+      containsAny(text, ["校准", "盘点", "现实", "readiness", "Reality Check"]))
+  );
+}
+
+function isSyntheticPreviousFinding(findingId: string): boolean {
+  return findingId.startsWith("TPG-PREVIOUS-");
+}
+
+function isLocalGateFinding(finding: { id: string; body?: string }): boolean {
+  return finding.id.startsWith("TPG-") || finding.body?.includes("[local-gate]") === true;
 }
 
 function dependsOnAny(taskId: string, dependencyIds: ReadonlySet<string>, plan: TaskPlan): boolean {

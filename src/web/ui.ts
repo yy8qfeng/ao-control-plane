@@ -570,7 +570,8 @@ export function renderIndexHtml(): string {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
             workflowId,
-            projectRoot: getProjectRoot()
+            projectRoot: getProjectRoot(),
+            maxDesignReviewRounds: Number(new FormData(form).get("maxDesignReviewRounds") || 3)
           })
         });
         const responseBody = await readResponse(response);

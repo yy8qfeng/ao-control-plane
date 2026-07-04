@@ -56,14 +56,18 @@ export class CodexCliAdapter implements CodexAdapter {
   constructor(private readonly options: CodexCliAdapterOptions = {}) {}
 
   async createDesign(requirement: Requirement, options: { signal?: AbortSignal } = {}): Promise<string> {
+    const designGateRules = formatDesignGateRules();
     return this.runCodex([
       "你是需求治理层的 Codex 设计负责人。请基于下面的需求和当前代码仓库，输出可供 ClaudeCode 审查的需求设计稿。",
       "",
       "输出要求：",
       "- 只输出 Markdown 设计稿，不要输出 JSON。",
       "- 不要修改文件。",
-      "- 设计稿必须至少包含这些二级标题：背景与问题定义、目标与非目标、影响范围、方案概述、接口、数据或关键契约变化、任务拆解前置约束、风险、回滚方案和替代方案、可测试性自评。",
+      "- 设计稿必须至少包含这些二级标题：背景与问题定义、目标与非目标、项目门禁边界与放行策略、影响范围、方案概述、接口、数据或关键契约变化、任务拆解前置约束、风险、回滚方案和替代方案、可测试性自评。",
       "- 设计必须足够具体，能支撑后续拆解 AO 执行任务。",
+      "",
+      "项目门禁要求：",
+      ...designGateRules,
       "",
       "需求 JSON：",
       JSON.stringify(requirement, null, 2)
@@ -74,6 +78,7 @@ export class CodexCliAdapter implements CodexAdapter {
     input: { currentDesign: string; review: DesignReview },
     options: { signal?: AbortSignal } = {}
   ): Promise<string> {
+    const designGateRules = formatDesignGateRules();
     return this.runCodex([
       "你是需求治理层的 Codex 设计负责人。请根据 ClaudeCode 的结构化审查意见整改设计稿。",
       "",
@@ -81,7 +86,11 @@ export class CodexCliAdapter implements CodexAdapter {
       "- 只输出完整的新版 Markdown 设计稿，不要输出 JSON。",
       "- 不要修改文件。",
       "- 保留并完善必需章节。",
+      "- 必须包含并更新二级标题：项目门禁边界与放行策略。",
       "- 逐条体现已整改项；如有不整改项，必须说明不整改理由、风险和替代方案。",
+      "",
+      "项目门禁要求：",
+      ...designGateRules,
       "",
       "当前设计稿：",
       input.currentDesign,
@@ -337,6 +346,20 @@ function formatTaskPlanRules(mode: "create" | "revise"): string[] {
   ];
 }
 
+function formatDesignGateRules(): string[] {
+  return [
+    "- 必须在 `## 项目门禁边界与放行策略` 中把 requirement.description、acceptanceCriteria、constraints 里的硬需求逐条转成项目门禁。",
+    "- 每条项目门禁必须说明：gateId、来源文本、硬需求边界、通过条件、必需证据、阻断时的处理策略。",
+    "- 门禁通过条件必须是可验证的，例如平台矩阵、协议矩阵、构建运行结果、性能阈值、集成闭环、产物路径或人工放行记录。",
+    "- 需求中写明必须支持、成功编译运行、硬验收、约束、关键指标的内容，必须进入项目门禁，不能只写在目标、风险或任务拆解说明中。",
+    "- 禁止把硬需求降级为非一期、条件兼容、可选扩展、实验性、默认关闭、不作为发布阻塞项或仅预留接口。",
+    "- 禁止用抽象适配器、预留接口、feature gate、默认关闭、实验性能力或其他替代边界，模糊、弱化或替代需求中的硬能力；若需求明确要求某类协议、平台、性能、交付形态或兼容矩阵，必须将其作为本次项目门禁定义能力范围、覆盖矩阵和验收证据。",
+    "- 降级表达字典：非一期、二期、后续版本、未来扩展、延后到、条件兼容、可选扩展、实验性、默认关闭、不作为发布阻塞项、仅预留接口；这些表达只允许出现在禁止、不得、不能降级的规则说明中，不得用于描述硬需求边界。",
+    "- `目标与非目标` 只能排除需求未要求的内容，不得排除或弱化 acceptanceCriteria、constraints 或讨论记录中的硬需求。",
+    "- 放行策略必须说明：哪些门禁是任务计划生成前必须冻结，哪些是任务执行后发布前必须通过，任何阻断项出现时不得进入后续阶段。"
+  ];
+}
+
 export class PlaceholderCodexAdapter implements CodexAdapter {
   async createDesign(requirement: Requirement): Promise<string> {
     return [
@@ -348,6 +371,9 @@ export class PlaceholderCodexAdapter implements CodexAdapter {
       "## 目标与非目标",
       "目标：满足需求验收标准，并保持进入 AO 执行层后只按 AO 内置角色下发任务。",
       "非目标：不修改 AO core、CLI 或 Dashboard。",
+      "",
+      "## 项目门禁边界与放行策略",
+      ...formatPlaceholderProjectGateLines(requirement),
       "",
       "## 影响范围",
       "待执行 worker 将根据最终任务计划修改相关代码、测试或文档。",
@@ -376,9 +402,10 @@ export class PlaceholderCodexAdapter implements CodexAdapter {
     if (unresolved.length === 0) {
       return input.currentDesign;
     }
+    const designWithUpdatedGates = rewritePlaceholderProjectGateSection(input.currentDesign, unresolved);
 
     return [
-      input.currentDesign,
+      designWithUpdatedGates,
       "",
       `## 第 ${input.review.round} 轮审查整改记录`,
       ...unresolved.map((finding) => `- 已整改 ${finding.id}：${finding.body}`),
@@ -456,6 +483,144 @@ export class PlaceholderCodexAdapter implements CodexAdapter {
       }))
     };
   }
+}
+
+function formatPlaceholderProjectGateLines(requirement: Requirement): string[] {
+  const gates = [
+    formatPlaceholderGateLine({
+      gateId: "GATE-REQ-001",
+      source: "requirement.description",
+      text: requirement.description,
+      boundary: "需求描述中的必须支持、成功编译运行、硬验收、约束和关键指标均纳入本次门禁",
+      passCondition: "后续任务计划必须提供实现、测试、构建、矩阵或人工放行证据",
+      evidence: "任务计划覆盖追踪、验证任务、构建运行结果或人工放行记录",
+      blocking: "证据缺失不得进入任务执行或发布阶段"
+    }),
+    ...requirement.acceptanceCriteria.map((item, index) =>
+      formatPlaceholderGateLine({
+        gateId: `GATE-AC-${String(index + 1).padStart(3, "0")}`,
+        source: `requirement.acceptanceCriteria[${index}]`,
+        text: item,
+        boundary: "验收标准作为本次项目硬门禁",
+        passCondition: "后续任务计划必须提供可验证证据",
+        evidence: "对应任务、测试、构建、矩阵或验收记录",
+        blocking: "未满足不得发布"
+      })
+    ),
+    ...requirement.constraints.map((item, index) =>
+      formatPlaceholderGateLine({
+        gateId: `GATE-C-${String(index + 1).padStart(3, "0")}`,
+        source: `requirement.constraints[${index}]`,
+        text: item,
+        boundary: "约束作为本次项目硬门禁",
+        passCondition: "后续任务计划必须提供实现或验证任务",
+        evidence: "对应任务、验证结果或人工放行记录",
+        blocking: "不得降级为非一期、条件兼容或可选扩展"
+      })
+    )
+  ];
+
+  return gates.filter((line) => !line.includes("来源文本：。"));
+}
+
+function formatPlaceholderGateLine(input: {
+  gateId: string;
+  source: string;
+  text: string;
+  boundary: string;
+  passCondition: string;
+  evidence: string;
+  blocking: string;
+}): string {
+  return [
+    `- ${input.gateId}`,
+    `来源：${input.source}`,
+    `来源文本：${normalizeMarkdownLine(input.text)}`,
+    `硬需求边界：${input.boundary}`,
+    `通过条件：${input.passCondition}`,
+    `必需证据：${input.evidence}`,
+    `阻断策略：${input.blocking}。`
+  ].join("；");
+}
+
+function rewritePlaceholderProjectGateSection(
+  currentDesign: string,
+  unresolvedFindings: DesignReview["findings"]
+): string {
+  const existingGateLines = extractMarkdownSectionLines(
+    currentDesign,
+    "## 项目门禁边界与放行策略"
+  ).filter((line) => line.trim().startsWith("- GATE-"));
+  const preservedGateLines = existingGateLines.length > 0
+    ? existingGateLines
+    : [
+        "- GATE-REQ-001；来源：currentDesign；来源文本：当前设计稿；硬需求边界：设计稿中的硬需求必须形成项目门禁；通过条件：后续任务计划必须提供可验证证据；必需证据：对应任务、测试、构建、矩阵或人工放行记录；阻断策略：证据缺失不得进入后续阶段。"
+      ];
+  const findingGateLines = unresolvedFindings.map((finding) =>
+    formatPlaceholderGateLine({
+      gateId: `GATE-${sanitizeGateId(finding.id)}`,
+      source: `ClaudeCode finding ${finding.id}`,
+      text: finding.rationale ?? finding.body,
+      boundary: "按审查意见补齐本次设计门禁，不能散落在其他章节",
+      passCondition: "新版设计稿和后续任务计划必须提供可验证证据",
+      evidence: "对应任务、测试、构建、矩阵或人工放行记录",
+      blocking: "未闭环不得进入后续阶段"
+    })
+  );
+
+  return replaceMarkdownSection(currentDesign, "## 项目门禁边界与放行策略", [
+    "## 项目门禁边界与放行策略",
+    ...preservedGateLines,
+    ...findingGateLines
+  ]);
+}
+
+function extractMarkdownSectionLines(markdown: string, heading: string): string[] {
+  const lines = markdown.split("\n");
+  const start = lines.findIndex((line) => line.trim() === heading);
+  if (start < 0) {
+    return [];
+  }
+  const end = findNextSecondLevelHeading(lines, start + 1);
+  return lines.slice(start + 1, end < 0 ? lines.length : end).filter((line) => line.trim().length > 0);
+}
+
+function replaceMarkdownSection(markdown: string, heading: string, replacement: string[]): string {
+  const lines = markdown.split("\n");
+  const start = lines.findIndex((line) => line.trim() === heading);
+  if (start >= 0) {
+    const end = findNextSecondLevelHeading(lines, start + 1);
+    const before = lines.slice(0, start);
+    const after = lines.slice(end < 0 ? lines.length : end);
+    return [...before, ...replacement, "", ...after].join("\n");
+  }
+
+  const targetStart = lines.findIndex((line) => line.trim() === "## 目标与非目标");
+  if (targetStart >= 0) {
+    const insertAt = findNextSecondLevelHeading(lines, targetStart + 1);
+    const index = insertAt < 0 ? lines.length : insertAt;
+    return [
+      ...lines.slice(0, index),
+      "",
+      ...replacement,
+      "",
+      ...lines.slice(index)
+    ].join("\n");
+  }
+
+  return [...lines, "", ...replacement].join("\n");
+}
+
+function findNextSecondLevelHeading(lines: string[], fromIndex: number): number {
+  return lines.findIndex((line, index) => index >= fromIndex && /^##\s+/.test(line));
+}
+
+function sanitizeGateId(id: string): string {
+  return id.replace(/[^A-Za-z0-9]+/g, "-").replace(/^-|-$/g, "") || "REVIEW-001";
+}
+
+function normalizeMarkdownLine(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
 }
 
 function parseTaskPlanOutput(
