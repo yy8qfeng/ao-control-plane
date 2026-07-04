@@ -69,7 +69,7 @@ export class ArtifactStore {
       writeFile(join(workflowDir, "design.md"), artifacts.design, "utf8"),
       writeJson(join(workflowDir, "reviews.json"), artifacts.reviews),
       artifacts.taskPlanReviews
-        ? writeJson(join(workflowDir, "task-plan-reviews.json"), artifacts.taskPlanReviews)
+        ? writeTaskPlanReviewArtifacts(workflowDir, artifacts.taskPlanReviews)
         : Promise.resolve(),
       artifacts.taskPlanApprovalReport
         ? writeJson(join(workflowDir, "task-plan-approval-report.json"), artifacts.taskPlanApprovalReport)
@@ -175,6 +175,50 @@ const normalizationReportIssueSeverityByCode: Record<ZodIssue["code"], TaskPlanN
 
 async function writeJson(file: string, value: unknown): Promise<void> {
   await writeFile(file, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+async function writeTaskPlanReviewArtifacts(workflowDir: string, reviews: TaskPlanReview[]): Promise<void> {
+  await writeJson(join(workflowDir, "task-plan-reviews.json"), reviews);
+  const latest = reviews.at(-1);
+  if (!latest) {
+    await removeOptionalFile(join(workflowDir, "task-plan-review-latest.json"));
+    return;
+  }
+
+  await Promise.all([
+    writeJson(join(workflowDir, "task-plan-review-latest.json"), latest),
+    ...reviews.map((review, index) => writeJson(join(workflowDir, getTaskPlanReviewFileName(reviews, index)), review))
+  ]);
+}
+
+function getTaskPlanReviewFileName(reviews: TaskPlanReview[], index: number): string {
+  const review = reviews[index];
+  if (!review) {
+    throw new Error(`Task plan review index ${index} is out of range`);
+  }
+  const sameRound = reviews.filter((item) => item.round === review.round);
+  const sameRoundIndex = reviews.slice(0, index + 1).filter((item) => item.round === review.round).length - 1;
+  if (sameRound.length === 1) {
+    return `task-plan-review-${review.round}.json`;
+  }
+  return `task-plan-review-${review.round}${getTaskPlanReviewFileSuffix(sameRound, sameRoundIndex)}.json`;
+}
+
+function getTaskPlanReviewFileSuffix(sameRound: TaskPlanReview[], sameRoundIndex: number): string {
+  const review = sameRound[sameRoundIndex];
+  if (!review) {
+    throw new Error(`Task plan review round index ${sameRoundIndex} is out of range`);
+  }
+  if (review.findings.some((finding) => finding.body.startsWith("[local-gate]"))) {
+    return "-local-gate";
+  }
+  const localGateIndex = sameRound.findIndex((item) =>
+    item.findings.some((finding) => finding.body.startsWith("[local-gate]"))
+  );
+  if (localGateIndex >= 0 && sameRoundIndex > localGateIndex) {
+    return "-local-gate-arbitration";
+  }
+  return "";
 }
 
 async function readJson<T>(file: string): Promise<T> {

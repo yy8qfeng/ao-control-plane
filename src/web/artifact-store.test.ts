@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -177,6 +177,100 @@ describe("ArtifactStore", () => {
     expect(restored.taskPlanNormalizationReports?.[0]?.sourceHistory?.[0]?.source).toBe("codex");
     expect(restored.taskPlanNormalizationReports?.[0]?.changes[0]?.path).toBe("tasks.0.type");
     expect(restored.draftPlan?.tasks[0]?.title).toBe("Draft task");
+  });
+
+  it("updates latest and round-specific task plan review files", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-artifacts-"));
+    const store = new ArtifactStore(tempDir);
+
+    await store.saveWorkflow({
+      requirement: {
+        id: "WF-PLAN-REVIEW-FILES",
+        title: "Plan review files",
+        source: "test",
+        description: "Persist latest and round review files.",
+        acceptanceCriteria: [],
+        constraints: []
+      },
+      workflow: {
+        workflowId: "WF-PLAN-REVIEW-FILES",
+        title: "Plan review files",
+        rawRequirement: "Persist latest and round review files.",
+        status: "blocked_for_human",
+        designRounds: 1,
+        maxDesignReviewRounds: 3,
+        tasks: []
+      },
+      design: "# Plan review files",
+      reviews: [],
+      taskPlanReviews: [
+        {
+          workflowId: "WF-PLAN-REVIEW-FILES",
+          round: 2,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: "task-plan-current",
+          reviewDecision: "approved",
+          findings: [
+            {
+              id: "TPF-MODEL-OK",
+              title: "Model review approved",
+              body: "Model review approved.",
+              severity: "observation",
+              status: "accepted_as_is"
+            }
+          ]
+        },
+        {
+          workflowId: "WF-PLAN-REVIEW-FILES",
+          round: 2,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: "task-plan-current",
+          reviewDecision: "changes_requested",
+          findings: [
+            {
+              id: "TPG-LOCAL",
+              title: "Local gate finding",
+              body: "[local-gate] Local gate finding.",
+              severity: "blocking",
+              status: "unresolved"
+            }
+          ]
+        },
+        {
+          workflowId: "WF-PLAN-REVIEW-FILES",
+          round: 2,
+          planner: "codex",
+          reviewer: "claude-code",
+          planVersion: "task-plan-current",
+          reviewDecision: "approved",
+          findings: [
+            {
+              id: "TPF-ARBITRATION-OK",
+              title: "Arbitration accepted",
+              body: "Arbitration accepted.",
+              severity: "observation",
+              status: "accepted_as_is"
+            }
+          ]
+        }
+      ]
+    });
+
+    const workflowDir = join(tempDir, "WF-PLAN-REVIEW-FILES");
+    await expect(readFile(join(workflowDir, "task-plan-review-2.json"), "utf8")).resolves.toContain(
+      "TPF-MODEL-OK"
+    );
+    await expect(readFile(join(workflowDir, "task-plan-review-2-local-gate.json"), "utf8")).resolves.toContain(
+      "TPG-LOCAL"
+    );
+    await expect(
+      readFile(join(workflowDir, "task-plan-review-2-local-gate-arbitration.json"), "utf8")
+    ).resolves.toContain("TPF-ARBITRATION-OK");
+    await expect(readFile(join(workflowDir, "task-plan-review-latest.json"), "utf8")).resolves.toContain(
+      "TPF-ARBITRATION-OK"
+    );
   });
 
   it("returns structured errors for invalid normalization reports without blocking workflow reads", async () => {
