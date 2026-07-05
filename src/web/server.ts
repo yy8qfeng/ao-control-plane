@@ -8,7 +8,9 @@ import { CodexCliAdapter } from "../adapters/codex.js";
 import type { CodexAdapter } from "../adapters/codex.js";
 import { executePlan, type ManualGateRelease } from "../workflow/plan-execution.js";
 import { runWorkflow } from "../workflow/run-workflow.js";
+import { getExecutionStateStore } from "../workflow/execution-state-store.js";
 import { ArtifactStore } from "./artifact-store.js";
+import { ExecutionJobManager } from "./execution-jobs.js";
 import { browseDirectories } from "./filesystem-browser.js";
 import { ProjectConfigStore, type RequirementDraft } from "./project-config.js";
 import { renderIndexHtml } from "./ui.js";
@@ -40,7 +42,19 @@ export async function startWebServer(options: WebServerOptions): Promise<{
   const defaultArtifactRoot = resolve(options.artifactRoot);
   const projectConfig = new ProjectConfigStore(join(defaultArtifactRoot, "project-config.json"));
   const workflowJobs = new WorkflowJobStore();
+  const executionManagers = new Map<string, ExecutionJobManager>();
   await mkdir(defaultArtifactRoot, { recursive: true });
+  const defaultExecutionManager = new ExecutionJobManager({
+    store: getExecutionStateStore(defaultArtifactRoot),
+    artifactRoot: defaultArtifactRoot,
+    createAo: () => new AoCliAdapter({ projectRoot: options.aoProjectRoot, dryRun: false }),
+    createCodex: () => options.createCodexAdapter?.(options.aoProjectRoot) ?? new CodexCliAdapter({ projectRoot: options.aoProjectRoot }),
+    createClaudeCode: () =>
+      options.createClaudeCodeAdapter?.(options.aoProjectRoot) ??
+      new ClaudeCodeCliAdapter({ projectRoot: options.aoProjectRoot })
+  });
+  executionManagers.set(defaultArtifactRoot, defaultExecutionManager);
+  await defaultExecutionManager.restoreFromDisk();
 
   const server = createServer(async (request, response) => {
     try {
@@ -50,12 +64,13 @@ export async function startWebServer(options: WebServerOptions): Promise<{
         defaultArtifactRoot,
         projectConfig,
         workflowJobs,
+        executionManagers,
         aoProjectRoot: options.aoProjectRoot,
         createCodexAdapter: options.createCodexAdapter,
         createClaudeCodeAdapter: options.createClaudeCodeAdapter
       });
     } catch (error) {
-      sendJson(response, 500, {
+      sendJson(response, getHttpStatusCode(error), {
         error: error instanceof Error ? error.message : "Unknown server error"
       });
     }
@@ -83,6 +98,7 @@ async function routeRequest(input: {
   defaultArtifactRoot: string;
   projectConfig: ProjectConfigStore;
   workflowJobs: WorkflowJobStore;
+  executionManagers: Map<string, ExecutionJobManager>;
   aoProjectRoot?: string;
   createCodexAdapter?: (projectRoot?: string) => CodexAdapter;
   createClaudeCodeAdapter?: (projectRoot?: string) => ClaudeCodeAdapter;
@@ -238,6 +254,13 @@ async function routeRequest(input: {
         createCodexAdapter: input.createCodexAdapter,
         createClaudeCodeAdapter: input.createClaudeCodeAdapter,
         onEvent: async (event) => {
+          if (event.type === "workflow_completed") {
+            await input.projectConfig.saveRequirementDraft(
+              toRequirementDraft({ ...body, workflowId: event.result.workflow.workflowId })
+            );
+            input.workflowJobs.completeGovernanceResult(job.snapshot.jobId, event.result);
+            return;
+          }
           input.workflowJobs.recordEvent(job.snapshot.jobId, event);
           if (event.type === "workflow_started") {
             await input.projectConfig.saveRequirementDraft(
@@ -256,13 +279,6 @@ async function routeRequest(input: {
         }
 
         input.workflowJobs.failJob(job.snapshot.jobId, error);
-      }).then(async (result) => {
-        if (!result) {
-          return;
-        }
-        await input.projectConfig.saveRequirementDraft(
-          toRequirementDraft({ ...body, workflowId: result.workflow.workflowId })
-        );
       }).catch((error: unknown) => {
         input.workflowJobs.failJob(job.snapshot.jobId, error);
       });
@@ -304,6 +320,114 @@ async function routeRequest(input: {
     return;
   }
 
+  if (method === "POST" && url.pathname === "/api/ao/execution-jobs") {
+    const body = (await readJsonBody(input.request)) as {
+      workflowId?: string;
+      dryRun?: boolean;
+      pollIntervalMs?: number;
+      staleLockMs?: number;
+    } & ProjectScopedRequest;
+    if (!body.workflowId) {
+      sendJson(input.response, 400, { error: "workflowId is required" });
+      return;
+    }
+    await rememberProjectRootIfPresent(body, input.projectConfig);
+    const manager = getExecutionManager(body, input);
+    const snapshot = await manager.createOrResume({
+      workflowId: body.workflowId,
+      pollIntervalMs: body.pollIntervalMs,
+      staleLockMs: body.staleLockMs
+    });
+    sendJson(input.response, 200, snapshot);
+    return;
+  }
+
+  if (method === "GET" && url.pathname.startsWith("/api/ao/execution-jobs/")) {
+    const jobId = decodeURIComponent(url.pathname.replace("/api/ao/execution-jobs/", "").split("/")[0] ?? "");
+    const projectRoot = url.searchParams.get("projectRoot") ?? undefined;
+    const manager = getExecutionManager({ projectRoot }, input);
+    sendJson(input.response, 200, await manager.getSnapshot(jobId));
+    return;
+  }
+
+  if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/stop$/)) {
+    const jobId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+    const body = (await readJsonBody(input.request)) as ProjectScopedRequest;
+    const manager = getExecutionManager(body, input);
+    sendJson(input.response, 200, await manager.stop(jobId));
+    return;
+  }
+
+  if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/resume$/)) {
+    const jobId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+    const body = (await readJsonBody(input.request)) as { pollIntervalMs?: number } & ProjectScopedRequest;
+    const manager = getExecutionManager(body, input);
+    sendJson(input.response, 200, await manager.resume(jobId, body.pollIntervalMs));
+    return;
+  }
+
+  if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/tasks\/[^/]+\/retry$/)) {
+    const parts = url.pathname.split("/");
+    const jobId = decodeURIComponent(parts[4] ?? "");
+    const taskId = decodeURIComponent(parts[6] ?? "");
+    const body = (await readJsonBody(input.request)) as ProjectScopedRequest;
+    const manager = getExecutionManager(body, input);
+    sendJson(input.response, 200, await manager.retry(jobId, taskId));
+    return;
+  }
+
+  if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/tasks\/[^/]+\/mark-completed$/)) {
+    const parts = url.pathname.split("/");
+    const jobId = decodeURIComponent(parts[4] ?? "");
+    const taskId = decodeURIComponent(parts[6] ?? "");
+    const body = (await readJsonBody(input.request)) as { rationale?: string } & ProjectScopedRequest;
+    const manager = getExecutionManager(body, input);
+    sendJson(input.response, 200, await manager.markCompleted(jobId, taskId, body.rationale ?? ""));
+    return;
+  }
+
+  if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/manual-gates\/[^/]+\/decision$/)) {
+    const parts = url.pathname.split("/");
+    const jobId = decodeURIComponent(parts[4] ?? "");
+    const taskId = decodeURIComponent(parts[6] ?? "");
+    const body = (await readJsonBody(input.request)) as {
+      decision?: "approved" | "requires_replan" | "blocked";
+      rationale?: string;
+    } & ProjectScopedRequest;
+    if (body.decision !== "approved" && body.decision !== "requires_replan" && body.decision !== "blocked") {
+      sendJson(input.response, 400, { error: "decision must be approved, requires_replan, or blocked" });
+      return;
+    }
+    const manager = getExecutionManager(body, input);
+    sendJson(input.response, 200, await manager.decideManualGate(jobId, taskId, {
+      decision: body.decision,
+      rationale: body.rationale ?? ""
+    }));
+    return;
+  }
+
+  if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/revision-requests$/)) {
+    const jobId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+    const body = (await readJsonBody(input.request)) as {
+      workflowId?: string;
+      triggerTaskId?: string;
+      reasonCategory?: string;
+      rationale?: string;
+    } & ProjectScopedRequest;
+    if (!body.workflowId || !body.triggerTaskId || !body.reasonCategory) {
+      sendJson(input.response, 400, { error: "workflowId, triggerTaskId, and reasonCategory are required" });
+      return;
+    }
+    const manager = getExecutionManager(body, input);
+    sendJson(input.response, 200, await manager.requestRevision(jobId, {
+      workflowId: body.workflowId,
+      triggerTaskId: body.triggerTaskId,
+      reasonCategory: body.reasonCategory,
+      rationale: body.rationale ?? ""
+    }));
+    return;
+  }
+
   sendJson(input.response, 404, { error: "Not found" });
 }
 
@@ -335,6 +459,40 @@ function createRequestStore(
   defaultArtifactRoot: string
 ): ArtifactStore {
   return new ArtifactStore(resolveArtifactRoot(request, defaultArtifactRoot));
+}
+
+function getExecutionManager(
+  request: ProjectScopedRequest & { dryRun?: boolean },
+  input: {
+    defaultArtifactRoot: string;
+    executionManagers: Map<string, ExecutionJobManager>;
+    aoProjectRoot?: string;
+    createCodexAdapter?: (projectRoot?: string) => CodexAdapter;
+    createClaudeCodeAdapter?: (projectRoot?: string) => ClaudeCodeAdapter;
+  }
+): ExecutionJobManager {
+  const artifactRoot = resolveArtifactRoot(request, input.defaultArtifactRoot);
+  const projectRoot = resolveProjectRoot(request, input.aoProjectRoot);
+  let manager = input.executionManagers.get(artifactRoot);
+  if (!manager) {
+    manager = new ExecutionJobManager({
+      store: getExecutionStateStore(artifactRoot),
+      artifactRoot,
+      createAo: () => new AoCliAdapter({ projectRoot, dryRun: request.dryRun ?? false }),
+      createCodex: () => createCodexAdapterForRequest(input.createCodexAdapter, request, input.aoProjectRoot),
+      createClaudeCode: () => createClaudeCodeAdapterForRequest(input.createClaudeCodeAdapter, request, input.aoProjectRoot)
+    });
+    input.executionManagers.set(artifactRoot, manager);
+    void manager.restoreFromDisk();
+  }
+  return manager;
+}
+
+function getHttpStatusCode(error: unknown): number {
+  if (error instanceof Error && "statusCode" in error && typeof error.statusCode === "number") {
+    return error.statusCode;
+  }
+  return 500;
 }
 
 function recordTaskPlanStageEvent(

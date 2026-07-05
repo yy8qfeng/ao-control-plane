@@ -1,14 +1,15 @@
 import type { AoCliAdapter } from "../adapters/ao.js";
-import type { ExecutionTask, TaskPlan } from "../schemas/task-plan.js";
+import type { TaskPlan } from "../schemas/task-plan.js";
+import {
+  getAlreadyWorkingTaskIds,
+  getCompletedTaskIds,
+  getLegacyReleasedManualGateTaskIds,
+  getTaskReadiness,
+  type BlockedTaskKind,
+  type ManualGateRelease
+} from "./task-readiness.js";
 
-export type BlockedTaskKind = "waiting_dependencies" | "manual_gate";
-
-export interface ManualGateRelease {
-  taskId: string;
-  decision: "approved" | "requires_replan" | "blocked";
-  rationale?: string;
-  releasedAt?: string;
-}
+export type { BlockedTaskKind, ManualGateRelease } from "./task-readiness.js";
 
 export interface PlanExecutionResult {
   sessions: Array<{
@@ -28,19 +29,9 @@ export async function executePlan(input: {
   ao: AoCliAdapter;
   releasedManualGateTaskIds?: Array<string | ManualGateRelease>;
 }): Promise<PlanExecutionResult> {
-  const releasedManualGateTaskIds = new Set(
-    (input.releasedManualGateTaskIds ?? [])
-      .map((release) => (typeof release === "string" ? release : release.decision === "approved" ? release.taskId : undefined))
-      .filter((taskId): taskId is string => Boolean(taskId))
-  );
-  const completed = new Set(
-    input.plan.tasks.filter((task) => task.status === "completed").map((task) => task.taskId)
-  );
-  const alreadyWorking = new Set(
-    input.plan.tasks
-      .filter((task) => task.status === "working" || Boolean(task.aoSessionId))
-      .map((task) => task.taskId)
-  );
+  const releasedManualGateTaskIds = getLegacyReleasedManualGateTaskIds(input.releasedManualGateTaskIds);
+  const completed = getCompletedTaskIds(input.plan);
+  const alreadyWorking = getAlreadyWorkingTaskIds(input.plan);
   const sessions: PlanExecutionResult["sessions"] = [];
   const blockedTasks: PlanExecutionResult["blockedTasks"] = [];
 
@@ -50,7 +41,7 @@ export async function executePlan(input: {
       continue;
     }
 
-    const readiness = getTaskReadiness(task, completed, releasedManualGateTaskIds);
+    const readiness = getTaskReadiness({ task, completed, releasedManualGateTaskIds });
 
     if (!readiness.ready) {
       blockedTasks.push({
@@ -71,51 +62,4 @@ export async function executePlan(input: {
   }
 
   return { sessions, blockedTasks };
-}
-
-function getTaskReadiness(
-  task: ExecutionTask,
-  completed: ReadonlySet<string>,
-  releasedManualGateTaskIds: ReadonlySet<string>
-): { ready: true } | { ready: false; kind: BlockedTaskKind; reason: string } {
-  if (task.dependencyCondition === "manual_gate") {
-    const dependenciesCompleted = task.dependencies.every((dependency) => completed.has(dependency));
-    if (!dependenciesCompleted) {
-      return {
-        ready: false,
-        kind: "waiting_dependencies",
-        reason: `waiting for dependencies: ${task.dependencies.join(", ")}`
-      };
-    }
-    return releasedManualGateTaskIds.has(task.taskId)
-      ? { ready: true }
-      : {
-          ready: false,
-          kind: "manual_gate",
-          reason: "manual_gate requires human approval before dispatch"
-        };
-  }
-
-  if (task.dependencies.length === 0) {
-    return { ready: true };
-  }
-
-  if (task.dependencyCondition === "any_completed") {
-    return task.dependencies.some((dependency) => completed.has(dependency))
-      ? { ready: true }
-      : {
-          ready: false,
-          kind: "waiting_dependencies",
-          reason: `waiting for any dependency: ${task.dependencies.join(", ")}`
-        };
-  }
-
-  const unresolved = task.dependencies.filter((dependency) => !completed.has(dependency));
-  return unresolved.length === 0
-    ? { ready: true }
-    : {
-        ready: false,
-        kind: "waiting_dependencies",
-        reason: `waiting for dependencies: ${unresolved.join(", ")}`
-      };
 }

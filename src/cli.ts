@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { readFile } from "node:fs/promises";
+import { basename, resolve } from "node:path";
 import { Command } from "commander";
 import { appVersion } from "./app-version.js";
 import { AoCliAdapter } from "./adapters/ao.js";
@@ -12,6 +13,16 @@ import {
   reconcileTaskSessions
 } from "./workflow/ao-status.js";
 import { executePlan } from "./workflow/plan-execution.js";
+import {
+  ContinuousExecutionRunner,
+  decideManualGate,
+  markExecutionTaskCompleted,
+  retryExecutionTask,
+  stopExecution
+} from "./workflow/continuous-plan-execution.js";
+import { acquireExecutionLock } from "./workflow/execution-lock.js";
+import { getExecutionStateStore } from "./workflow/execution-state-store.js";
+import type { PlanVersion } from "./workflow/execution-state-store.js";
 import { runWorkflow } from "./workflow/run-workflow.js";
 import { TASK_PLAN_NORMALIZATION_SOURCE, parseTaskPlanWithNormalization } from "./workflow/task-plan-normalizer.js";
 import { startWebServer } from "./web/server.js";
@@ -120,6 +131,184 @@ program
       releasedManualGateTaskIds: options.releaseManualGate
     });
     console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("execute-plan-continuous")
+  .argument("<task-plan-file>", "Task plan JSON file")
+  .option("--project-root <path>", "AO project root used as cwd for ao CLI")
+  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .option("--workflow-id <id>", "Workflow id; defaults to task-plan.workflowId")
+  .option("--poll-interval-ms <number>", "AO status poll interval", "5000")
+  .option("--stale-lock-ms <number>", "Execution lock stale threshold")
+  .option("--dry-run", "Run continuous scheduling without spawning real AO sessions")
+  .option("--attach", "Only print current execution state and logs without driving the runner")
+  .description("Execute a task plan continuously, serially dispatching ready AO tasks")
+  .action(async (
+    taskPlanFile: string,
+    options: {
+      projectRoot?: string;
+      artifactRoot: string;
+      workflowId?: string;
+      pollIntervalMs: string;
+      staleLockMs?: string;
+      dryRun?: boolean;
+      attach?: boolean;
+    }
+  ) => {
+    const plan = await readTaskPlan(taskPlanFile);
+    const workflowId = options.workflowId ?? plan.workflowId;
+    const store = getExecutionStateStore(options.artifactRoot);
+    if (options.attach) {
+      console.log(JSON.stringify({
+        state: await store.ensureState(workflowId),
+        logs: await store.readLogs(workflowId)
+      }, null, 2));
+      return;
+    }
+
+    await activateCliPlanFile({ store, workflowId, taskPlanFile });
+    const lock = options.dryRun
+      ? undefined
+      : await acquireExecutionLock({
+          artifactRoot: options.artifactRoot,
+          workflowId,
+          holder: "cli",
+          staleLockMs: options.staleLockMs ? Number(options.staleLockMs) : undefined
+        });
+    try {
+      const runner = new ContinuousExecutionRunner({
+        workflowId,
+        store,
+        ao: new AoCliAdapter({
+          projectRoot: options.projectRoot,
+          dryRun: options.dryRun
+        }),
+        pollIntervalMs: Number(options.pollIntervalMs)
+      });
+      await runner.run();
+      console.log(JSON.stringify(await store.ensureState(workflowId), null, 2));
+    } finally {
+      await lock?.release();
+    }
+  });
+
+program
+  .command("execution-status")
+  .requiredOption("--workflow-id <id>", "Workflow id")
+  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .description("Print continuous execution state and recent logs")
+  .action(async (options: { workflowId: string; artifactRoot: string }) => {
+    const store = getExecutionStateStore(options.artifactRoot);
+    console.log(JSON.stringify({
+      state: await store.ensureState(options.workflowId),
+      logs: await store.readLogs(options.workflowId)
+    }, null, 2));
+  });
+
+program
+  .command("execution-stop")
+  .requiredOption("--workflow-id <id>", "Workflow id")
+  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .description("Stop continuous execution without killing AO sessions")
+  .action(async (options: { workflowId: string; artifactRoot: string }) => {
+    const store = getExecutionStateStore(options.artifactRoot);
+    console.log(JSON.stringify(await stopExecution({ store, workflowId: options.workflowId, actor: "cli" }), null, 2));
+  });
+
+program
+  .command("execution-resume")
+  .requiredOption("--workflow-id <id>", "Workflow id")
+  .option("--project-root <path>", "AO project root used as cwd for ao CLI")
+  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .option("--poll-interval-ms <number>", "AO status poll interval", "5000")
+  .option("--stale-lock-ms <number>", "Execution lock stale threshold")
+  .option("--dry-run", "Run continuous scheduling without spawning real AO sessions")
+  .description("Resume a stopped continuous execution")
+  .action(async (options: {
+    workflowId: string;
+    projectRoot?: string;
+    artifactRoot: string;
+    pollIntervalMs: string;
+    staleLockMs?: string;
+    dryRun?: boolean;
+  }) => {
+    const store = getExecutionStateStore(options.artifactRoot);
+    const lock = options.dryRun
+      ? undefined
+      : await acquireExecutionLock({
+          artifactRoot: options.artifactRoot,
+          workflowId: options.workflowId,
+          holder: "cli",
+          staleLockMs: options.staleLockMs ? Number(options.staleLockMs) : undefined
+        });
+    try {
+      const runner = new ContinuousExecutionRunner({
+        workflowId: options.workflowId,
+        store,
+        ao: new AoCliAdapter({ projectRoot: options.projectRoot, dryRun: options.dryRun }),
+        pollIntervalMs: Number(options.pollIntervalMs)
+      });
+      await runner.run();
+      console.log(JSON.stringify(await store.ensureState(options.workflowId), null, 2));
+    } finally {
+      await lock?.release();
+    }
+  });
+
+program
+  .command("execution-retry")
+  .requiredOption("--workflow-id <id>", "Workflow id")
+  .requiredOption("--task-id <taskId>", "Task id")
+  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .description("Mark a blocked or failed task for retry")
+  .action(async (options: { workflowId: string; taskId: string; artifactRoot: string }) => {
+    const store = getExecutionStateStore(options.artifactRoot);
+    console.log(JSON.stringify(await retryExecutionTask({ store, workflowId: options.workflowId, taskId: options.taskId, actor: "cli" }), null, 2));
+  });
+
+program
+  .command("execution-mark-completed")
+  .requiredOption("--workflow-id <id>", "Workflow id")
+  .requiredOption("--task-id <taskId>", "Task id")
+  .requiredOption("--rationale <text>", "Human completion rationale")
+  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .description("Mark a task completed after human verification")
+  .action(async (options: { workflowId: string; taskId: string; rationale: string; artifactRoot: string }) => {
+    const store = getExecutionStateStore(options.artifactRoot);
+    console.log(JSON.stringify(await markExecutionTaskCompleted({
+      store,
+      workflowId: options.workflowId,
+      taskId: options.taskId,
+      rationale: options.rationale,
+      actor: "cli"
+    }), null, 2));
+  });
+
+program
+  .command("execution-release-gate")
+  .requiredOption("--workflow-id <id>", "Workflow id")
+  .requiredOption("--task-id <taskId>", "Task id")
+  .option("--decision <decision>", "approved, requires_replan, or blocked", "approved")
+  .option("--rationale <text>", "Decision rationale", "CLI manual gate decision")
+  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .description("Submit a structured manual gate decision")
+  .action(async (options: {
+    workflowId: string;
+    taskId: string;
+    decision: "approved" | "requires_replan" | "blocked";
+    rationale: string;
+    artifactRoot: string;
+  }) => {
+    const store = getExecutionStateStore(options.artifactRoot);
+    console.log(JSON.stringify(await decideManualGate({
+      store,
+      workflowId: options.workflowId,
+      taskId: options.taskId,
+      decision: options.decision,
+      rationale: options.rationale,
+      actor: "cli"
+    }), null, 2));
   });
 
 program
@@ -271,6 +460,35 @@ program
   );
 
 await program.parseAsync();
+
+async function activateCliPlanFile(input: {
+  store: ReturnType<typeof getExecutionStateStore>;
+  workflowId: string;
+  taskPlanFile: string;
+}): Promise<void> {
+  const fileName = basename(input.taskPlanFile);
+  const workflowDir = input.store.getWorkflowDir(input.workflowId);
+  const expectedPath = resolve(workflowDir, fileName);
+  const actualPath = resolve(input.taskPlanFile);
+  if (actualPath !== expectedPath) {
+    throw new Error(
+      `execute-plan-continuous requires ${fileName} to already be in the workflow artifact directory: ${workflowDir}`
+    );
+  }
+  const versionMatch = fileName.match(/^task-plan-v(\d+)\.json$/);
+  if (fileName !== "task-plan.json" && !versionMatch) {
+    throw new Error("execute-plan-continuous only accepts task-plan.json or task-plan-v{N}.json as active plans");
+  }
+  if (!versionMatch) {
+    return;
+  }
+  const planVersion = `task-plan-v${versionMatch[1]}` as PlanVersion;
+  await input.store.update(input.workflowId, (state) => ({
+    ...state,
+    planVersion,
+    planPath: fileName
+  }));
+}
 
 async function readTaskPlan(file: string) {
   const parsed = await readJson(file);

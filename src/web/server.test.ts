@@ -303,6 +303,36 @@ describe("web server", () => {
     expect(invalidDecision.error).toContain("decision must be approved, requires_replan, or blocked");
   });
 
+  it("runs continuous execution through execution job APIs in dry-run mode", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    const projectRoot = join(tempDir, "project");
+    await mkdir(projectRoot);
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir
+    });
+    await seedExecutingWorkflow(projectRoot, "WF-CONTINUOUS-WEB", createWebPlan("WF-CONTINUOUS-WEB"));
+
+    const startResponse = await fetch(`${server.url}/api/ao/execution-jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectRoot,
+        workflowId: "WF-CONTINUOUS-WEB",
+        dryRun: true,
+        pollIntervalMs: 1
+      })
+    });
+    const started = (await startResponse.json()) as { jobId: string; mode: string; status: string };
+
+    expect(startResponse.status).toBe(200);
+    expect(started.mode).toBe("created");
+
+    const completed = await waitForExecutionJobStatus(server.url, started.jobId, projectRoot, "completed");
+    expect(completed.summary.completed).toBe(1);
+    expect(completed.currentTaskId).toBeNull();
+  });
+
   it("runs the real governance endpoint through injected adapters", async () => {
     tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
     const projectRoot = join(tempDir, "project");
@@ -895,24 +925,25 @@ describe("web server", () => {
     expect(html).toContain("设计已达到可实施标准，部分问题将进入实施阶段处理。");
   });
 
-  it("renders execution controls for real dispatch and structured manual gate release", () => {
+  it("renders execution controls for continuous execution and structured manual gate release", () => {
     const html = renderIndexHtml();
 
     expect(html).toContain('id="executeButton"');
     expect(html).toContain('id="releaseManualGateButton"');
     expect(html).toContain('id="replanManualGateButton"');
     expect(html).toContain('id="blockManualGateButton"');
-    expect(html).toContain("派发执行");
+    expect(html).toContain("启动连续执行");
     expect(html).toContain("要求重规划");
     expect(html).toContain("标记阻断");
     expect(html).toContain("dryRun: false");
-    expect(html).toContain("即将真实派发");
-    expect(html).toContain("AO 已派发");
-    expect(html).toContain("先点击派发执行，以识别需要人工放行的 manual_gate 任务。");
+    expect(html).toContain("/api/ao/execution-jobs");
+    expect(html).toContain("即将启动连续执行");
+    expect(html).toContain("连续执行已启动");
+    expect(html).toContain("启动连续执行后，调度器会在需要人工门禁时暂停。");
     expect(html).toContain("taskPlanApprovalReport");
-    expect(html).toContain('createManualGateReleases("approved"');
-    expect(html).toContain('createManualGateReleases("requires_replan"');
-    expect(html).toContain('createManualGateReleases("blocked"');
+    expect(html).toContain('submitManualGateDecision("approved"');
+    expect(html).toContain('submitManualGateDecision("requires_replan"');
+    expect(html).toContain('submitManualGateDecision("blocked"');
     expect(html).toContain("Web UI 人工放行");
     expect(html).toContain("Web UI 要求重规划");
     expect(html).toContain("Web UI 标记阻断");
@@ -944,7 +975,7 @@ describe("web server", () => {
     expect(html).toContain("可实施状态：");
     expect(html).toContain("覆盖缺口：");
     expect(html).toContain("待处理 finding：");
-    expect(html).toContain('task.kind === "manual_gate"');
+    expect(html).toContain('state.execution?.status === "waiting_manual_gate"');
     expect(html).not.toContain('id="dryRunToggle"');
     expect(html).not.toContain("预演模式");
     expect(html).not.toContain('task.reason === "manual_gate requires human approval before dispatch"');
@@ -995,6 +1026,33 @@ const fakeCodex: CodexAdapter = {
 async function waitForJob(url: string, jobId: string) {
   const job = await waitForCompletedJob(url, jobId);
   return job.result;
+}
+
+async function waitForExecutionJobStatus(
+  url: string,
+  jobId: string,
+  projectRoot: string,
+  expectedStatus: string
+) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const response = await fetch(
+      `${url}/api/ao/execution-jobs/${encodeURIComponent(jobId)}?projectRoot=${encodeURIComponent(projectRoot)}`
+    );
+    const job = (await response.json()) as {
+      status: string;
+      currentTaskId: string | null;
+      summary: { completed: number };
+      failure?: { message: string };
+    };
+    if (job.status === expectedStatus) {
+      return job;
+    }
+    if (job.status === "failed") {
+      throw new Error(job.failure?.message ?? "execution job failed");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`execution job did not reach ${expectedStatus}`);
 }
 
 async function waitForCompletedJob(url: string, jobId: string, expectedTaskPlanReviews = 1) {

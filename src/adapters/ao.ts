@@ -16,14 +16,30 @@ export interface AoAdapterOptions {
 }
 
 export class AoCliAdapter {
+  private readonly dryRunSessions: Array<{
+    id: string;
+    role: string;
+    status: string;
+    prompt: string;
+    displayName: string;
+  }> = [];
+
   constructor(private readonly options: AoAdapterOptions = {}) {}
 
   async spawnTask(task: ExecutionTask): Promise<AoSpawnResult> {
     const args = buildSpawnArgs(task);
 
     if (this.options.dryRun) {
+      const sessionId = `dry-run-${task.taskId}`;
+      this.dryRunSessions.push({
+        id: sessionId,
+        role: task.aoRole,
+        status: "completed",
+        prompt: task.aoPrompt,
+        displayName: `[${task.workflowId} / ${task.taskId}] ${task.title}`
+      });
       return {
-        sessionId: `dry-run-${task.taskId}`,
+        sessionId,
         stdout: `ao ${args.join(" ")}`,
         stderr: ""
       };
@@ -42,6 +58,10 @@ export class AoCliAdapter {
   }
 
   async listSessions(): Promise<unknown> {
+    if (this.options.dryRun) {
+      return { sessions: this.dryRunSessions };
+    }
+
     const args = ["session", "ls", "--json", "--include-terminated"];
     if (this.options.projectId) {
       args.push("--project", this.options.projectId);

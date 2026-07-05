@@ -372,10 +372,10 @@ export function renderIndexHtml(): string {
           <button id="saveDraftButton" class="secondary" type="button">保存草稿</button>
           <button id="clearDraftButton" class="secondary" type="button">清空草稿</button>
           <button id="planButton" class="secondary" type="button" disabled>继续审查任务计划</button>
-          <button id="executeButton" class="secondary" type="button" disabled>派发执行</button>
-          <button id="releaseManualGateButton" class="secondary" type="button" disabled title="先点击派发执行，以识别需要人工放行的 manual_gate 任务。">放行门禁</button>
-          <button id="replanManualGateButton" class="secondary" type="button" disabled title="先点击派发执行，以识别需要人工决策的 manual_gate 任务。">要求重规划</button>
-          <button id="blockManualGateButton" class="secondary" type="button" disabled title="先点击派发执行，以识别需要人工决策的 manual_gate 任务。">标记阻断</button>
+          <button id="executeButton" class="secondary" type="button" disabled>启动连续执行</button>
+          <button id="releaseManualGateButton" class="secondary" type="button" disabled title="启动连续执行后，调度器会在需要人工门禁时暂停。">放行门禁</button>
+          <button id="replanManualGateButton" class="secondary" type="button" disabled title="启动连续执行后，调度器会在需要人工门禁时暂停。">要求重规划</button>
+          <button id="blockManualGateButton" class="secondary" type="button" disabled title="启动连续执行后，调度器会在需要人工门禁时暂停。">标记阻断</button>
         </div>
         <div id="draftStatus" class="status">表单草稿会自动保存到本地。</div>
         <div id="formStatus" class="status"></div>
@@ -456,6 +456,7 @@ export function renderIndexHtml(): string {
       pollTimer: null,
       localTimer: null,
       execution: null,
+      executionPollTimer: null,
       activeTab: "logs",
       pendingRender: false,
       browsingPath: "",
@@ -604,27 +605,23 @@ export function renderIndexHtml(): string {
     });
 
     executeButton.addEventListener("click", async () => {
-      const dispatchableCount = getDispatchableTaskCount([]);
-      if (!confirm("即将真实派发 " + dispatchableCount + " 个任务到 AO，是否继续？")) return;
-      await executeAoPlan([], "正在向 AO 派发任务...");
+      if (!confirm("即将启动连续执行，调度器会按任务顺序和依赖关系持续派发 AO 任务，是否继续？")) return;
+      await startContinuousExecution("正在启动连续执行...");
     });
 
     releaseManualGateButton.addEventListener("click", async () => {
-      const releases = createManualGateReleases("approved", "Web UI 人工放行");
-      if (!confirm("即将真实放行并派发 " + releases.length + " 个 manual_gate 任务到 AO，是否继续？")) return;
-      await executeAoPlan(releases, "正在放行 manual_gate 任务...");
+      if (!confirm("确认放行当前 manual_gate 并继续执行？")) return;
+      await submitManualGateDecision("approved", "Web UI 人工放行");
     });
 
     replanManualGateButton.addEventListener("click", async () => {
-      const releases = createManualGateReleases("requires_replan", "Web UI 要求重规划");
-      if (!confirm("即将把 " + releases.length + " 个 manual_gate 标记为需要重规划，旧后续任务不会被放行，是否继续？")) return;
-      await executeAoPlan(releases, "正在标记 manual_gate 需要重规划...");
+      if (!confirm("确认要求修复任务计划？连续执行会暂停到重规划流程。")) return;
+      await submitManualGateDecision("requires_replan", "Web UI 要求重规划");
     });
 
     blockManualGateButton.addEventListener("click", async () => {
-      const releases = createManualGateReleases("blocked", "Web UI 标记阻断");
-      if (!confirm("即将把 " + releases.length + " 个 manual_gate 标记为阻断，旧后续任务不会被放行，是否继续？")) return;
-      await executeAoPlan(releases, "正在标记 manual_gate 阻断...");
+      if (!confirm("确认标记当前 manual_gate 阻断？连续执行会中断。")) return;
+      await submitManualGateDecision("blocked", "Web UI 标记阻断");
     });
 
     document.querySelectorAll(".tab").forEach((tab) => {
@@ -712,6 +709,10 @@ export function renderIndexHtml(): string {
       if (state.localTimer) {
         clearInterval(state.localTimer);
         state.localTimer = null;
+      }
+      if (state.executionPollTimer) {
+        clearInterval(state.executionPollTimer);
+        state.executionPollTimer = null;
       }
     }
 
@@ -1108,22 +1109,39 @@ export function renderIndexHtml(): string {
       } else if (state.activeTab === "planReview") {
         output.textContent = formatPlanReviewTabContent();
       } else {
-        output.textContent = JSON.stringify(state.execution || { message: "尚未执行 AO 派发。" }, null, 2);
+        output.textContent = formatExecutionTabContent();
       }
     }
 
-    async function executeAoPlan(releasedManualGateTaskIds, busyMessage) {
+    function formatExecutionTabContent() {
+      if (!state.execution) {
+        return JSON.stringify({ message: "尚未启动连续执行。" }, null, 2);
+      }
+      const waitingScheduler =
+        state.execution.status === "running" &&
+        !state.execution.currentTaskId &&
+        Number(state.execution.summary?.working || 0) > 0;
+      if (!waitingScheduler) {
+        return JSON.stringify(state.execution, null, 2);
+      }
+      return [
+        "迁移完成，等待调度器选择下一个任务。",
+        "",
+        JSON.stringify(state.execution, null, 2)
+      ].join("\\n");
+    }
+
+    async function startContinuousExecution(busyMessage) {
       if (!state.result?.workflow?.workflowId) return;
       setBusy(true, busyMessage);
       try {
-        const response = await fetch("/api/ao/execute", {
+        const response = await fetch("/api/ao/execution-jobs", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
             workflowId: state.result.workflow.workflowId,
             projectRoot: getProjectRoot(),
-            dryRun: false,
-            releasedManualGateTaskIds
+            dryRun: false
           })
         });
         state.execution = await readResponse(response);
@@ -1132,6 +1150,7 @@ export function renderIndexHtml(): string {
         renderActiveTab();
         updateSummary();
         setStatus("ok", getExecutionSuccessMessage(state.execution));
+        startPollingExecutionJob(state.execution.jobId);
       } catch (error) {
         setStatus("bad", error.message || String(error));
       } finally {
@@ -1139,7 +1158,58 @@ export function renderIndexHtml(): string {
       }
     }
 
+    async function submitManualGateDecision(decision, rationale) {
+      const taskId = getManualGateBlockedTaskIds()[0];
+      const jobId = state.execution?.jobId;
+      if (!taskId || !jobId) return;
+      setBusy(true, "正在提交门禁决策...");
+      try {
+        const response = await fetch("/api/ao/execution-jobs/" + encodeURIComponent(jobId) + "/manual-gates/" + encodeURIComponent(taskId) + "/decision", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            projectRoot: getProjectRoot(),
+            decision,
+            rationale
+          })
+        });
+        state.execution = await readResponse(response);
+        renderActiveTab();
+        updateSummary();
+        setStatus("ok", "门禁决策已提交。");
+        if (decision === "approved") startPollingExecutionJob(jobId);
+      } catch (error) {
+        setStatus("bad", error.message || String(error));
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    function startPollingExecutionJob(jobId) {
+      if (!jobId) return;
+      if (state.executionPollTimer) clearInterval(state.executionPollTimer);
+      state.executionPollTimer = setInterval(async () => {
+        try {
+          const response = await fetch("/api/ao/execution-jobs/" + encodeURIComponent(jobId) + "?projectRoot=" + encodeURIComponent(getProjectRoot()));
+          state.execution = await readResponse(response);
+          renderActiveTab();
+          updateSummary();
+          if (!["running", "waiting_manual_gate", "paused_for_replan"].includes(state.execution.status)) {
+            clearInterval(state.executionPollTimer);
+            state.executionPollTimer = null;
+          }
+        } catch (error) {
+          clearInterval(state.executionPollTimer);
+          state.executionPollTimer = null;
+          setStatus("bad", error.message || String(error));
+        }
+      }, 2000);
+    }
+
     function getManualGateBlockedTaskIds() {
+      if (state.execution?.status === "waiting_manual_gate" && state.execution.currentTaskId) {
+        return [state.execution.currentTaskId];
+      }
       return (state.execution?.blockedTasks || [])
         .filter((task) => task.kind === "manual_gate")
         .map((task) => task.taskId)
@@ -1148,27 +1218,21 @@ export function renderIndexHtml(): string {
 
     function getReleaseManualGateButtonTitle() {
       const count = getManualGateBlockedTaskIds().length;
-      if (count > 0) return "放行当前识别到的 " + count + " 个 manual_gate 任务。";
-      return "先点击派发执行，以识别需要人工放行的 manual_gate 任务。";
+      if (count > 0) return "放行当前等待的 " + count + " 个 manual_gate 任务。";
+      return "启动连续执行后，调度器会在需要人工门禁时暂停。";
     }
 
     function getManualGateDecisionButtonTitle(decision) {
       const count = getManualGateBlockedTaskIds().length;
-      if (count === 0) return "先点击派发执行，以识别需要人工决策的 manual_gate 任务。";
-      if (decision === "requires_replan") return "将当前识别到的 " + count + " 个 manual_gate 标记为需要重规划。";
-      return "将当前识别到的 " + count + " 个 manual_gate 标记为阻断。";
-    }
-
-    function createManualGateReleases(decision, rationale) {
-      return getManualGateBlockedTaskIds().map((taskId) => ({
-        taskId,
-        decision,
-        rationale,
-        releasedAt: new Date().toISOString()
-      }));
+      if (count === 0) return "启动连续执行后，调度器会在需要人工门禁时暂停。";
+      if (decision === "requires_replan") return "将当前等待的 " + count + " 个 manual_gate 标记为需要重规划。";
+      return "将当前等待的 " + count + " 个 manual_gate 标记为阻断。";
     }
 
     function getExecutionSuccessMessage(execution) {
+      if (execution?.jobId) {
+        return "连续执行已启动，当前状态：" + execution.status + "。";
+      }
       const sessionCount = execution?.sessions?.length || 0;
       const blockedCount = execution?.blockedTasks?.length || 0;
       return "AO 已派发 " + sessionCount + " 个任务" + (blockedCount > 0 ? "，" + blockedCount + " 个任务仍在等待。" : "。");
