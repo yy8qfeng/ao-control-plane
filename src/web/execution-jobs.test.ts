@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
@@ -88,7 +88,7 @@ describe("ExecutionJobManager", () => {
 
     await expect(manager.retry(`EXEC-${workflowId}`, "TASK-001")).rejects.toMatchObject({
       statusCode: 503,
-      message: expect.stringContaining("AO 未启动或不可用")
+      message: expect.stringContaining(`workflowId=${workflowId}, jobId=EXEC-${workflowId}`)
     });
 
     const state = await store.readState(workflowId);
@@ -96,13 +96,39 @@ describe("ExecutionJobManager", () => {
     expect(state.taskStates["TASK-001"]?.status).toBe("blocked_for_human");
     expect(state.failure?.kind).toBe("ao_spawn_failed");
   });
+
+  it("releases the prepared lock when retry validation fails", async () => {
+    const workflowId = "WF-RETRY-MAX-ATTEMPTS";
+    const { manager } = await seedManager(workflowId, "failed", true, false, 3, 3);
+    await manager.restoreFromDisk();
+
+    await expect(manager.retry(`EXEC-${workflowId}`, "TASK-001"))
+      .rejects.toThrow("exceeded maxAttempts 3");
+
+    await expect(access(join(tempDir ?? "", workflowId, "execution.lock")))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("releases the prepared lock when mark completed validation fails", async () => {
+    const workflowId = "WF-MARK-COMPLETED-EMPTY";
+    const { manager } = await seedManager(workflowId, "failed", true);
+    await manager.restoreFromDisk();
+
+    await expect(manager.markCompleted(`EXEC-${workflowId}`, "TASK-001", ""))
+      .rejects.toThrow("rationale is required");
+
+    await expect(access(join(tempDir ?? "", workflowId, "execution.lock")))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
 });
 
 async function seedManager(
   workflowId: string,
   status: "running" | "stopped" | "failed",
   withActiveTask = false,
-  aoUnavailable = false
+  aoUnavailable = false,
+  attempt = 1,
+  maxAttempts = 3
 ) {
   tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-execution-jobs-"));
   const store = new ExecutionStateStore(tempDir);
@@ -130,8 +156,8 @@ async function seedManager(
         status: status === "failed" ? "blocked_for_human" : "working",
         aoRole: "backend-senior",
         aoSessionId: status === "failed" ? undefined : "session-TASK-001",
-        attempt: 1,
-        maxAttempts: 3,
+        attempt,
+        maxAttempts,
         startedAt: new Date().toISOString(),
         completedAt: null,
         failureReason: status === "failed" ? "AO session missing" : null,

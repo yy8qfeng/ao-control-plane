@@ -216,23 +216,33 @@ export class ExecutionJobManager {
   async retry(jobId: string, taskId: string): Promise<ExecutionJobSnapshot> {
     const job = this.requireJob(jobId);
     const ao = await this.prepareContinuation(job);
-    await retryExecutionTask({ store: this.input.store, workflowId: job.workflowId, taskId, actor: "user" });
-    this.startRunner(job, ao);
-    return this.getSnapshot(jobId);
+    try {
+      await retryExecutionTask({ store: this.input.store, workflowId: job.workflowId, taskId, actor: "user" });
+      this.startRunner(job, ao);
+      return this.getSnapshot(jobId);
+    } catch (error) {
+      await this.releasePreparedContinuation(job);
+      throw error;
+    }
   }
 
   async markCompleted(jobId: string, taskId: string, rationale: string): Promise<ExecutionJobSnapshot> {
     const job = this.requireJob(jobId);
     const ao = await this.prepareContinuation(job);
-    await markExecutionTaskCompleted({
-      store: this.input.store,
-      workflowId: job.workflowId,
-      taskId,
-      rationale,
-      actor: "user"
-    });
-    this.startRunner(job, ao);
-    return this.getSnapshot(jobId);
+    try {
+      await markExecutionTaskCompleted({
+        store: this.input.store,
+        workflowId: job.workflowId,
+        taskId,
+        rationale,
+        actor: "user"
+      });
+      this.startRunner(job, ao);
+      return this.getSnapshot(jobId);
+    } catch (error) {
+      await this.releasePreparedContinuation(job);
+      throw error;
+    }
   }
 
   async decideManualGate(jobId: string, taskId: string, input: {
@@ -241,18 +251,25 @@ export class ExecutionJobManager {
   }): Promise<ExecutionJobSnapshot> {
     const job = this.requireJob(jobId);
     const ao = input.decision === "approved" ? await this.prepareContinuation(job) : undefined;
-    await decideManualGate({
-      store: this.input.store,
-      workflowId: job.workflowId,
-      taskId,
-      decision: input.decision,
-      rationale: input.rationale,
-      actor: "user"
-    });
-    if (input.decision === "approved") {
-      this.startRunner(job, ao);
+    try {
+      await decideManualGate({
+        store: this.input.store,
+        workflowId: job.workflowId,
+        taskId,
+        decision: input.decision,
+        rationale: input.rationale,
+        actor: "user"
+      });
+      if (input.decision === "approved") {
+        this.startRunner(job, ao);
+      }
+      return this.getSnapshot(jobId);
+    } catch (error) {
+      if (input.decision === "approved") {
+        await this.releasePreparedContinuation(job);
+      }
+      throw error;
     }
-    return this.getSnapshot(jobId);
   }
 
   async requestRevision(jobId: string, request: PlanRevisionRequest): Promise<{
@@ -316,7 +333,12 @@ export class ExecutionJobManager {
 
   private async ensureRunner(job: ManagedExecutionJob): Promise<void> {
     const ao = await this.prepareContinuation(job);
-    this.startRunner(job, ao);
+    try {
+      this.startRunner(job, ao);
+    } catch (error) {
+      await this.releasePreparedContinuation(job);
+      throw error;
+    }
   }
 
   private async prepareContinuation(
@@ -326,7 +348,7 @@ export class ExecutionJobManager {
       return undefined;
     }
     const ao = this.input.createAo();
-    await this.ensureAoAvailable(ao);
+    await this.ensureAoAvailable(ao, job);
     job.lock ??= await acquireExecutionLock({
       artifactRoot: this.input.artifactRoot,
       workflowId: job.workflowId,
@@ -334,6 +356,15 @@ export class ExecutionJobManager {
       jobId: job.jobId
     });
     return ao;
+  }
+
+  private async releasePreparedContinuation(job: ManagedExecutionJob): Promise<void> {
+    if (job.runner || !job.lock) {
+      return;
+    }
+    await job.lock.release();
+    job.lock = undefined;
+    job.readonly = true;
   }
 
   private startRunner(
@@ -353,13 +384,17 @@ export class ExecutionJobManager {
     job.runner.start();
   }
 
-  private async ensureAoAvailable(ao: Pick<AoCliAdapter, "listSessions">): Promise<void> {
+  private async ensureAoAvailable(
+    ao: Pick<AoCliAdapter, "listSessions">,
+    job?: Pick<ManagedExecutionJob, "jobId" | "workflowId">
+  ): Promise<void> {
     try {
       await ao.listSessions();
     } catch (error) {
+      const context = job ? `workflowId=${job.workflowId}, jobId=${job.jobId}。` : "";
       throw httpError(
         503,
-        `AO 未启动或不可用，请先启动 AO 后再启动连续执行。原始错误：${formatErrorMessage(error)}`
+        `AO 未启动或不可用，请先启动 AO 后再启动连续执行。${context}原始错误：${formatErrorMessage(error)}`
       );
     }
   }
