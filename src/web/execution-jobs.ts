@@ -16,8 +16,12 @@ import {
   type ExecutionStateStore,
   summarizeExecutionState
 } from "../workflow/execution-state-store.js";
+import { normalizeAoSessions } from "../workflow/ao-status.js";
 import { acquireExecutionLock, type ExecutionLockHandle } from "../workflow/execution-lock.js";
 import { requestTaskPlanRevision, type PlanRevisionRequest } from "../workflow/task-plan-revision-review-loop.js";
+
+type ExecutionAoAdapter = Pick<AoCliAdapter, "spawnTask" | "listSessions"> &
+  Partial<Pick<AoCliAdapter, "validateDispatchPrerequisites">>;
 
 export interface ExecutionJobSnapshot {
   jobId: string;
@@ -62,14 +66,15 @@ export class ExecutionJobManager {
   constructor(private readonly input: {
     store: ExecutionStateStore;
     artifactRoot: string;
-    createAo: () => Pick<AoCliAdapter, "spawnTask" | "listSessions">;
+    createAo: () => ExecutionAoAdapter;
     createCodex?: () => CodexAdapter;
     createClaudeCode?: () => ClaudeCodeAdapter;
   }) {}
 
   async restoreFromDisk(): Promise<void> {
     const states = await this.input.store.scanStates();
-    for (const state of states) {
+    for (const scannedState of states) {
+      const state = await this.recoverFailedTaskCompletedByAoReport(scannedState);
       const jobId = this.getJobId(state.workflowId);
       if (state.status === "running") {
         try {
@@ -100,7 +105,9 @@ export class ExecutionJobManager {
     pollIntervalMs?: number;
     staleLockMs?: number;
   }): Promise<ExecutionJobSnapshot> {
-    const state = await this.input.store.ensureState(input.workflowId);
+    const state = await this.recoverFailedTaskCompletedByAoReport(
+      await this.input.store.ensureState(input.workflowId)
+    );
     if (state.status === "completed") {
       throw httpError(409, "Workflow execution is already completed");
     }
@@ -343,7 +350,7 @@ export class ExecutionJobManager {
 
   private async prepareContinuation(
     job: ManagedExecutionJob
-  ): Promise<Pick<AoCliAdapter, "spawnTask" | "listSessions"> | undefined> {
+  ): Promise<ExecutionAoAdapter | undefined> {
     if (job.runner) {
       return undefined;
     }
@@ -369,7 +376,7 @@ export class ExecutionJobManager {
 
   private startRunner(
     job: ManagedExecutionJob,
-    ao?: Pick<AoCliAdapter, "spawnTask" | "listSessions">
+    ao?: ExecutionAoAdapter
   ): void {
     if (job.runner) {
       job.runner.start();
@@ -385,18 +392,87 @@ export class ExecutionJobManager {
   }
 
   private async ensureAoAvailable(
-    ao: Pick<AoCliAdapter, "listSessions">,
+    ao: Pick<AoCliAdapter, "listSessions"> & Partial<Pick<AoCliAdapter, "validateDispatchPrerequisites">>,
     job?: Pick<ManagedExecutionJob, "jobId" | "workflowId">
   ): Promise<void> {
     try {
       await ao.listSessions();
+      await ao.validateDispatchPrerequisites?.();
     } catch (error) {
       const context = job ? `workflowId=${job.workflowId}, jobId=${job.jobId}。` : "";
+      const original = formatErrorMessage(error);
+      if (original.includes("GitHub CLI is not authenticated")) {
+        throw httpError(
+          503,
+          `GitHub CLI 未认证，AO 派发任务必须先完成 GitHub 集成。请运行 gh auth login，并用 gh auth status 确认成功。${context}原始错误：${original}`
+        );
+      }
       throw httpError(
         503,
-        `AO 未启动或不可用，请先启动 AO 后再启动连续执行。${context}原始错误：${formatErrorMessage(error)}`
+        `AO 未启动或不可用，请先启动 AO 后再启动连续执行。${context}原始错误：${original}`
       );
     }
+  }
+
+  private async recoverFailedTaskCompletedByAoReport(state: ExecutionState): Promise<ExecutionState> {
+    const taskId = state.failure?.taskId ?? state.currentTaskId ?? undefined;
+    if (state.status !== "failed" || !taskId) {
+      return state;
+    }
+    const task = state.taskStates[taskId];
+    if (!task?.aoSessionId) {
+      return state;
+    }
+
+    let sessions;
+    try {
+      sessions = normalizeAoSessions(await this.input.createAo().listSessions());
+    } catch {
+      return state;
+    }
+    const session = sessions.find((item) => item.id === task.aoSessionId);
+    if (session?.status !== "completed") {
+      return state;
+    }
+
+    const recovered = await this.input.store.update(state.workflowId, (current) => {
+      const currentTask = current.taskStates[taskId];
+      if (current.status !== "failed" || !currentTask) {
+        return current;
+      }
+      return {
+        ...current,
+        status: "running",
+        currentTaskId: null,
+        failure: null,
+        taskStates: {
+          ...current.taskStates,
+          [taskId]: {
+            ...currentTask,
+            status: "completed",
+            completedAt: currentTask.completedAt ?? new Date().toISOString(),
+            failureReason: null,
+            statusObservations: [
+              ...(currentTask.statusObservations ?? []),
+              {
+                attempt: currentTask.attempt,
+                status: "completed",
+                observedAt: new Date().toISOString()
+              }
+            ].slice(-5)
+          }
+        }
+      };
+    }) as ExecutionState;
+    await this.input.store.appendLog(state.workflowId, {
+      type: "task_completed_from_ao_report",
+      taskId,
+      attempt: recovered.taskStates[taskId]?.attempt ?? 0,
+      actor: "runner",
+      aoSessionId: task.aoSessionId,
+      reportedState: session.reportedState ?? "completed"
+    });
+    return recovered;
   }
 }
 

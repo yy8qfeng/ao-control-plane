@@ -97,13 +97,55 @@ describe("ExecutionJobManager", () => {
     expect(state.failure?.kind).toBe("ao_spawn_failed");
   });
 
+  it("recovers a failed task when AO status carries an accepted completed report", async () => {
+    const workflowId = "WF-RECOVER-AO-REPORT";
+    const { manager, store } = await seedManager(workflowId, "failed", true, false, 4, 3, [
+      {
+        name: "session-TASK-001",
+        status: "stuck",
+        reports: [
+          {
+            reportState: "completed",
+            accepted: true
+          }
+        ]
+      }
+    ]);
+    await store.update(workflowId, (state) => ({
+      ...state,
+      taskStates: {
+        ...state.taskStates,
+        "TASK-001": {
+          ...state.taskStates["TASK-001"]!,
+          aoSessionId: "session-TASK-001"
+        }
+      }
+    }));
+
+    await manager.restoreFromDisk();
+
+    const snapshot = await waitForSnapshotStatus(manager, `EXEC-${workflowId}`, "completed");
+    expect(snapshot.status).toBe("completed");
+    expect(snapshot.tasks?.[0]?.status).toBe("completed");
+    await expect(store.readLogs(workflowId)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "task_completed_from_ao_report",
+          taskId: "TASK-001",
+          aoSessionId: "session-TASK-001"
+        })
+      ])
+    );
+  });
+
+
   it("releases the prepared lock when retry validation fails", async () => {
-    const workflowId = "WF-RETRY-MAX-ATTEMPTS";
+    const workflowId = "WF-RETRY-UNKNOWN-TASK";
     const { manager } = await seedManager(workflowId, "failed", true, false, 3, 3);
     await manager.restoreFromDisk();
 
-    await expect(manager.retry(`EXEC-${workflowId}`, "TASK-001"))
-      .rejects.toThrow("exceeded maxAttempts 3");
+    await expect(manager.retry(`EXEC-${workflowId}`, "TASK-404"))
+      .rejects.toThrow("Task TASK-404 is not retryable");
 
     await expect(access(join(tempDir ?? "", workflowId, "execution.lock")))
       .rejects.toMatchObject({ code: "ENOENT" });
@@ -128,7 +170,8 @@ async function seedManager(
   withActiveTask = false,
   aoUnavailable = false,
   attempt = 1,
-  maxAttempts = 3
+  maxAttempts = 3,
+  aoSessions: unknown[] = []
 ) {
   tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-execution-jobs-"));
   const store = new ExecutionStateStore(tempDir);
@@ -178,11 +221,24 @@ async function seedManager(
         if (aoUnavailable) {
           throw new Error("ao daemon is offline");
         }
-        return { sessions: [] };
+        return { data: aoSessions };
       }
     })
   });
   return { manager, store };
+}
+
+async function waitForSnapshotStatus(
+  manager: ExecutionJobManager,
+  jobId: string,
+  status: string
+) {
+  let snapshot = await manager.getSnapshot(jobId);
+  for (let attempt = 0; attempt < 20 && snapshot.status !== status; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    snapshot = await manager.getSnapshot(jobId);
+  }
+  return snapshot;
 }
 
 function createPlan(workflowId: string): TaskPlan {

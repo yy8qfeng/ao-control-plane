@@ -91,6 +91,64 @@ describe("ContinuousExecutionRunner", () => {
     expect(state.taskStates["TASK-001"]?.statusObservations).toHaveLength(2);
   });
 
+  it("completes a working task when AO reports completed while the session is idle", async () => {
+    const workflowId = "WF-IDLE-REPORT-COMPLETED";
+    const { store } = await seedPlan(createPlan(workflowId, [createTask(workflowId, "TASK-001")]));
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "running",
+      currentTaskId: "TASK-001",
+      taskStates: {
+        "TASK-001": {
+          taskId: "TASK-001",
+          status: "working",
+          aoRole: "architect",
+          aoSessionId: "ft-1",
+          attempt: 1,
+          maxAttempts: 3,
+          startedAt: new Date().toISOString(),
+          completedAt: null,
+          failureReason: null,
+          statusObservations: []
+        }
+      }
+    }));
+    const runner = new ContinuousExecutionRunner({
+      workflowId,
+      store,
+      ao: {
+        async spawnTask() {
+          throw new Error("spawnTask should not be called");
+        },
+        async listSessions() {
+          return {
+            data: [
+              {
+                name: "ft-1",
+                status: "idle",
+                reports: [
+                  {
+                    reportState: "completed",
+                    accepted: true
+                  }
+                ]
+              }
+            ]
+          };
+        }
+      },
+      pollIntervalMs: 1,
+      maxTicks: 2
+    });
+
+    await runner.run();
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("completed");
+    expect(state.taskStates["TASK-001"]?.status).toBe("completed");
+    expect(state.taskStates["TASK-001"]?.statusObservations?.at(-1)?.status).toBe("completed");
+  });
+
   it("records stopped state without polluting failure", async () => {
     const workflowId = "WF-STOP";
     const { store } = await seedPlan(createPlan(workflowId, [createTask(workflowId, "TASK-001")]));
@@ -174,6 +232,38 @@ describe("ContinuousExecutionRunner", () => {
         })
       ])
     );
+  });
+
+  it("marks task blocked when AO spawn throws before returning a session", async () => {
+    const workflowId = "WF-SPAWN-THROWS";
+    const { store } = await seedPlan(createPlan(workflowId, [createTask(workflowId, "TASK-001")]));
+    const runner = new ContinuousExecutionRunner({
+      workflowId,
+      store,
+      ao: {
+        async spawnTask() {
+          throw new Error("GitHub CLI is not authenticated");
+        },
+        async listSessions() {
+          return { sessions: [] };
+        }
+      },
+      pollIntervalMs: 1,
+      maxTicks: 1
+    });
+
+    await runner.run();
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("failed");
+    expect(state.failure).toMatchObject({
+      kind: "ao_spawn_failed",
+      taskId: "TASK-001",
+      message: "GitHub CLI is not authenticated"
+    });
+    expect(state.pendingDispatch).toBeNull();
+    expect(state.taskStates["TASK-001"]?.status).toBe("blocked_for_human");
+    expect(state.taskStates["TASK-001"]?.failureReason).toBe("ao_spawn_failed");
   });
 
   it("fails restored working task when no session id or matching AO session exists", async () => {
@@ -346,7 +436,7 @@ describe("ContinuousExecutionRunner", () => {
     });
   });
 
-  it("rejects retry when attempt already reached maxAttempts", async () => {
+  it("allows retry even when attempt already reached the previous maxAttempts value", async () => {
     const workflowId = "WF-RETRY-MAX";
     const { store } = await seedPlan(createPlan(workflowId, [createTask(workflowId, "TASK-001")]));
     await store.update(workflowId, (state) => ({
@@ -363,8 +453,44 @@ describe("ContinuousExecutionRunner", () => {
       }
     }));
 
-    await expect(retryExecutionTask({ store, workflowId, taskId: "TASK-001" }))
-      .rejects.toThrow("exceeded maxAttempts 3");
+    await retryExecutionTask({ store, workflowId, taskId: "TASK-001" });
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("running");
+    expect(state.taskStates["TASK-001"]?.status).toBe("pending");
+    expect(state.failure).toBeNull();
+  });
+
+  it("allows retry for legacy failed spawn states whose task is still pending", async () => {
+    const workflowId = "WF-RETRY-LEGACY-PENDING";
+    const { store } = await seedPlan(createPlan(workflowId, [createTask(workflowId, "TASK-001")]));
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "failed",
+      currentTaskId: "TASK-001",
+      failure: {
+        taskId: "TASK-001",
+        kind: "ao_spawn_failed",
+        message: "GitHub CLI is not authenticated",
+        occurredAt: new Date().toISOString()
+      },
+      taskStates: {
+        "TASK-001": {
+          taskId: "TASK-001",
+          status: "pending",
+          aoRole: "backend-senior",
+          attempt: 3,
+          maxAttempts: 3
+        }
+      }
+    }));
+
+    await retryExecutionTask({ store, workflowId, taskId: "TASK-001" });
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("running");
+    expect(state.taskStates["TASK-001"]?.status).toBe("pending");
+    expect(state.failure).toBeNull();
   });
 });
 

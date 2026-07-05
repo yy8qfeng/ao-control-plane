@@ -5,6 +5,7 @@ export interface AoSessionSnapshot {
   id: string;
   role?: string;
   status?: string;
+  reportedState?: string;
   prompt?: string;
   createdAt?: string;
   displayName?: string;
@@ -40,20 +41,26 @@ export function normalizeAoSessions(value: unknown): AoSessionSnapshot[] {
     ? value
     : isRecord(value) && Array.isArray(value.sessions)
       ? value.sessions
+      : isRecord(value) && Array.isArray(value.data)
+        ? value.data
       : [];
 
-  return rawSessions.filter(isRecord).map((session) => ({
-    id: readString(session, ["id", "sessionId"]) ?? "",
-    role: readString(session, ["role"]),
-    status: readString(session, ["status", "state"]),
-    prompt: readString(session, ["prompt"]),
-    createdAt: readString(session, ["createdAt", "created_at"]),
-    displayName: readString(session, ["displayName", "display_name", "name"]),
-    branch: readString(session, ["branch"]),
-    prUrl: readString(session, ["prUrl", "pr_url"]),
-    ciStatus: readString(session, ["ciStatus", "ci_status"]),
-    reviewStatus: readString(session, ["reviewStatus", "review_status"])
-  }));
+  return rawSessions.filter(isRecord).map((session) => {
+    const reportedState = readLatestAcceptedReportState(session);
+    return {
+      id: readString(session, ["id", "sessionId", "name"]) ?? "",
+      role: readString(session, ["role"]),
+      status: reportedState === "completed" ? "completed" : readString(session, ["status", "state"]),
+      reportedState,
+      prompt: readString(session, ["prompt"]),
+      createdAt: readString(session, ["createdAt", "created_at"]),
+      displayName: readString(session, ["displayName", "display_name", "name"]),
+      branch: readString(session, ["branch"]),
+      prUrl: readString(session, ["prUrl", "pr_url"]),
+      ciStatus: readString(session, ["ciStatus", "ci_status"]),
+      reviewStatus: readString(session, ["reviewStatus", "review_status"])
+    };
+  });
 }
 
 export function reconcileTaskSessions(input: {
@@ -104,6 +111,7 @@ export function getAoSessionSnapshotKeys(): string[] {
     "id",
     "prUrl",
     "prompt",
+    "reportedState",
     "reviewStatus",
     "role",
     "status"
@@ -151,6 +159,44 @@ function readString(record: Record<string, unknown>, keys: string[]): string | u
     }
   }
   return undefined;
+}
+
+function readLatestAcceptedReportState(session: Record<string, unknown>): string | undefined {
+  const reports = session.reports;
+  if (!Array.isArray(reports)) {
+    return undefined;
+  }
+  const latestAccepted = findLatestAcceptedReport(reports);
+  return latestAccepted ? readString(latestAccepted, ["reportState", "state"]) : undefined;
+}
+
+function findLatestAcceptedReport(reports: unknown[]): Record<string, unknown> | undefined {
+  let latestReport: Record<string, unknown> | undefined;
+  let latestTimestamp = Number.NEGATIVE_INFINITY;
+
+  for (const report of reports) {
+    if (!isRecord(report) || report.accepted !== true) {
+      continue;
+    }
+
+    const timestamp = readReportTimestamp(report);
+    if (!latestReport || timestamp >= latestTimestamp) {
+      latestReport = report;
+      latestTimestamp = timestamp;
+    }
+  }
+
+  return latestReport;
+}
+
+function readReportTimestamp(report: Record<string, unknown>): number {
+  const timestamp = readString(report, ["timestamp", "createdAt", "created_at", "updatedAt", "updated_at"]);
+  if (!timestamp) {
+    return Number.NEGATIVE_INFINITY;
+  }
+
+  const value = Date.parse(timestamp);
+  return Number.isNaN(value) ? Number.NEGATIVE_INFINITY : value;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

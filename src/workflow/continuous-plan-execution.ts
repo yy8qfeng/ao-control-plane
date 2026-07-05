@@ -277,17 +277,38 @@ export class ContinuousExecutionRunner {
     try {
       spawnResult = await this.options.ao.spawnTask(task);
     } catch (error) {
-      await this.options.store.failState(this.options.workflowId, {
-        kind: "ao_spawn_failed",
-        taskId: task.taskId,
-        message: error instanceof Error ? error.message : String(error)
+      const message = error instanceof Error ? error.message : String(error);
+      await this.options.store.update(this.options.workflowId, (current) => {
+        const attempt = current.pendingDispatch?.attempt ?? current.taskStates[task.taskId]?.attempt ?? 1;
+        return failCurrentState({
+          ...current,
+          currentTaskId: task.taskId,
+          pendingDispatch: null,
+          taskStates: {
+            ...current.taskStates,
+            [task.taskId]: {
+              ...(current.taskStates[task.taskId] ?? createTaskState(task, attempt)),
+              status: "blocked_for_human",
+              aoRole: task.aoRole,
+              attempt,
+              startedAt: new Date().toISOString(),
+              completedAt: null,
+              failureReason: "ao_spawn_failed",
+              statusObservations: []
+            }
+          }
+        }, {
+          kind: "ao_spawn_failed",
+          taskId: task.taskId,
+          message
+        });
       });
       await this.options.store.appendLog(this.options.workflowId, {
         type: "task_dispatch_failed",
         taskId: task.taskId,
         attempt: 0,
         actor: "runner",
-        error: error instanceof Error ? error.message : String(error)
+        error: message
       });
       return;
     }
@@ -522,11 +543,13 @@ export async function retryExecutionTask(input: {
 }): Promise<ExecutionState> {
   const state = await input.store.update(input.workflowId, (current) => {
     const task = current.taskStates[input.taskId];
-    if (!task || (task.status !== "blocked_for_human" && task.status !== "failed")) {
+    const retryableFailedDispatch =
+      current.status === "failed" &&
+      current.failure?.taskId === input.taskId &&
+      current.failure.kind === "ao_spawn_failed" &&
+      task?.status === "pending";
+    if (!task || (task.status !== "blocked_for_human" && task.status !== "failed" && !retryableFailedDispatch)) {
       throw new Error(`Task ${input.taskId} is not retryable`);
-    }
-    if (task.attempt >= task.maxAttempts) {
-      throw new Error(`Task ${input.taskId} exceeded maxAttempts ${task.maxAttempts}`);
     }
     return {
       ...current,

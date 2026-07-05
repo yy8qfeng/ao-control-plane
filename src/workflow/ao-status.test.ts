@@ -40,6 +40,7 @@ describe("AO status collector helpers", () => {
         "id",
         "prUrl",
         "prompt",
+        "reportedState",
         "reviewStatus",
         "role",
         "status",
@@ -67,6 +68,140 @@ describe("AO status collector helpers", () => {
         status: "completed"
       }
     ]);
+  });
+
+  it("normalizes AO CLI session ls data envelope", () => {
+    const sessions = normalizeAoSessions({
+      data: [
+        {
+          id: "ft-1",
+          role: "worker",
+          status: "spawning",
+          branch: "session/ft-1",
+          lastActivityAt: "2026-07-05T10:00:00.000Z"
+        }
+      ],
+      meta: { hiddenTerminatedCount: 0 }
+    });
+
+    expect(sessions).toEqual([
+      {
+        id: "ft-1",
+        role: "worker",
+        status: "spawning",
+        branch: "session/ft-1",
+        createdAt: undefined,
+        displayName: undefined,
+        prompt: undefined,
+        reportedState: undefined,
+        prUrl: undefined,
+        ciStatus: undefined,
+        reviewStatus: undefined
+      }
+    ]);
+  });
+
+  it("treats accepted AO completed reports as task completion even when the session is idle", () => {
+    const sessions = normalizeAoSessions({
+      data: [
+        {
+          name: "ft-1",
+          role: "worker",
+          status: "idle",
+          branch: "session/ft-1",
+          reports: [
+            {
+              reportState: "completed",
+              accepted: true,
+              timestamp: "2026-07-05T14:39:36.016Z"
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(sessions[0]).toMatchObject({
+      id: "ft-1",
+      displayName: "ft-1",
+      status: "completed",
+      reportedState: "completed"
+    });
+    expect(
+      reconcileTaskSessions({
+        plan: {
+          ...plan,
+          tasks: [
+            {
+              ...plan.tasks[0],
+              aoSessionId: "ft-1"
+            }
+          ]
+        },
+        sessions
+      })
+    ).toEqual([
+      {
+        taskId: "TASK-001",
+        aoSessionId: "ft-1",
+        status: "completed"
+      }
+    ]);
+  });
+
+  it("uses the newest accepted AO report when reports arrive in chronological order", () => {
+    const sessions = normalizeAoSessions({
+      data: [
+        {
+          name: "ft-1",
+          status: "idle",
+          reports: [
+            {
+              reportState: "failed",
+              accepted: true,
+              timestamp: "2026-07-05T14:30:00.000Z"
+            },
+            {
+              reportState: "completed",
+              accepted: true,
+              timestamp: "2026-07-05T14:39:36.016Z"
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(sessions[0]).toMatchObject({
+      id: "ft-1",
+      status: "completed",
+      reportedState: "completed"
+    });
+  });
+
+  it("falls back to the last accepted AO report when report timestamps are absent", () => {
+    const sessions = normalizeAoSessions({
+      data: [
+        {
+          name: "ft-1",
+          status: "idle",
+          reports: [
+            {
+              reportState: "needs_input",
+              accepted: true
+            },
+            {
+              reportState: "completed",
+              accepted: true
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(sessions[0]).toMatchObject({
+      id: "ft-1",
+      status: "completed",
+      reportedState: "completed"
+    });
   });
 
   it("does not match task prefixes in the middle of unrelated session text", () => {

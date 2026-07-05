@@ -26,6 +26,23 @@ export class AoCliAdapter {
 
   constructor(private readonly options: AoAdapterOptions = {}) {}
 
+  async validateDispatchPrerequisites(): Promise<void> {
+    if (this.options.dryRun) {
+      return;
+    }
+
+    const result = await execa("gh", ["auth", "status"], {
+      cwd: this.options.projectRoot,
+      reject: false
+    });
+
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `GitHub CLI is not authenticated; AO dispatch requires GitHub integration. Run "gh auth login", then verify with "gh auth status". ${formatAoOutput(result)}`
+      );
+    }
+  }
+
   async spawnTask(task: ExecutionTask): Promise<AoSpawnResult> {
     const args = buildSpawnArgs(task);
 
@@ -45,10 +62,16 @@ export class AoCliAdapter {
       };
     }
 
+    await this.validateDispatchPrerequisites();
+
     const result = await execa("ao", args, {
       cwd: this.options.projectRoot,
       reject: false
     });
+
+    if (result.exitCode !== 0) {
+      throw new Error(`AO spawn failed with exit code ${result.exitCode}: ${formatAoOutput(result)}`);
+    }
 
     return {
       sessionId: parseSessionId(result.stdout),
@@ -62,7 +85,7 @@ export class AoCliAdapter {
       return { sessions: this.dryRunSessions };
     }
 
-    const args = ["session", "ls", "--json", "--include-terminated"];
+    const args = ["status", "--json", "--reports", "full"];
     if (this.options.projectId) {
       args.push("--project", this.options.projectId);
     }
@@ -89,6 +112,26 @@ export function buildSpawnArgs(task: ExecutionTask): string[] {
 export function parseSessionId(stdout: string): string | undefined {
   const match = stdout.match(/SESSION=([^\s]+)/);
   return match?.[1];
+}
+
+function formatAoOutput(result: { stdout?: string; stderr?: string }): string {
+  const stderr = result.stderr?.trim();
+  const stdout = result.stdout?.trim();
+  const output = [stderr, stdout].filter(Boolean).join("\n").trim();
+  if (!output) {
+    return "no output";
+  }
+
+  const actionable = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) =>
+      line.startsWith("✗ ") ||
+      line.includes("GitHub CLI is not authenticated") ||
+      line.includes("AO is not running")
+    );
+
+  return actionable.length > 0 ? actionable.join("\n") : output;
 }
 
 function assertNoConcreteAgentFields(task: ExecutionTask): void {

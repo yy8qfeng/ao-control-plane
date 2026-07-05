@@ -1199,7 +1199,7 @@ export function renderIndexHtml(): string {
           "任务状态：" + activeTask.status,
           "AO 角色：" + (activeTask.aoRole || "-"),
           "AO session：" + (activeTask.aoSessionId || "尚未拿到 sessionId，正在按任务前缀从 AO 会话列表追踪"),
-          "尝试次数：" + Number(activeTask.attempt || 0) + " / " + Number(activeTask.maxAttempts || 0)
+          "尝试次数：" + Number(activeTask.attempt || 0) + "（不限）"
         );
         const latestObservation = (activeTask.statusObservations || []).at(-1);
         if (latestObservation) {
@@ -1425,8 +1425,13 @@ export function renderIndexHtml(): string {
     }
 
     function canRetryExecutionTask() {
+      const taskId = getRecoverableExecutionTaskId();
       const taskStatus = state.execution?.activeTask?.status;
-      return canRecoverExecutionTask() && (taskStatus === "blocked_for_human" || taskStatus === "failed");
+      const failedDuringDispatch =
+        state.execution?.status === "failed" &&
+        state.execution?.failure?.taskId === taskId &&
+        state.execution?.failure?.kind === "ao_spawn_failed";
+      return canRecoverExecutionTask() && (taskStatus === "blocked_for_human" || taskStatus === "failed" || failedDuringDispatch);
     }
 
     function getExecutionRecoveryButtonTitle(action) {
@@ -1435,7 +1440,7 @@ export function renderIndexHtml(): string {
       if (action === "retry") {
         return canRetryExecutionTask()
           ? "重新派发当前任务 " + taskId + "。"
-          : "只有 failed 或 blocked_for_human 任务可以重试。";
+          : "只有 failed、blocked_for_human 或派发失败的任务可以重试。";
       }
       if (action === "mark-completed") return "人工确认当前任务 " + taskId + " 已完成，并继续后续任务。";
       return "基于当前任务 " + taskId + " 请求修复任务计划。";
