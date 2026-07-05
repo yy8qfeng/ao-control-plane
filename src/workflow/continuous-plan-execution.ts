@@ -292,6 +292,49 @@ export class ContinuousExecutionRunner {
       return;
     }
 
+    if (!spawnResult.sessionId) {
+      const committed = await this.options.store.update<boolean>(this.options.workflowId, (current) => {
+        if (current.pendingDispatch?.dispatchId !== dispatchId || current.pendingDispatch.taskId !== task.taskId || current.status !== "running") {
+          return { state: current, value: false };
+        }
+        const attempt = current.pendingDispatch.attempt;
+        return {
+          state: failCurrentState({
+            ...current,
+            currentTaskId: task.taskId,
+            pendingDispatch: null,
+            taskStates: {
+              ...current.taskStates,
+              [task.taskId]: {
+                ...(current.taskStates[task.taskId] ?? createTaskState(task, attempt)),
+                status: "blocked_for_human",
+                aoRole: task.aoRole,
+                attempt,
+                startedAt: new Date().toISOString(),
+                completedAt: null,
+                failureReason: "ao_session_missing",
+                statusObservations: []
+              }
+            }
+          }, {
+            kind: "ao_spawn_failed",
+            taskId: task.taskId,
+            message: "AO spawn did not return a sessionId; execution is interrupted for manual recovery"
+          }),
+          value: true
+        };
+      }) as boolean;
+      await this.options.store.appendLog(this.options.workflowId, {
+        type: committed ? "task_dispatch_missing_session" : "task_dispatch_orphaned",
+        taskId: task.taskId,
+        attempt: 0,
+        actor: "runner",
+        dispatchId,
+        error: "AO spawn did not return a sessionId"
+      });
+      return;
+    }
+
     const committed = await this.options.store.update<boolean>(this.options.workflowId, (current) => {
       if (current.pendingDispatch?.dispatchId !== dispatchId || current.pendingDispatch.taskId !== task.taskId || current.status !== "running") {
         return { state: current, value: false };
@@ -363,6 +406,7 @@ export class ContinuousExecutionRunner {
       return;
     }
 
+    const missingSessionTaskIds: string[] = [];
     await this.options.store.update(this.options.workflowId, (current) => {
       let next = current;
       for (const taskState of working) {
@@ -371,6 +415,29 @@ export class ContinuousExecutionRunner {
           continue;
         }
         const session = findSessionForTaskState(taskState, planTask, sessions);
+        if (!session && !taskState.aoSessionId) {
+          missingSessionTaskIds.push(taskState.taskId);
+          next = failCurrentState({
+            ...next,
+            currentTaskId: taskState.taskId,
+            taskStates: {
+              ...next.taskStates,
+              [taskState.taskId]: {
+                ...taskState,
+                status: "blocked_for_human",
+                failureReason: "ao_session_missing"
+              }
+            }
+          }, {
+            kind: "ao_spawn_failed",
+            taskId: taskState.taskId,
+            message: `Working task ${taskState.taskId} has no aoSessionId and no matching AO session; execution is interrupted for manual recovery`
+          });
+          break;
+        }
+        if (session?.id && !taskState.aoSessionId) {
+          next = attachAoSessionId(next, taskState.taskId, session.id);
+        }
         const status = session?.status;
         if (!status) {
           continue;
@@ -379,6 +446,15 @@ export class ContinuousExecutionRunner {
       }
       return next;
     });
+    for (const taskId of missingSessionTaskIds) {
+      await this.options.store.appendLog(this.options.workflowId, {
+        type: "task_execution_missing_session",
+        taskId,
+        attempt: state.taskStates[taskId]?.attempt ?? 0,
+        actor: "runner",
+        error: "Working task has no aoSessionId and no matching AO session"
+      });
+    }
   }
 
   private async finishIfTerminal(plan: TaskPlan): Promise<ContinuousExecutionTickResult | undefined> {
@@ -651,6 +727,23 @@ function applyAoStatusObservation(
       [taskId]: {
         ...task,
         statusObservations: observations
+      }
+    }
+  };
+}
+
+function attachAoSessionId(state: ExecutionState, taskId: string, aoSessionId: string): ExecutionState {
+  const task = state.taskStates[taskId];
+  if (!task) {
+    return state;
+  }
+  return {
+    ...state,
+    taskStates: {
+      ...state.taskStates,
+      [taskId]: {
+        ...task,
+        aoSessionId
       }
     }
   };

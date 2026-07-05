@@ -137,6 +137,94 @@ describe("ContinuousExecutionRunner", () => {
     );
   });
 
+  it("fails dispatch when AO spawn returns no session id", async () => {
+    const workflowId = "WF-MISSING-SPAWN-SESSION";
+    const { store } = await seedPlan(createPlan(workflowId, [createTask(workflowId, "TASK-001")]));
+    const runner = new ContinuousExecutionRunner({
+      workflowId,
+      store,
+      ao: {
+        async spawnTask() {
+          return { stdout: "spawned without session marker", stderr: "" };
+        },
+        async listSessions() {
+          return { sessions: [] };
+        }
+      },
+      pollIntervalMs: 1,
+      maxTicks: 1
+    });
+
+    await runner.run();
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("failed");
+    expect(state.failure).toMatchObject({
+      kind: "ao_spawn_failed",
+      taskId: "TASK-001"
+    });
+    expect(state.pendingDispatch).toBeNull();
+    expect(state.taskStates["TASK-001"]?.status).toBe("blocked_for_human");
+    expect(state.taskStates["TASK-001"]?.aoSessionId).toBeUndefined();
+    await expect(store.readLogs(workflowId)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "task_dispatch_missing_session",
+          taskId: "TASK-001"
+        })
+      ])
+    );
+  });
+
+  it("fails restored working task when no session id or matching AO session exists", async () => {
+    const workflowId = "WF-MISSING-RESTORED-SESSION";
+    const { store } = await seedPlan(createPlan(workflowId, [createTask(workflowId, "TASK-001")]));
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "running",
+      currentTaskId: "TASK-001",
+      taskStates: {
+        "TASK-001": {
+          taskId: "TASK-001",
+          status: "working",
+          aoRole: "backend-senior",
+          attempt: 1,
+          maxAttempts: 3,
+          startedAt: new Date().toISOString(),
+          completedAt: null,
+          failureReason: null,
+          statusObservations: []
+        }
+      }
+    }));
+    const runner = new ContinuousExecutionRunner({
+      workflowId,
+      store,
+      ao: createListOnlyAo([]) as Pick<AoCliAdapter, "spawnTask" | "listSessions">,
+      pollIntervalMs: 1,
+      maxTicks: 1
+    });
+
+    await runner.run();
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("failed");
+    expect(state.failure).toMatchObject({
+      kind: "ao_spawn_failed",
+      taskId: "TASK-001"
+    });
+    expect(state.taskStates["TASK-001"]?.status).toBe("blocked_for_human");
+    expect(state.taskStates["TASK-001"]?.failureReason).toBe("ao_session_missing");
+    await expect(store.readLogs(workflowId)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "task_execution_missing_session",
+          taskId: "TASK-001"
+        })
+      ])
+    );
+  });
+
   it("recovers pendingDispatch by matching an orphan AO session", async () => {
     const workflowId = "WF-PENDING-RECOVER";
     const { store } = await seedPlan(createPlan(workflowId, [createTask(workflowId, "TASK-001")]));

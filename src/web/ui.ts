@@ -373,6 +373,9 @@ export function renderIndexHtml(): string {
           <button id="clearDraftButton" class="secondary" type="button">清空草稿</button>
           <button id="planButton" class="secondary" type="button" disabled>继续审查任务计划</button>
           <button id="executeButton" class="secondary" type="button" disabled>启动连续执行</button>
+          <button id="retryExecutionTaskButton" class="secondary" type="button" disabled title="连续执行中断后，可重试当前失败任务。">重试任务</button>
+          <button id="markExecutionTaskCompletedButton" class="secondary" type="button" disabled title="连续执行中断后，可人工确认当前任务已完成。">人工确认完成</button>
+          <button id="requestExecutionRevisionButton" class="secondary" type="button" disabled title="连续执行中断后，可要求修复任务计划并继续。">重规划</button>
           <button id="releaseManualGateButton" class="secondary" type="button" disabled title="启动连续执行后，调度器会在需要人工门禁时暂停。">放行门禁</button>
           <button id="replanManualGateButton" class="secondary" type="button" disabled title="启动连续执行后，调度器会在需要人工门禁时暂停。">要求重规划</button>
           <button id="blockManualGateButton" class="secondary" type="button" disabled title="启动连续执行后，调度器会在需要人工门禁时暂停。">标记阻断</button>
@@ -438,6 +441,9 @@ export function renderIndexHtml(): string {
     const clearDraftButton = document.querySelector("#clearDraftButton");
     const planButton = document.querySelector("#planButton");
     const executeButton = document.querySelector("#executeButton");
+    const retryExecutionTaskButton = document.querySelector("#retryExecutionTaskButton");
+    const markExecutionTaskCompletedButton = document.querySelector("#markExecutionTaskCompletedButton");
+    const requestExecutionRevisionButton = document.querySelector("#requestExecutionRevisionButton");
     const releaseManualGateButton = document.querySelector("#releaseManualGateButton");
     const replanManualGateButton = document.querySelector("#replanManualGateButton");
     const blockManualGateButton = document.querySelector("#blockManualGateButton");
@@ -607,6 +613,29 @@ export function renderIndexHtml(): string {
     executeButton.addEventListener("click", async () => {
       if (!confirm("即将启动连续执行，调度器会按任务顺序和依赖关系持续派发 AO 任务，是否继续？")) return;
       await startContinuousExecution("正在启动连续执行...");
+    });
+
+    retryExecutionTaskButton.addEventListener("click", async () => {
+      const taskId = getRecoverableExecutionTaskId();
+      if (!taskId) return;
+      if (!confirm("确认重试当前任务 " + taskId + "？调度器会重新派发该任务。")) return;
+      await submitExecutionRecovery("retry", "正在重试任务...");
+    });
+
+    markExecutionTaskCompletedButton.addEventListener("click", async () => {
+      const taskId = getRecoverableExecutionTaskId();
+      if (!taskId) return;
+      const rationale = prompt("请输入人工确认完成原因，调度器会跳过该任务并继续后续任务。", "已人工核验任务结果符合验收标准");
+      if (!rationale || !rationale.trim()) return;
+      await submitExecutionRecovery("mark-completed", "正在人工确认任务完成...", rationale.trim());
+    });
+
+    requestExecutionRevisionButton.addEventListener("click", async () => {
+      const taskId = getRecoverableExecutionTaskId();
+      if (!taskId) return;
+      const rationale = prompt("请输入重规划原因，系统会基于当前失败点修复任务计划。", getDefaultRevisionRationale());
+      if (!rationale || !rationale.trim()) return;
+      await submitExecutionRecovery("request-revision", "正在提交重规划请求...", rationale.trim());
     });
 
     releaseManualGateButton.addEventListener("click", async () => {
@@ -956,6 +985,7 @@ export function renderIndexHtml(): string {
         state.job = null;
         updateSummary();
         renderActiveTab();
+        await loadExecutionSnapshot(workflowId, projectRoot, false);
       } catch (error) {
         state.result = null;
         updateSummary();
@@ -1011,7 +1041,13 @@ export function renderIndexHtml(): string {
       deleteDraftButton.disabled = busy || !state.requirementDrafts.length;
       planButton.disabled = busy || !canReviewTaskPlan(state.result);
       planButton.title = getPlanButtonTitle(busy, state.result);
-      executeButton.disabled = busy || state.result?.workflow?.status !== "executing" || !state.result?.plan;
+      executeButton.disabled = busy || !canStartContinuousExecution();
+      retryExecutionTaskButton.disabled = busy || !canRetryExecutionTask();
+      retryExecutionTaskButton.title = getExecutionRecoveryButtonTitle("retry");
+      markExecutionTaskCompletedButton.disabled = busy || !canRecoverExecutionTask();
+      markExecutionTaskCompletedButton.title = getExecutionRecoveryButtonTitle("mark-completed");
+      requestExecutionRevisionButton.disabled = busy || !canRecoverExecutionTask();
+      requestExecutionRevisionButton.title = getExecutionRecoveryButtonTitle("request-revision");
       releaseManualGateButton.disabled = busy || getManualGateBlockedTaskIds().length === 0;
       releaseManualGateButton.title = getReleaseManualGateButtonTitle();
       replanManualGateButton.disabled = busy || getManualGateBlockedTaskIds().length === 0;
@@ -1042,8 +1078,9 @@ export function renderIndexHtml(): string {
       const result = state.result;
       const job = state.job;
       const running = job?.status === "running";
+      const executionRunning = ["running", "waiting_manual_gate", "paused_for_replan"].includes(state.execution?.status);
       document.querySelector("#workflowId").textContent = result?.workflow?.workflowId || job?.result?.workflow?.workflowId || state.workflowId || "未生成";
-      document.querySelector("#workflowStatus").textContent = job?.currentStep || result?.workflow?.status || job?.status || "-";
+      document.querySelector("#workflowStatus").textContent = job?.currentStep || (state.execution ? "连续执行：" + state.execution.status : "") || result?.workflow?.status || job?.status || "-";
       document.querySelector("#reviewCount").textContent = String(result?.reviews?.length || job?.reviews?.length || 0);
       document.querySelector("#taskCount").textContent = formatTaskCount();
       document.querySelector("#elapsedSeconds").textContent = String(job?.elapsedSeconds || 0) + "s";
@@ -1055,7 +1092,13 @@ export function renderIndexHtml(): string {
       deleteDraftButton.disabled = running || !state.requirementDrafts.length;
       planButton.disabled = running || !canReviewTaskPlan(result);
       planButton.title = getPlanButtonTitle(running, result);
-      executeButton.disabled = running || result?.workflow?.status !== "executing" || !result?.plan;
+      executeButton.disabled = running || executionRunning || !canStartContinuousExecution();
+      retryExecutionTaskButton.disabled = running || !canRetryExecutionTask();
+      retryExecutionTaskButton.title = getExecutionRecoveryButtonTitle("retry");
+      markExecutionTaskCompletedButton.disabled = running || !canRecoverExecutionTask();
+      markExecutionTaskCompletedButton.title = getExecutionRecoveryButtonTitle("mark-completed");
+      requestExecutionRevisionButton.disabled = running || !canRecoverExecutionTask();
+      requestExecutionRevisionButton.title = getExecutionRecoveryButtonTitle("request-revision");
       releaseManualGateButton.disabled = running || getManualGateBlockedTaskIds().length === 0;
       releaseManualGateButton.title = getReleaseManualGateButtonTitle();
       replanManualGateButton.disabled = running || getManualGateBlockedTaskIds().length === 0;
@@ -1067,6 +1110,16 @@ export function renderIndexHtml(): string {
     function canReviewTaskPlan(result) {
       const workflowStatus = result?.workflow?.status;
       return workflowStatus === "ready_for_planning" || Boolean(result?.plan) || Boolean(state.workflowId);
+    }
+
+    function canStartContinuousExecution() {
+      if (state.execution && ["running", "waiting_manual_gate", "paused_for_replan", "failed", "completed"].includes(state.execution.status)) {
+        return false;
+      }
+      if (state.result?.workflow?.status === "executing" && state.result?.plan) {
+        return true;
+      }
+      return Boolean(state.workflowId && state.result?.plan);
     }
 
     function getPlanButtonTitle(running, result) {
@@ -1088,6 +1141,10 @@ export function renderIndexHtml(): string {
       state.pendingRender = false;
 
       if (!state.result && !state.job) {
+        if (state.execution) {
+          output.textContent = formatExecutionTabContent();
+          return;
+        }
         output.textContent = "填写需求后点击生成。";
         return;
       }
@@ -1117,29 +1174,115 @@ export function renderIndexHtml(): string {
       if (!state.execution) {
         return JSON.stringify({ message: "尚未启动连续执行。" }, null, 2);
       }
-      const waitingScheduler =
-        state.execution.status === "running" &&
-        !state.execution.currentTaskId &&
-        Number(state.execution.summary?.working || 0) > 0;
-      if (!waitingScheduler) {
-        return JSON.stringify(state.execution, null, 2);
+      const execution = state.execution;
+      const summary = execution.summary || {};
+      const activeTask = execution.activeTask || {};
+      const lines = [
+        "连续执行状态：" + execution.status + (execution.readonly ? "（只读挂载）" : ""),
+        "Workflow：" + execution.workflowId,
+        "Job：" + execution.jobId,
+        "任务统计：完成 " + Number(summary.completed || 0) +
+          "，执行中 " + Number(summary.working || 0) +
+          "，待执行 " + Number(summary.pending || 0) +
+          "，阻断 " + Number(summary.blocked || 0) +
+          "，失败 " + Number(summary.failed || 0),
+        ""
+      ];
+      if (execution.status === "failed") {
+        lines.push("已中断，需要人工处理：请根据现场情况选择“重试任务”“人工确认完成”或“重规划”。", "");
+      } else if (execution.status === "paused_for_replan") {
+        lines.push("已暂停等待重规划：可点击“重规划”修复任务计划。", "");
       }
-      return [
-        "迁移完成，等待调度器选择下一个任务。",
-        "",
-        JSON.stringify(state.execution, null, 2)
-      ].join("\\n");
+      if (activeTask.taskId) {
+        lines.push(
+          "当前任务：" + activeTask.taskId + " / " + (activeTask.title || "未命名任务"),
+          "任务状态：" + activeTask.status,
+          "AO 角色：" + (activeTask.aoRole || "-"),
+          "AO session：" + (activeTask.aoSessionId || "尚未拿到 sessionId，正在按任务前缀从 AO 会话列表追踪"),
+          "尝试次数：" + Number(activeTask.attempt || 0) + " / " + Number(activeTask.maxAttempts || 0)
+        );
+        const latestObservation = (activeTask.statusObservations || []).at(-1);
+        if (latestObservation) {
+          lines.push("最近 AO 状态：" + latestObservation.status + " / " + latestObservation.observedAt);
+        }
+      } else {
+        lines.push("当前任务：暂无，调度器正在等待可执行任务或终态。");
+      }
+      if (execution.failure) {
+        lines.push("", "失败信息：" + execution.failure.kind + " / " + execution.failure.message);
+      }
+      lines.push("", "过程日志：");
+      const logs = execution.logs || [];
+      if (logs.length === 0) {
+        lines.push("暂无执行日志。");
+      } else {
+        logs.slice(-20).forEach((event) => lines.push(formatExecutionEvent(event)));
+      }
+      lines.push("", "原始快照：", JSON.stringify(execution, null, 2));
+      const waitingScheduler =
+        execution.status === "running" &&
+        !execution.currentTaskId &&
+        Number(summary.working || 0) > 0;
+      if (waitingScheduler) {
+        lines.unshift("迁移完成，等待调度器选择下一个任务。", "");
+      }
+      return lines.join("\\n");
+    }
+
+    function formatExecutionEvent(event) {
+      if (!event || typeof event !== "object") return String(event);
+      const parts = [
+        event.at || "-",
+        event.type || "event",
+        event.taskId ? "task=" + event.taskId : "",
+        event.aoSessionId ? "aoSession=" + event.aoSessionId : "",
+        event.actor ? "actor=" + event.actor : ""
+      ].filter(Boolean);
+      return parts.join(" | ");
+    }
+
+    async function loadExecutionSnapshot(workflowId, projectRoot, activateExecutionTab) {
+      if (!workflowId) return;
+      try {
+        const response = await fetch("/api/ao/execution-jobs/" + encodeURIComponent("EXEC-" + workflowId) + "?projectRoot=" + encodeURIComponent(projectRoot || getProjectRoot()));
+        state.execution = await readResponse(response);
+        if (activateExecutionTab) {
+          state.activeTab = "execution";
+          activateTab("execution");
+        }
+        renderActiveTab();
+        updateSummary();
+        if (["running", "waiting_manual_gate", "paused_for_replan"].includes(state.execution.status)) {
+          startPollingExecutionJob(state.execution.jobId);
+        }
+      } catch (error) {
+        if (!String(error.message || error).includes("execution job not found")) {
+          setStatus("warn", "已读取工作流产物，但未挂载连续执行状态：" + (error.message || String(error)));
+        }
+      }
+    }
+
+    async function pollExecutionJob(jobId) {
+      const response = await fetch("/api/ao/execution-jobs/" + encodeURIComponent(jobId) + "?projectRoot=" + encodeURIComponent(getProjectRoot()));
+      state.execution = await readResponse(response);
+      renderActiveTab();
+      updateSummary();
+      if (!["running", "waiting_manual_gate", "paused_for_replan"].includes(state.execution.status) && state.executionPollTimer) {
+        clearInterval(state.executionPollTimer);
+        state.executionPollTimer = null;
+      }
     }
 
     async function startContinuousExecution(busyMessage) {
-      if (!state.result?.workflow?.workflowId) return;
+      const workflowId = state.result?.workflow?.workflowId || state.workflowId;
+      if (!workflowId) return;
       setBusy(true, busyMessage);
       try {
         const response = await fetch("/api/ao/execution-jobs", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
-            workflowId: state.result.workflow.workflowId,
+            workflowId,
             projectRoot: getProjectRoot(),
             dryRun: false
           })
@@ -1151,6 +1294,68 @@ export function renderIndexHtml(): string {
         updateSummary();
         setStatus("ok", getExecutionSuccessMessage(state.execution));
         startPollingExecutionJob(state.execution.jobId);
+      } catch (error) {
+        const message = error.message || String(error);
+        if (message.includes("Workflow execution is failed")) {
+          await loadExecutionSnapshot(workflowId, getProjectRoot(), true);
+          setStatus("warn", "连续执行已中断，请在 AO 执行页选择重试任务、人工确认完成或重规划。");
+        } else {
+          setStatus("bad", message);
+        }
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function submitExecutionRecovery(action, busyMessage, rationale) {
+      const taskId = getRecoverableExecutionTaskId();
+      const jobId = state.execution?.jobId;
+      if (!taskId || !jobId) return;
+      setBusy(true, busyMessage);
+      try {
+        let response;
+        if (action === "retry") {
+          response = await fetch("/api/ao/execution-jobs/" + encodeURIComponent(jobId) + "/tasks/" + encodeURIComponent(taskId) + "/retry", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ projectRoot: getProjectRoot() })
+          });
+          state.execution = await readResponse(response);
+          setStatus("ok", "已提交重试，调度器会重新派发当前任务。");
+        } else if (action === "mark-completed") {
+          response = await fetch("/api/ao/execution-jobs/" + encodeURIComponent(jobId) + "/tasks/" + encodeURIComponent(taskId) + "/mark-completed", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              projectRoot: getProjectRoot(),
+              rationale: rationale || "Web UI 人工确认完成"
+            })
+          });
+          state.execution = await readResponse(response);
+          setStatus("ok", "已人工确认当前任务完成，调度器会继续后续任务。");
+        } else {
+          response = await fetch("/api/ao/execution-jobs/" + encodeURIComponent(jobId) + "/revision-requests", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              projectRoot: getProjectRoot(),
+              workflowId: state.execution.workflowId,
+              triggerTaskId: taskId,
+              reasonCategory: getRevisionReasonCategory(),
+              rationale: rationale || getDefaultRevisionRationale()
+            })
+          });
+          const result = await readResponse(response);
+          state.execution = result.job || result;
+          setStatus("ok", "已提交重规划请求。");
+        }
+        state.activeTab = "execution";
+        activateTab("execution");
+        renderActiveTab();
+        updateSummary();
+        if (["running", "waiting_manual_gate", "paused_for_replan"].includes(state.execution.status)) {
+          startPollingExecutionJob(jobId);
+        }
       } catch (error) {
         setStatus("bad", error.message || String(error));
       } finally {
@@ -1188,16 +1393,10 @@ export function renderIndexHtml(): string {
     function startPollingExecutionJob(jobId) {
       if (!jobId) return;
       if (state.executionPollTimer) clearInterval(state.executionPollTimer);
+      pollExecutionJob(jobId).catch((error) => setStatus("bad", error.message || String(error)));
       state.executionPollTimer = setInterval(async () => {
         try {
-          const response = await fetch("/api/ao/execution-jobs/" + encodeURIComponent(jobId) + "?projectRoot=" + encodeURIComponent(getProjectRoot()));
-          state.execution = await readResponse(response);
-          renderActiveTab();
-          updateSummary();
-          if (!["running", "waiting_manual_gate", "paused_for_replan"].includes(state.execution.status)) {
-            clearInterval(state.executionPollTimer);
-            state.executionPollTimer = null;
-          }
+          await pollExecutionJob(jobId);
         } catch (error) {
           clearInterval(state.executionPollTimer);
           state.executionPollTimer = null;
@@ -1214,6 +1413,48 @@ export function renderIndexHtml(): string {
         .filter((task) => task.kind === "manual_gate")
         .map((task) => task.taskId)
         .filter(Boolean);
+    }
+
+    function getRecoverableExecutionTaskId() {
+      return state.execution?.activeTask?.taskId || state.execution?.currentTaskId || "";
+    }
+
+    function canRecoverExecutionTask() {
+      const status = state.execution?.status;
+      return Boolean(getRecoverableExecutionTaskId() && (status === "failed" || status === "paused_for_replan"));
+    }
+
+    function canRetryExecutionTask() {
+      const taskStatus = state.execution?.activeTask?.status;
+      return canRecoverExecutionTask() && (taskStatus === "blocked_for_human" || taskStatus === "failed");
+    }
+
+    function getExecutionRecoveryButtonTitle(action) {
+      const taskId = getRecoverableExecutionTaskId();
+      if (!taskId) return "连续执行中断后可处理当前任务。";
+      if (action === "retry") {
+        return canRetryExecutionTask()
+          ? "重新派发当前任务 " + taskId + "。"
+          : "只有 failed 或 blocked_for_human 任务可以重试。";
+      }
+      if (action === "mark-completed") return "人工确认当前任务 " + taskId + " 已完成，并继续后续任务。";
+      return "基于当前任务 " + taskId + " 请求修复任务计划。";
+    }
+
+    function getRevisionReasonCategory() {
+      const kind = state.execution?.failure?.kind || "";
+      if (kind.includes("session")) return "ao_session_missing";
+      if (kind.includes("manual_gate")) return "manual_gate";
+      if (kind.includes("dependency")) return "dependency_deadlock";
+      if (kind.includes("plan")) return "plan_issue";
+      return kind || "execution_interrupted";
+    }
+
+    function getDefaultRevisionRationale() {
+      const failure = state.execution?.failure;
+      if (failure?.message) return failure.message;
+      const taskId = getRecoverableExecutionTaskId();
+      return taskId ? "任务 " + taskId + " 执行中断，需要修复任务计划后继续。" : "连续执行中断，需要修复任务计划后继续。";
     }
 
     function getReleaseManualGateButtonTitle() {

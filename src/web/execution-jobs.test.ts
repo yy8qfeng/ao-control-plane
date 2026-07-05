@@ -41,9 +41,69 @@ describe("ExecutionJobManager", () => {
     expect(snapshot.status).toBe("running");
     await manager.stop(snapshot.jobId);
   });
+
+  it("attaches existing running execution when start is clicked again", async () => {
+    const workflowId = "WF-ATTACH-RUNNING";
+    const { manager } = await seedManager(workflowId, "running", true);
+
+    const snapshot = await manager.createOrResume({ workflowId });
+
+    expect(snapshot.mode).toBe("attached");
+    expect(snapshot.status).toBe("running");
+    expect(snapshot.readonly).toBe(true);
+    expect(snapshot.activeTask?.taskId).toBe("TASK-001");
+    expect(snapshot.activeTask?.aoSessionId).toBe("session-TASK-001");
+    expect(snapshot.tasks?.[0]?.status).toBe("working");
+  });
+
+  it("fails before acquiring a lock when AO is unavailable", async () => {
+    const workflowId = "WF-AO-UNAVAILABLE";
+    const { manager, store } = await seedManager(workflowId, "stopped", false, true);
+
+    await expect(manager.createOrResume({ workflowId })).rejects.toMatchObject({
+      statusCode: 503,
+      message: expect.stringContaining("AO 未启动或不可用")
+    });
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("stopped");
+  });
+
+  it("retries a readonly failed execution job and starts the runner", async () => {
+    const workflowId = "WF-RETRY-READONLY";
+    const { manager } = await seedManager(workflowId, "failed", true);
+    await manager.restoreFromDisk();
+
+    const snapshot = await manager.retry(`EXEC-${workflowId}`, "TASK-001");
+
+    expect(["running", "completed"]).toContain(snapshot.status);
+    expect(snapshot.readonly).toBe(false);
+    expect(snapshot.failure).toBeNull();
+    await manager.stop(snapshot.jobId);
+  });
+
+  it("does not clear a failed task when retry cannot reach AO", async () => {
+    const workflowId = "WF-RETRY-AO-UNAVAILABLE";
+    const { manager, store } = await seedManager(workflowId, "failed", true, true);
+    await manager.restoreFromDisk();
+
+    await expect(manager.retry(`EXEC-${workflowId}`, "TASK-001")).rejects.toMatchObject({
+      statusCode: 503,
+      message: expect.stringContaining("AO 未启动或不可用")
+    });
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("failed");
+    expect(state.taskStates["TASK-001"]?.status).toBe("blocked_for_human");
+    expect(state.failure?.kind).toBe("ao_spawn_failed");
+  });
 });
 
-async function seedManager(workflowId: string, status: "running" | "stopped") {
+async function seedManager(
+  workflowId: string,
+  status: "running" | "stopped" | "failed",
+  withActiveTask = false,
+  aoUnavailable = false
+) {
   tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-execution-jobs-"));
   const store = new ExecutionStateStore(tempDir);
   await mkdir(store.getWorkflowDir(workflowId), { recursive: true });
@@ -53,13 +113,31 @@ async function seedManager(workflowId: string, status: "running" | "stopped") {
     planVersion: "task-plan-current",
     planPath: "task-plan.json",
     status,
-    currentTaskId: null,
+    currentTaskId: withActiveTask ? "TASK-001" : null,
     startedAt: null,
     updatedAt: new Date().toISOString(),
     completedAt: null,
     stoppedAt: status === "stopped" ? new Date().toISOString() : null,
-    failure: null,
-    taskStates: {},
+    failure: status === "failed" ? {
+      taskId: "TASK-001",
+      kind: "ao_spawn_failed",
+      message: "AO session missing",
+      occurredAt: new Date().toISOString()
+    } : null,
+    taskStates: withActiveTask ? {
+      "TASK-001": {
+        taskId: "TASK-001",
+        status: status === "failed" ? "blocked_for_human" : "working",
+        aoRole: "backend-senior",
+        aoSessionId: status === "failed" ? undefined : "session-TASK-001",
+        attempt: 1,
+        maxAttempts: 3,
+        startedAt: new Date().toISOString(),
+        completedAt: null,
+        failureReason: status === "failed" ? "AO session missing" : null,
+        statusObservations: []
+      }
+    } : {},
     manualGateReleases: [],
     pendingDispatch: null
   });
@@ -71,6 +149,9 @@ async function seedManager(workflowId: string, status: "running" | "stopped") {
         return { sessionId: `session-${task.taskId}`, stdout: "", stderr: "" };
       },
       async listSessions() {
+        if (aoUnavailable) {
+          throw new Error("ao daemon is offline");
+        }
         return { sessions: [] };
       }
     })

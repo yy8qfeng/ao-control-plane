@@ -323,7 +323,11 @@ describe("web server", () => {
         pollIntervalMs: 1
       })
     });
-    const started = (await startResponse.json()) as { jobId: string; mode: string; status: string };
+    const started = (await startResponse.json()) as {
+      jobId: string;
+      mode: string;
+      status: string;
+    };
 
     expect(startResponse.status).toBe(200);
     expect(started.mode).toBe("created");
@@ -331,6 +335,8 @@ describe("web server", () => {
     const completed = await waitForExecutionJobStatus(server.url, started.jobId, projectRoot, "completed");
     expect(completed.summary.completed).toBe(1);
     expect(completed.currentTaskId).toBeNull();
+    expect(completed.tasks?.[0]?.status).toBe("completed");
+    expect(completed.logs.some((event) => event.type === "task_dispatched")).toBe(true);
   });
 
   it("runs the real governance endpoint through injected adapters", async () => {
@@ -929,16 +935,33 @@ describe("web server", () => {
     const html = renderIndexHtml();
 
     expect(html).toContain('id="executeButton"');
+    expect(html).toContain('id="retryExecutionTaskButton"');
+    expect(html).toContain('id="markExecutionTaskCompletedButton"');
+    expect(html).toContain('id="requestExecutionRevisionButton"');
     expect(html).toContain('id="releaseManualGateButton"');
     expect(html).toContain('id="replanManualGateButton"');
     expect(html).toContain('id="blockManualGateButton"');
     expect(html).toContain("启动连续执行");
+    expect(html).toContain("重试任务");
+    expect(html).toContain("人工确认完成");
+    expect(html).toContain("重规划");
     expect(html).toContain("要求重规划");
     expect(html).toContain("标记阻断");
     expect(html).toContain("dryRun: false");
     expect(html).toContain("/api/ao/execution-jobs");
     expect(html).toContain("即将启动连续执行");
     expect(html).toContain("连续执行已启动");
+    expect(html).toContain("连续执行状态：");
+    expect(html).toContain("当前任务：");
+    expect(html).toContain("AO session：");
+    expect(html).toContain("已中断，需要人工处理");
+    expect(html).toContain("submitExecutionRecovery");
+    expect(html).toContain("/retry");
+    expect(html).toContain("/mark-completed");
+    expect(html).toContain("/revision-requests");
+    expect(html).toContain("getRecoverableExecutionTaskId");
+    expect(html).toContain("getExecutionRecoveryButtonTitle");
+    expect(html).toContain("loadExecutionSnapshot");
     expect(html).toContain("启动连续执行后，调度器会在需要人工门禁时暂停。");
     expect(html).toContain("taskPlanApprovalReport");
     expect(html).toContain('submitManualGateDecision("approved"');
@@ -1042,6 +1065,8 @@ async function waitForExecutionJobStatus(
       status: string;
       currentTaskId: string | null;
       summary: { completed: number };
+      tasks?: Array<{ status: string }>;
+      logs: Array<{ type: string }>;
       failure?: { message: string };
     };
     if (job.status === expectedStatus) {

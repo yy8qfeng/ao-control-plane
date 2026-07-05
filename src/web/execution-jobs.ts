@@ -12,6 +12,7 @@ import {
 } from "../workflow/continuous-plan-execution.js";
 import {
   type ExecutionState,
+  type ExecutionTaskState,
   type ExecutionStateStore,
   summarizeExecutionState
 } from "../workflow/execution-state-store.js";
@@ -21,13 +22,30 @@ import { requestTaskPlanRevision, type PlanRevisionRequest } from "../workflow/t
 export interface ExecutionJobSnapshot {
   jobId: string;
   workflowId: string;
-  mode?: "created" | "resumed";
+  mode?: "created" | "resumed" | "attached";
   status: ExecutionState["status"];
   currentTaskId?: string | null;
   summary?: ReturnType<typeof summarizeExecutionState>;
+  activeTask?: ExecutionTaskSnapshot;
+  tasks?: ExecutionTaskSnapshot[];
   failure?: ExecutionState["failure"];
   logs?: unknown[];
   readonly?: boolean;
+}
+
+export interface ExecutionTaskSnapshot {
+  taskId: string;
+  title?: string;
+  type?: string;
+  status: ExecutionTaskState["status"] | string;
+  aoRole?: string;
+  aoSessionId?: string;
+  attempt?: number;
+  maxAttempts?: number;
+  startedAt?: string;
+  completedAt?: string | null;
+  failureReason?: string | null;
+  statusObservations?: ExecutionTaskState["statusObservations"];
 }
 
 interface ManagedExecutionJob {
@@ -87,7 +105,7 @@ export class ExecutionJobManager {
       throw httpError(409, "Workflow execution is already completed");
     }
     if (state.status === "failed") {
-      throw httpError(409, "Workflow execution is failed; retry, mark completed, or request revision first");
+      throw httpError(409, "Workflow execution is failed; please use retry, mark completed, or request revision from the AO execution panel first");
     }
     if (state.status === "paused_for_replan") {
       throw httpError(409, "Workflow execution is paused for replan");
@@ -96,11 +114,19 @@ export class ExecutionJobManager {
       throw httpError(409, "Workflow execution is waiting for manual gate decision");
     }
     if (state.status === "running") {
+      const jobId = this.getJobId(input.workflowId);
+      const job = this.jobs.get(jobId) ?? await this.attachExistingJob(jobId);
+      if (job) {
+        const snapshot = await this.getSnapshot(jobId);
+        return { ...snapshot, mode: "attached" };
+      }
       throw httpError(409, "Workflow execution already has an active job");
     }
 
     const mode = state.status === "stopped" ? "resumed" : "created";
     const jobId = this.getJobId(input.workflowId);
+    const ao = this.input.createAo();
+    await this.ensureAoAvailable(ao);
     const lock = await acquireExecutionLock({
       artifactRoot: this.input.artifactRoot,
       workflowId: input.workflowId,
@@ -111,7 +137,7 @@ export class ExecutionJobManager {
     const runner = new ContinuousExecutionRunner({
       workflowId: input.workflowId,
       store: this.input.store,
-      ao: this.input.createAo(),
+      ao,
       pollIntervalMs: input.pollIntervalMs
     });
     this.jobs.set(jobId, { jobId, workflowId: input.workflowId, runner, lock });
@@ -127,9 +153,31 @@ export class ExecutionJobManager {
     }
     const state = await this.input.store.ensureState(job.workflowId);
     let summary: ReturnType<typeof summarizeExecutionState> | undefined;
+    let tasks: ExecutionTaskSnapshot[] | undefined;
+    let activeTask: ExecutionTaskSnapshot | undefined;
     try {
       const plan = await this.input.store.readActiveTaskPlan(state);
       summary = summarizeExecutionState(plan, state);
+      tasks = plan.tasks.map((task) => {
+        const runtime = state.taskStates[task.taskId];
+        return {
+          taskId: task.taskId,
+          title: task.title,
+          type: task.type,
+          status: runtime?.status ?? task.status,
+          aoRole: runtime?.aoRole ?? task.aoRole,
+          aoSessionId: runtime?.aoSessionId,
+          attempt: runtime?.attempt,
+          maxAttempts: runtime?.maxAttempts,
+          startedAt: runtime?.startedAt,
+          completedAt: runtime?.completedAt,
+          failureReason: runtime?.failureReason,
+          statusObservations: runtime?.statusObservations
+        };
+      });
+      activeTask = tasks.find((task) => task.taskId === state.currentTaskId) ??
+        tasks.find((task) => task.status === "working") ??
+        tasks.find((task) => task.status === "blocked_for_human");
     } catch {
       summary = undefined;
     }
@@ -139,6 +187,8 @@ export class ExecutionJobManager {
       status: state.status,
       currentTaskId: state.currentTaskId ?? null,
       summary,
+      activeTask,
+      tasks,
       failure: state.failure,
       logs: await this.input.store.readLogs(job.workflowId, 100),
       readonly: job.readonly
@@ -165,13 +215,15 @@ export class ExecutionJobManager {
 
   async retry(jobId: string, taskId: string): Promise<ExecutionJobSnapshot> {
     const job = this.requireJob(jobId);
+    const ao = await this.prepareContinuation(job);
     await retryExecutionTask({ store: this.input.store, workflowId: job.workflowId, taskId, actor: "user" });
-    this.ensureRunner(job);
+    this.startRunner(job, ao);
     return this.getSnapshot(jobId);
   }
 
   async markCompleted(jobId: string, taskId: string, rationale: string): Promise<ExecutionJobSnapshot> {
     const job = this.requireJob(jobId);
+    const ao = await this.prepareContinuation(job);
     await markExecutionTaskCompleted({
       store: this.input.store,
       workflowId: job.workflowId,
@@ -179,7 +231,7 @@ export class ExecutionJobManager {
       rationale,
       actor: "user"
     });
-    this.ensureRunner(job);
+    this.startRunner(job, ao);
     return this.getSnapshot(jobId);
   }
 
@@ -188,6 +240,7 @@ export class ExecutionJobManager {
     rationale: string;
   }): Promise<ExecutionJobSnapshot> {
     const job = this.requireJob(jobId);
+    const ao = input.decision === "approved" ? await this.prepareContinuation(job) : undefined;
     await decideManualGate({
       store: this.input.store,
       workflowId: job.workflowId,
@@ -197,7 +250,7 @@ export class ExecutionJobManager {
       actor: "user"
     });
     if (input.decision === "approved") {
-      this.ensureRunner(job);
+      this.startRunner(job, ao);
     }
     return this.getSnapshot(jobId);
   }
@@ -220,7 +273,7 @@ export class ExecutionJobManager {
       request
     });
     if (revision.approved) {
-      this.ensureRunner(job);
+      await this.ensureRunner(job);
     }
     return { job: await this.getSnapshot(jobId), revision };
   }
@@ -246,7 +299,12 @@ export class ExecutionJobManager {
       return undefined;
     }
     const workflowId = jobId.slice("EXEC-".length);
-    const state = await this.input.store.ensureState(workflowId);
+    let state: ExecutionState;
+    try {
+      state = await this.input.store.readState(workflowId);
+    } catch {
+      return undefined;
+    }
     const job: ManagedExecutionJob = {
       jobId,
       workflowId: state.workflowId,
@@ -256,7 +314,32 @@ export class ExecutionJobManager {
     return job;
   }
 
-  private ensureRunner(job: ManagedExecutionJob): void {
+  private async ensureRunner(job: ManagedExecutionJob): Promise<void> {
+    const ao = await this.prepareContinuation(job);
+    this.startRunner(job, ao);
+  }
+
+  private async prepareContinuation(
+    job: ManagedExecutionJob
+  ): Promise<Pick<AoCliAdapter, "spawnTask" | "listSessions"> | undefined> {
+    if (job.runner) {
+      return undefined;
+    }
+    const ao = this.input.createAo();
+    await this.ensureAoAvailable(ao);
+    job.lock ??= await acquireExecutionLock({
+      artifactRoot: this.input.artifactRoot,
+      workflowId: job.workflowId,
+      holder: "web",
+      jobId: job.jobId
+    });
+    return ao;
+  }
+
+  private startRunner(
+    job: ManagedExecutionJob,
+    ao?: Pick<AoCliAdapter, "spawnTask" | "listSessions">
+  ): void {
     if (job.runner) {
       job.runner.start();
       return;
@@ -264,10 +347,21 @@ export class ExecutionJobManager {
     job.runner = new ContinuousExecutionRunner({
       workflowId: job.workflowId,
       store: this.input.store,
-      ao: this.input.createAo()
+      ao: ao ?? this.input.createAo()
     });
     job.readonly = false;
     job.runner.start();
+  }
+
+  private async ensureAoAvailable(ao: Pick<AoCliAdapter, "listSessions">): Promise<void> {
+    try {
+      await ao.listSessions();
+    } catch (error) {
+      throw httpError(
+        503,
+        `AO 未启动或不可用，请先启动 AO 后再启动连续执行。原始错误：${formatErrorMessage(error)}`
+      );
+    }
   }
 }
 
@@ -275,4 +369,8 @@ export function httpError(statusCode: number, message: string): Error & { status
   const error = new Error(message) as Error & { statusCode: number };
   error.statusCode = statusCode;
   return error;
+}
+
+function formatErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
