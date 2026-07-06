@@ -10,6 +10,7 @@ import {
   ContinuousExecutionRunner,
   decideManualGate,
   dispatchManualGateReview,
+  reconcileExecutionTaskArtifacts,
   retryExecutionTask,
   stopExecution
 } from "./continuous-plan-execution.js";
@@ -48,7 +49,7 @@ describe("ContinuousExecutionRunner", () => {
     expect(state.taskStates["TASK-002"]?.status).toBe("completed");
   });
 
-  it("pauses at manual_gate without dispatching it", async () => {
+  it("auto-dispatches manual_gate review tasks instead of waiting for routine human release", async () => {
     const workflowId = "WF-MANUAL";
     const { store } = await seedPlan(createPlan(workflowId, [
       createTask(workflowId, "TASK-001", { status: "completed" }),
@@ -57,21 +58,31 @@ describe("ContinuousExecutionRunner", () => {
         dependencyCondition: "manual_gate"
       })
     ]));
-    const ao = createFakeAo([]);
+    const ao = createFakeAo(["completed"]);
     const runner = new ContinuousExecutionRunner({
       workflowId,
       store,
       ao: ao as Pick<AoCliAdapter, "spawnTask" | "listSessions">,
       pollIntervalMs: 1,
-      maxTicks: 2
+      maxTicks: 3
     });
 
     await runner.run();
 
     const state = await store.readState(workflowId);
-    expect(ao.spawned).toEqual([]);
-    expect(state.status).toBe("waiting_manual_gate");
-    expect(state.currentTaskId).toBe("TASK-002");
+    expect(ao.spawned).toEqual(["TASK-002"]);
+    expect(state.status).toBe("completed");
+    expect(state.taskStates["TASK-002"]?.status).toBe("completed");
+    expect(state.manualGateReleases).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          taskId: "TASK-002",
+          decision: "review_dispatched",
+          mode: "ao_review",
+          aoSessionId: "session-TASK-002"
+        })
+      ])
+    );
   });
 
   it("skips replan-only manual gate branches after an approved upstream gate", async () => {
@@ -647,14 +658,27 @@ describe("ContinuousExecutionRunner", () => {
       })
     ]));
     await writeFile(join(store.getWorkflowDir(workflowId), "g0_repo_reality_check.json"), "{}\n", "utf8");
-    const runner = new ContinuousExecutionRunner({
-      workflowId,
-      store,
-      ao: createListOnlyAo([]) as Pick<AoCliAdapter, "spawnTask" | "listSessions">,
-      pollIntervalMs: 1,
-      maxTicks: 2
-    });
-    await runner.run();
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "waiting_manual_gate",
+      currentTaskId: "TASK-002",
+      taskStates: {
+        "TASK-001": {
+          taskId: "TASK-001",
+          status: "completed",
+          aoRole: "architect",
+          attempt: 1,
+          maxAttempts: 3
+        },
+        "TASK-002": {
+          taskId: "TASK-002",
+          status: "pending",
+          aoRole: "reviewer",
+          attempt: 0,
+          maxAttempts: 3
+        }
+      }
+    }));
 
     const state = await approveManualGate({
       store,
@@ -959,6 +983,155 @@ describe("ContinuousExecutionRunner", () => {
     expect(state.failure?.message).toContain("g0_repo_reality_check.json");
   });
 
+  it("recovers completed AO review outputs from the AO session worktree before completing the task", async () => {
+    const workflowId = "WF-RECONCILE-RUNNER";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-005", {
+        title: "冻结跨语言 IPC 核心字节布局契约",
+        status: "completed"
+      }),
+      createTask(workflowId, "TASK-006", {
+        title: "跨语言 IPC 契约人工复核门禁",
+        description: "reviewer 复核 IPC 契约是否冻结。",
+        dependencies: ["TASK-005"],
+        dependencyCondition: "manual_gate",
+        type: "verification",
+        aoRole: "reviewer",
+        outputArtifacts: [
+          { kind: "ipc_contract_review_gate_decision", path: "ipc_contract_review_gate_decision.json", required: true },
+          { kind: "ipc_contract_approved_flag", path: "ipc_contract_approved.flag", requiredWhen: "decision=approved" }
+        ]
+      })
+    ]));
+    const artifactDir = store.getWorkflowDir(workflowId);
+    await writeFile(join(artifactDir, "ipc_byte_layout_freeze.json"), "{}\n", "utf8");
+    await writeFile(join(artifactDir, "ipc_byte_layout_freeze.md"), "# IPC\n", "utf8");
+    await writeFile(join(artifactDir, "ipc_byte_layout_qa_verdict.json"), "{}\n", "utf8");
+    const worktreePath = join(tempDir ?? "", ".agent-orchestrator", "projects", "project", "worktrees", "ft-7");
+    await mkdir(join(worktreePath, ".ao-control-plane", workflowId), { recursive: true });
+    await writeFile(join(worktreePath, ".ao-control-plane", workflowId, "ipc_contract_review_gate_decision.json"), JSON.stringify({
+      workflowId,
+      taskId: "TASK-006",
+      decision: "approved",
+      source: "control_plane_manual_gate",
+      reviewerIndependence: {
+        reviewerSessionId: "ft-7"
+      }
+    }), "utf8");
+    await writeFile(join(worktreePath, ".ao-control-plane", workflowId, "ipc_contract_approved.flag"), "approved\n", "utf8");
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "running",
+      currentTaskId: "TASK-006",
+      taskStates: {
+        "TASK-005": {
+          taskId: "TASK-005",
+          status: "completed",
+          aoRole: "architect",
+          attempt: 1,
+          maxAttempts: 3
+        },
+        "TASK-006": {
+          taskId: "TASK-006",
+          status: "working",
+          aoRole: "reviewer",
+          aoSessionId: "ft-7",
+          attempt: 1,
+          maxAttempts: 3,
+          statusObservations: []
+        }
+      },
+      manualGateReleases: [{
+        taskId: "TASK-006",
+        decision: "review_dispatched",
+        mode: "ao_review",
+        rationale: "派发 AO 复核",
+        releasedAt: new Date().toISOString(),
+        attempt: 1,
+        aoSessionId: "ft-7"
+      }]
+    }));
+    const runner = new ContinuousExecutionRunner({
+      workflowId,
+      store,
+      ao: createListOnlyAo([{ id: "ft-7", status: "completed", prompt: `[${workflowId} / TASK-006] review`, worktreePath }]) as Pick<AoCliAdapter, "spawnTask" | "listSessions">,
+      pollIntervalMs: 1,
+      maxTicks: 2
+    });
+
+    await runner.run();
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("completed");
+    const decision = JSON.parse(await readFile(join(artifactDir, "ipc_contract_review_gate_decision.json"), "utf8")) as { source: string; aoSessionId: string };
+    expect(decision.source).toBe("ao_review");
+    expect(decision.aoSessionId).toBe("ft-7");
+    await expect(store.readLogs(workflowId)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "artifact_output_recovered_from_worktree", taskId: "TASK-006" }),
+        expect.objectContaining({ type: "artifact_output_normalized", taskId: "TASK-006" })
+      ])
+    );
+  });
+
+  it("rolls back recovered artifacts when second validation still fails", async () => {
+    const workflowId = "WF-RECONCILE-ROLLBACK";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", {
+        outputArtifacts: [
+          { kind: "gate_decision", path: "gate_decision.json", required: true },
+          { kind: "approved_flag", path: "approved.flag", requiredWhen: "decision=approved" }
+        ]
+      })
+    ]));
+    const artifactDir = store.getWorkflowDir(workflowId);
+    const worktreePath = join(tempDir ?? "", ".agent-orchestrator", "projects", "project", "worktrees", "ft-rollback");
+    await mkdir(join(worktreePath, ".ao-control-plane", workflowId), { recursive: true });
+    await writeFile(join(worktreePath, ".ao-control-plane", workflowId, "gate_decision.json"), JSON.stringify({
+      workflowId,
+      taskId: "TASK-001",
+      decision: "approved"
+    }), "utf8");
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "failed",
+      currentTaskId: "TASK-001",
+      failure: {
+        taskId: "TASK-001",
+        kind: "artifact_output_missing",
+        message: "missing output",
+        occurredAt: new Date().toISOString()
+      },
+      taskStates: {
+        "TASK-001": {
+          taskId: "TASK-001",
+          status: "blocked_for_human",
+          aoRole: "backend-senior",
+          aoSessionId: "ft-rollback",
+          attempt: 1,
+          maxAttempts: 3
+        }
+      }
+    }));
+
+    const result = await reconcileExecutionTaskArtifacts({
+      store,
+      workflowId,
+      taskId: "TASK-001",
+      sessions: [{ id: "ft-rollback", status: "completed", prompt: `[${workflowId} / TASK-001]`, worktreePath }]
+    });
+
+    expect(result.completed).toBe(false);
+    expect(result.failureKind).toBe("artifact_output_missing");
+    expect(result.reconcileResult?.failures).toEqual([
+      expect.objectContaining({
+        reason: "canonical_validation_failed",
+        rolledBackPaths: [join(artifactDir, "gate_decision.json")]
+      })
+    ]);
+    await expect(access(join(artifactDir, "gate_decision.json"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("blocks completed AO review when gate decision source conflicts with release mode", async () => {
     const workflowId = "WF-CONFLICT-OUTPUT";
     const { store } = await seedPlan(createPlan(workflowId, [
@@ -1130,7 +1303,7 @@ function createFakeAo(statuses: string[]) {
   };
 }
 
-function createListOnlyAo(sessions: Array<{ id: string; status: string; prompt: string }>) {
+function createListOnlyAo(sessions: Array<{ id: string; status: string; prompt: string; worktreePath?: string }>) {
   return {
     async spawnTask() {
       throw new Error("spawnTask should not be called");

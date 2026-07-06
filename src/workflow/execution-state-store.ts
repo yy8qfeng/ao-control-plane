@@ -43,11 +43,13 @@ export type ExecutionErrorKind =
   | "artifact_context_missing"
   | "artifact_output_missing"
   | "artifact_output_conflict"
+  | "artifact_output_reconcile_failed"
   | "manual_gate_artifact_write_failed"
   | "plan_missing"
   | "plan_invalid"
   | "state_corrupted"
-  | "dispatcher_stopped";
+  | "dispatcher_stopped"
+  | "worktree_cleanup_failed";
 
 export interface ExecutionFailure {
   taskId?: string;
@@ -68,6 +70,11 @@ export const executionLogTypeSchema = z.enum([
   "artifact_context_missing",
   "artifact_output_conflict",
   "artifact_output_missing",
+  "artifact_output_normalized",
+  "artifact_output_reconcile_failed",
+  "artifact_output_reconcile_skipped",
+  "artifact_output_reconcile_started",
+  "artifact_output_recovered_from_worktree",
   "dispatcher_stopped",
   "manual_gate_approved",
   "manual_gate_artifact_write_failed",
@@ -82,7 +89,10 @@ export const executionLogTypeSchema = z.enum([
   "task_execution_missing_session",
   "task_marked_completed",
   "task_retry_requested",
-  "task_skipped"
+  "task_skipped",
+  "worktree_cleanup_candidate_detected",
+  "worktree_cleanup_completed",
+  "worktree_cleanup_failed"
 ]);
 
 export type ExecutionLogType = z.infer<typeof executionLogTypeSchema>;
@@ -198,11 +208,13 @@ const executionStateSchema = z.object({
       "artifact_context_missing",
       "artifact_output_missing",
       "artifact_output_conflict",
+      "artifact_output_reconcile_failed",
       "manual_gate_artifact_write_failed",
       "plan_missing",
       "plan_invalid",
       "state_corrupted",
-      "dispatcher_stopped"
+      "dispatcher_stopped",
+      "worktree_cleanup_failed"
     ]),
     message: z.string().min(1),
     occurredAt: z.string().min(1),

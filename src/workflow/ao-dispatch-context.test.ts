@@ -182,6 +182,59 @@ describe("ao dispatch context", () => {
       ])
     );
   });
+
+  it("makes AO prompt distinguish dependency inputs from expected outputs", async () => {
+    const artifactDir = await createTempArtifactDir();
+    await writeFile(join(artifactDir, "task-plan.json"), "{}\n", "utf8");
+    await writeFile(join(artifactDir, "execution-state.json"), "{}\n", "utf8");
+    await writeFile(join(artifactDir, "ipc_byte_layout_freeze.json"), "{}\n", "utf8");
+    await writeFile(join(artifactDir, "ipc_byte_layout_freeze.md"), "# IPC\n", "utf8");
+    await writeFile(join(artifactDir, "ipc_byte_layout_qa_verdict.json"), "{}\n", "utf8");
+    const workflowId = "WF-DOMAIN-GATE-PROMPT";
+    const producer = createTask(workflowId, {
+      taskId: "TASK-005",
+      title: "冻结跨语言 IPC 核心字节布局契约",
+      description: "冻结 IPC 布局。",
+      aoPrompt: `[${workflowId} / TASK-005] freeze ipc.`,
+      acceptanceCriteria: ["冻结控制块字段。"]
+    });
+    const reviewer = createTask(workflowId, {
+      taskId: "TASK-006",
+      title: "跨语言 IPC 契约人工复核门禁",
+      description: "reviewer 复核 IPC 契约是否跨 Rust/Java 同步冻结。",
+      dependencies: ["TASK-005"],
+      dependencyCondition: "manual_gate",
+      aoPrompt: `[${workflowId} / TASK-006] review ipc.`,
+      acceptanceCriteria: ["approved 时产出 ipc_contract_approved.flag。"]
+    });
+    const plan = { workflowId, title: "Plan", tasks: [producer, reviewer] };
+
+    const context = await buildAoDispatchContext({
+      task: reviewer,
+      plan,
+      state: createInitialState(workflowId),
+      projectRoot: "C:\\workspace\\fast-transport",
+      artifactDir,
+      attempt: 1
+    });
+
+    expect(context.prompt).toContain("Dependency artifacts are required inputs");
+    expect(context.prompt).toContain("Expected outputs are files you must create");
+    expect(context.prompt).toContain("Do not treat a missing expected output as missing input");
+    expect(context.prompt).toContain("An empty AO worktree is not evidence that control-plane artifacts are missing");
+    expect(context.prompt).toContain("Write every required expected output to the exact absolute expectedOutputs.path");
+    expect(context.prompt).toContain("source=\"ao_review\"");
+    expect(context.prompt).toContain("INPUT ipc_byte_layout_freeze");
+    expect(context.prompt).toContain("OUTPUT ipc_contract_approved_flag");
+    expect(context.manifest.instructions).toEqual(
+      expect.arrayContaining([
+        "Dependency artifacts are required inputs; read every required dependency artifact from artifactDir before asking for user help.",
+        "Expected outputs are files you must create for this task; their absence before the task starts is normal.",
+        "Do not treat a missing expected output as missing input."
+      ])
+    );
+    expect(context.missingRequiredArtifacts).toEqual([]);
+  });
 });
 
 async function createTempArtifactDir(): Promise<string> {

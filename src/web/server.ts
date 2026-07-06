@@ -343,10 +343,43 @@ async function routeRequest(input: {
     return;
   }
 
+  if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/reconcile-artifacts$/)) {
+    const jobId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+    const body = (await readJsonBody(input.request)) as ProjectScopedRequest;
+    const manager = getExecutionManager(body, input);
+    sendJson(input.response, 200, await manager.reconcileArtifacts(jobId));
+    return;
+  }
+
+  if (method === "GET" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/worktree-cleanup-candidates$/)) {
+    const jobId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+    const projectRoot = url.searchParams.get("projectRoot") ?? undefined;
+    const dryRun = url.searchParams.get("dryRun") === "true" ? true : undefined;
+    const manager = getExecutionManager({ projectRoot, dryRun }, input);
+    sendJson(input.response, 200, await manager.listWorktreeCleanupCandidates(jobId));
+    return;
+  }
+
+  if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/worktree-cleanup$/)) {
+    const jobId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+    const body = (await readJsonBody(input.request)) as { sessionIds?: string[]; dryRun?: boolean } & ProjectScopedRequest;
+    if (!Array.isArray(body.sessionIds)) {
+      sendJson(input.response, 400, { error: "sessionIds must be an array" });
+      return;
+    }
+    const manager = getExecutionManager(body, input);
+    sendJson(input.response, 200, await manager.cleanupWorktrees(jobId, {
+      sessionIds: body.sessionIds,
+      dryRun: body.dryRun
+    }));
+    return;
+  }
+
   if (method === "GET" && url.pathname.startsWith("/api/ao/execution-jobs/")) {
     const jobId = decodeURIComponent(url.pathname.replace("/api/ao/execution-jobs/", "").split("/")[0] ?? "");
     const projectRoot = url.searchParams.get("projectRoot") ?? undefined;
-    const manager = getExecutionManager({ projectRoot }, input);
+    const dryRun = url.searchParams.get("dryRun") === "true" ? true : undefined;
+    const manager = getExecutionManager({ projectRoot, dryRun }, input);
     sendJson(input.response, 200, await manager.getSnapshot(jobId));
     return;
   }

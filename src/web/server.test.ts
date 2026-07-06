@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { execa } from "execa";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ClaudeCodeAdapter } from "../adapters/claude-code.js";
 import type { CodexAdapter } from "../adapters/codex.js";
@@ -339,6 +340,114 @@ describe("web server", () => {
     expect(completed.logs.some((event) => event.type === "task_dispatched")).toBe(true);
   });
 
+  it("reconciles artifacts through the execution job API", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    const projectRoot = join(tempDir, "project");
+    await mkdir(projectRoot);
+    const workflowId = "WF-HTTP-RECONCILE";
+    await seedExecutingWorkflow(projectRoot, workflowId, createArtifactPlan(workflowId));
+    const worktreePath = await seedGitSessionWorktree(projectRoot, "ft-7");
+    await mkdir(join(worktreePath, ".ao-control-plane", workflowId), { recursive: true });
+    await writeFile(join(worktreePath, ".ao-control-plane", workflowId, "gate_decision.json"), JSON.stringify({
+      workflowId,
+      taskId: "TASK-001",
+      decision: "approved"
+    }), "utf8");
+    await seedFailedArtifactExecution(projectRoot, workflowId, "ft-7");
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir
+    });
+    await attachExecutionJob(server.url, `EXEC-${workflowId}`, projectRoot);
+
+    const response = await fetch(`${server.url}/api/ao/execution-jobs/${encodeURIComponent(`EXEC-${workflowId}`)}/reconcile-artifacts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ projectRoot, dryRun: true })
+    });
+    const result = (await response.json()) as { completed: boolean; job: { status: string } };
+
+    expect(response.status).toBe(200);
+    expect(result.completed).toBe(true);
+    await expect(readFile(join(projectRoot, ".ao-control-plane", workflowId, "gate_decision.json"), "utf8"))
+      .resolves.toContain(`"workflowId": "${workflowId}"`);
+    await waitForExecutionJobStatus(server.url, `EXEC-${workflowId}`, projectRoot, "completed");
+  });
+
+  it("lists worktree cleanup candidates through the execution job API", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    const projectRoot = join(tempDir, "project");
+    await mkdir(projectRoot);
+    const workflowId = "WF-HTTP-CLEANUP-CANDIDATES";
+    await seedExecutingWorkflow(projectRoot, workflowId, createWebPlan(workflowId));
+    const worktreePath = await seedGitSessionWorktree(projectRoot, "ft-clean");
+    await seedCleanupExecution(projectRoot, workflowId, "ft-clean");
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir
+    });
+    await attachExecutionJob(server.url, `EXEC-${workflowId}`, projectRoot);
+
+    const response = await fetch(
+      `${server.url}/api/ao/execution-jobs/${encodeURIComponent(`EXEC-${workflowId}`)}/worktree-cleanup-candidates?projectRoot=${encodeURIComponent(projectRoot)}&dryRun=true`
+    );
+    const candidates = (await response.json()) as Array<{ sessionId: string; worktreePath: string }>;
+
+    expect(response.status).toBe(200);
+    expect(candidates).toEqual([expect.objectContaining({ sessionId: "ft-clean", worktreePath })]);
+  });
+
+  it("dry-runs worktree cleanup through the execution job API without removing worktrees", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    const projectRoot = join(tempDir, "project");
+    await mkdir(projectRoot);
+    const workflowId = "WF-HTTP-CLEANUP-DRYRUN";
+    await seedExecutingWorkflow(projectRoot, workflowId, createWebPlan(workflowId));
+    const worktreePath = await seedGitSessionWorktree(projectRoot, "ft-clean");
+    await seedCleanupExecution(projectRoot, workflowId, "ft-clean");
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir
+    });
+    await attachExecutionJob(server.url, `EXEC-${workflowId}`, projectRoot);
+
+    const response = await fetch(`${server.url}/api/ao/execution-jobs/${encodeURIComponent(`EXEC-${workflowId}`)}/worktree-cleanup`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ projectRoot, dryRun: true, sessionIds: ["ft-clean"] })
+    });
+    const result = (await response.json()) as { dryRun: boolean; skipped: Array<{ sessionId: string; reason: string }> };
+
+    expect(response.status).toBe(200);
+    expect(result.dryRun).toBe(true);
+    expect(result.skipped).toEqual([expect.objectContaining({ sessionId: "ft-clean", reason: "dryRun" })]);
+    await expect(stat(worktreePath)).resolves.toBeTruthy();
+  });
+
+  it("rejects worktree cleanup without a sessionIds array", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    const projectRoot = join(tempDir, "project");
+    await mkdir(projectRoot);
+    const workflowId = "WF-HTTP-CLEANUP-BAD-BODY";
+    await seedExecutingWorkflow(projectRoot, workflowId, createWebPlan(workflowId));
+    await seedCleanupExecution(projectRoot, workflowId, "ft-clean");
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir
+    });
+    await attachExecutionJob(server.url, `EXEC-${workflowId}`, projectRoot);
+
+    const response = await fetch(`${server.url}/api/ao/execution-jobs/${encodeURIComponent(`EXEC-${workflowId}`)}/worktree-cleanup`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ projectRoot, dryRun: true })
+    });
+    const result = (await response.json()) as { error: string };
+
+    expect(response.status).toBe(400);
+    expect(result.error).toBe("sessionIds must be an array");
+  });
+
   it("approves a waiting manual gate through the split execution job API", async () => {
     tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
     const projectRoot = join(tempDir, "project");
@@ -347,19 +456,11 @@ describe("web server", () => {
       port: 0,
       artifactRoot: tempDir
     });
-    await seedExecutingWorkflow(projectRoot, "WF-GATE-APPROVE", createManualGatePlan("WF-GATE-APPROVE"));
+    const workflowId = "WF-GATE-APPROVE";
+    await seedExecutingWorkflow(projectRoot, workflowId, createManualGatePlan(workflowId));
+    await seedWaitingManualGateExecution(projectRoot, workflowId);
 
-    const startResponse = await fetch(`${server.url}/api/ao/execution-jobs`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        projectRoot,
-        workflowId: "WF-GATE-APPROVE",
-        dryRun: true,
-        pollIntervalMs: 1
-      })
-    });
-    const started = (await startResponse.json()) as { jobId: string };
+    const started = { jobId: `EXEC-${workflowId}` };
     const waiting = await waitForExecutionJobStatus(server.url, started.jobId, projectRoot, "waiting_manual_gate");
     expect(waiting.manualGateContext?.taskId).toBe("TASK-002");
 
@@ -384,7 +485,7 @@ describe("web server", () => {
       .resolves.toContain("control_plane_manual_gate");
   });
 
-  it("dispatches a waiting manual gate review through the split execution job API", async () => {
+  it("auto-dispatches a waiting manual gate review after attaching execution state", async () => {
     tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
     const projectRoot = join(tempDir, "project");
     await mkdir(projectRoot);
@@ -392,51 +493,26 @@ describe("web server", () => {
       port: 0,
       artifactRoot: tempDir
     });
-    await seedExecutingWorkflow(projectRoot, "WF-GATE-DISPATCH", createManualGatePlan("WF-GATE-DISPATCH"));
+    const workflowId = "WF-GATE-DISPATCH";
+    await seedExecutingWorkflow(projectRoot, workflowId, createManualGatePlan(workflowId));
+    await seedWaitingManualGateExecution(projectRoot, workflowId);
 
-    const startResponse = await fetch(`${server.url}/api/ao/execution-jobs`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        projectRoot,
-        workflowId: "WF-GATE-DISPATCH",
-        dryRun: true,
-        pollIntervalMs: 1
-      })
-    });
-    const started = (await startResponse.json()) as { jobId: string };
-    await waitForExecutionJobStatus(server.url, started.jobId, projectRoot, "waiting_manual_gate");
-
-    const dispatchResponse = await fetch(
-      `${server.url}/api/ao/execution-jobs/${encodeURIComponent(started.jobId)}/manual-gates/TASK-002/dispatch-review`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          projectRoot,
-          rationale: "派发 AO reviewer 复核"
-        })
-      }
-    );
-    const dispatched = (await dispatchResponse.json()) as {
+    const started = { jobId: `EXEC-${workflowId}` };
+    const dispatched = await waitForExecutionLogEvent(server.url, started.jobId, projectRoot, "manual_gate_review_dispatched") as {
       status: string;
       activeTask?: { taskId: string; aoSessionId?: string; status: string };
       logs: Array<{ type: string }>;
     };
 
-    expect(dispatchResponse.status).toBe(200);
-    expect(dispatched.status).toBe("running");
-    expect(dispatched.activeTask).toMatchObject({
-      taskId: "TASK-002",
-      status: "working"
-    });
-    expect(dispatched.activeTask?.aoSessionId).toBeTruthy();
+    expect(["running", "completed"]).toContain(dispatched.status);
     expect(dispatched.logs.some((event) => event.type === "manual_gate_review_dispatched")).toBe(true);
-    await fetch(`${server.url}/api/ao/execution-jobs/${encodeURIComponent(started.jobId)}/stop`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ projectRoot })
-    });
+    if (dispatched.status === "running") {
+      await fetch(`${server.url}/api/ao/execution-jobs/${encodeURIComponent(started.jobId)}/stop`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ projectRoot, dryRun: true })
+      });
+    }
   });
 
   it("runs the real governance endpoint through injected adapters", async () => {
@@ -1036,6 +1112,7 @@ describe("web server", () => {
 
     expect(html).toContain('id="executeButton"');
     expect(html).toContain('id="retryExecutionTaskButton"');
+    expect(html).toContain('id="reconcileArtifactsButton"');
     expect(html).toContain('id="markExecutionTaskCompletedButton"');
     expect(html).toContain('id="requestExecutionRevisionButton"');
     expect(html).toContain('id="releaseManualGateButton"');
@@ -1044,6 +1121,7 @@ describe("web server", () => {
     expect(html).toContain('id="blockManualGateButton"');
     expect(html).toContain("启动连续执行");
     expect(html).toContain("重试任务");
+    expect(html).toContain("重新检查产物");
     expect(html).toContain("人工标记完成");
     expect(html).toContain("提交重规划请求");
     expect(html).toContain("门禁放行");
@@ -1060,6 +1138,7 @@ describe("web server", () => {
     expect(html).toContain("已中断，需要人工处理");
     expect(html).toContain("submitExecutionRecovery");
     expect(html).toContain("/retry");
+    expect(html).toContain("/reconcile-artifacts");
     expect(html).toContain("/mark-completed");
     expect(html).toContain("/revision-requests");
     expect(html).toContain("getRecoverableExecutionTaskId");
@@ -1164,9 +1243,18 @@ async function waitForExecutionJobStatus(
   projectRoot: string,
   expectedStatus: string
 ) {
+  return waitForExecutionJobStatuses(url, jobId, projectRoot, [expectedStatus]);
+}
+
+async function waitForExecutionJobStatuses(
+  url: string,
+  jobId: string,
+  projectRoot: string,
+  expectedStatuses: string[]
+) {
   for (let attempt = 0; attempt < 40; attempt += 1) {
     const response = await fetch(
-      `${url}/api/ao/execution-jobs/${encodeURIComponent(jobId)}?projectRoot=${encodeURIComponent(projectRoot)}`
+      `${url}/api/ao/execution-jobs/${encodeURIComponent(jobId)}?projectRoot=${encodeURIComponent(projectRoot)}&dryRun=true`
     );
     const job = (await response.json()) as {
       status: string;
@@ -1177,7 +1265,7 @@ async function waitForExecutionJobStatus(
       failure?: { message: string };
       manualGateContext?: { taskId: string };
     };
-    if (job.status === expectedStatus) {
+    if (expectedStatuses.includes(job.status)) {
       return job;
     }
     if (job.status === "failed") {
@@ -1185,7 +1273,40 @@ async function waitForExecutionJobStatus(
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  throw new Error(`execution job did not reach ${expectedStatus}`);
+  throw new Error(`execution job did not reach ${expectedStatuses.join(" or ")}`);
+}
+
+async function waitForExecutionLogEvent(
+  url: string,
+  jobId: string,
+  projectRoot: string,
+  eventType: string
+) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const response = await fetch(
+      `${url}/api/ao/execution-jobs/${encodeURIComponent(jobId)}?projectRoot=${encodeURIComponent(projectRoot)}&dryRun=true`
+    );
+    const job = (await response.json()) as {
+      status: string;
+      logs: Array<{ type: string }>;
+      failure?: { message: string };
+    };
+    if (job.logs?.some((event) => event.type === eventType)) {
+      return job;
+    }
+    if (job.status === "failed") {
+      throw new Error(job.failure?.message ?? "execution job failed");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`execution job did not log ${eventType}`);
+}
+
+async function attachExecutionJob(url: string, jobId: string, projectRoot: string): Promise<void> {
+  const response = await fetch(
+    `${url}/api/ao/execution-jobs/${encodeURIComponent(jobId)}?projectRoot=${encodeURIComponent(projectRoot)}&dryRun=true`
+  );
+  expect(response.status).toBe(200);
 }
 
 async function waitForCompletedJob(url: string, jobId: string, expectedTaskPlanReviews = 1) {
@@ -1288,6 +1409,19 @@ function createWebPlan(workflowId: string): TaskPlan {
   };
 }
 
+function createArtifactPlan(workflowId: string): TaskPlan {
+  const plan = createWebPlan(workflowId);
+  return {
+    ...plan,
+    tasks: plan.tasks.map((task) => ({
+      ...task,
+      outputArtifacts: [
+        { kind: "gate_decision", path: "gate_decision.json", required: true }
+      ]
+    }))
+  };
+}
+
 function createManualGatePlan(workflowId: string): TaskPlan {
   return {
     workflowId,
@@ -1323,6 +1457,117 @@ function createManualGatePlan(workflowId: string): TaskPlan {
       }
     ]
   };
+}
+
+async function seedWaitingManualGateExecution(projectRoot: string, workflowId: string): Promise<void> {
+  const workflowDir = join(projectRoot, ".ao-control-plane", workflowId);
+  await writeJson(join(workflowDir, "execution-state.json"), {
+    workflowId,
+    planVersion: "task-plan-current",
+    planPath: "task-plan.json",
+    status: "waiting_manual_gate",
+    currentTaskId: "TASK-002",
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    completedAt: null,
+    stoppedAt: null,
+    failure: null,
+    taskStates: {
+      "TASK-001": {
+        taskId: "TASK-001",
+        status: "completed",
+        aoRole: "backend-senior",
+        attempt: 1,
+        maxAttempts: 3,
+        completedAt: new Date().toISOString(),
+        failureReason: null,
+        statusObservations: []
+      },
+      "TASK-002": {
+        taskId: "TASK-002",
+        status: "pending",
+        aoRole: "qa",
+        attempt: 0,
+        maxAttempts: 3,
+        completedAt: null,
+        failureReason: null,
+        statusObservations: []
+      }
+    },
+    manualGateReleases: [],
+    pendingDispatch: null,
+    supersededSessions: []
+  });
+}
+
+async function seedFailedArtifactExecution(projectRoot: string, workflowId: string, aoSessionId: string): Promise<void> {
+  const workflowDir = join(projectRoot, ".ao-control-plane", workflowId);
+  await writeJson(join(workflowDir, "execution-state.json"), {
+    workflowId,
+    planVersion: "task-plan-current",
+    planPath: "task-plan.json",
+    status: "failed",
+    currentTaskId: "TASK-001",
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    completedAt: null,
+    stoppedAt: null,
+    failure: {
+      taskId: "TASK-001",
+      kind: "artifact_output_missing",
+      message: "missing output",
+      occurredAt: new Date().toISOString()
+    },
+    taskStates: {
+      "TASK-001": {
+        taskId: "TASK-001",
+        status: "blocked_for_human",
+        aoRole: "backend-senior",
+        aoSessionId,
+        attempt: 1,
+        maxAttempts: 3,
+        startedAt: new Date().toISOString(),
+        completedAt: null,
+        failureReason: "artifact_output_missing",
+        statusObservations: []
+      }
+    },
+    manualGateReleases: [],
+    pendingDispatch: null,
+    supersededSessions: []
+  });
+}
+
+async function seedCleanupExecution(projectRoot: string, workflowId: string, aoSessionId: string): Promise<void> {
+  const workflowDir = join(projectRoot, ".ao-control-plane", workflowId);
+  await writeJson(join(workflowDir, "execution-state.json"), {
+    workflowId,
+    planVersion: "task-plan-current",
+    planPath: "task-plan.json",
+    status: "stopped",
+    currentTaskId: null,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    completedAt: null,
+    stoppedAt: new Date().toISOString(),
+    failure: null,
+    taskStates: {
+      "TASK-001": {
+        taskId: "TASK-001",
+        status: "completed",
+        aoRole: "backend-senior",
+        aoSessionId,
+        attempt: 1,
+        maxAttempts: 3,
+        completedAt: new Date().toISOString(),
+        failureReason: null,
+        statusObservations: []
+      }
+    },
+    manualGateReleases: [],
+    pendingDispatch: null,
+    supersededSessions: [aoSessionId]
+  });
 }
 
 async function writeJson(file: string, value: unknown): Promise<void> {
@@ -1398,6 +1643,20 @@ async function seedExecutingWorkflow(projectRoot: string, workflowId: string, pl
     }
   ]);
   await writeJson(join(workflowDir, "task-plan.json"), plan);
+}
+
+async function seedGitSessionWorktree(projectRoot: string, sessionId: string): Promise<string> {
+  await execa("git", ["init"], { cwd: projectRoot });
+  await execa("git", ["config", "user.email", "test@example.com"], { cwd: projectRoot });
+  await execa("git", ["config", "user.name", "Test User"], { cwd: projectRoot });
+  await writeFile(join(projectRoot, "README.md"), "test\n", "utf8");
+  await execa("git", ["add", "."], { cwd: projectRoot });
+  await execa("git", ["commit", "-m", "init"], { cwd: projectRoot });
+  await execa("git", ["branch", `session/${sessionId}`], { cwd: projectRoot });
+  const worktreePath = join(projectRoot, "..", "worktrees", sessionId);
+  await mkdir(join(projectRoot, "..", "worktrees"), { recursive: true });
+  await execa("git", ["worktree", "add", worktreePath, `session/${sessionId}`], { cwd: projectRoot });
+  return worktreePath;
 }
 
 async function waitForCondition(predicate: () => boolean, message: string): Promise<void> {

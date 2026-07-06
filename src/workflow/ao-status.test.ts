@@ -44,6 +44,7 @@ describe("AO status collector helpers", () => {
         "reviewStatus",
         "role",
         "status",
+        "worktreePath",
       ]
     `);
   });
@@ -56,10 +57,13 @@ describe("AO status collector helpers", () => {
           role: "worker",
           status: "completed",
           prompt: "[WF-001 / TASK-001] Implement API.",
+          worktree_path: "C:\\Users\\niuniu\\.agent-orchestrator\\projects\\demo\\worktrees\\app-3",
           created_at: "2026-06-29T02:00:00.000Z"
         }
       ]
     });
+
+    expect(sessions[0]?.worktreePath).toBe("C:\\Users\\niuniu\\.agent-orchestrator\\projects\\demo\\worktrees\\app-3");
 
     expect(reconcileTaskSessions({ plan, sessions })).toEqual([
       {

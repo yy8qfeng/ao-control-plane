@@ -374,6 +374,7 @@ export function renderIndexHtml(): string {
           <button id="planButton" class="secondary" type="button" disabled>继续审查任务计划</button>
           <button id="executeButton" class="secondary" type="button" disabled>启动连续执行</button>
           <button id="retryExecutionTaskButton" class="secondary" type="button" disabled title="连续执行中断后，可重试当前失败任务。">重试任务</button>
+          <button id="reconcileArtifactsButton" class="secondary" type="button" disabled title="任务产物缺失或冲突时，重新从 AO worktree 检查并归集控制面产物。">重新检查产物</button>
           <button id="markExecutionTaskCompletedButton" class="secondary" type="button" disabled title="任务中断后，人工把当前任务标记为已完成并继续。">人工标记完成</button>
           <button id="requestExecutionRevisionButton" class="secondary" type="button" disabled title="任务中断后，提交任务计划修订请求。">提交重规划请求</button>
           <button id="releaseManualGateButton" class="secondary" type="button" disabled title="manual_gate 等待时，人工批准门禁并继续执行。">门禁放行</button>
@@ -443,6 +444,7 @@ export function renderIndexHtml(): string {
     const planButton = document.querySelector("#planButton");
     const executeButton = document.querySelector("#executeButton");
     const retryExecutionTaskButton = document.querySelector("#retryExecutionTaskButton");
+    const reconcileArtifactsButton = document.querySelector("#reconcileArtifactsButton");
     const markExecutionTaskCompletedButton = document.querySelector("#markExecutionTaskCompletedButton");
     const requestExecutionRevisionButton = document.querySelector("#requestExecutionRevisionButton");
     const releaseManualGateButton = document.querySelector("#releaseManualGateButton");
@@ -622,6 +624,12 @@ export function renderIndexHtml(): string {
       if (!taskId) return;
       if (!confirm("确认重试当前任务 " + taskId + "？调度器会重新派发该任务。")) return;
       await submitExecutionRecovery("retry", "正在重试任务...");
+    });
+
+    reconcileArtifactsButton.addEventListener("click", async () => {
+      const taskId = getRecoverableExecutionTaskId();
+      if (!taskId) return;
+      await reconcileArtifacts("正在重新检查 AO worktree 产物...");
     });
 
     markExecutionTaskCompletedButton.addEventListener("click", async () => {
@@ -1051,6 +1059,8 @@ export function renderIndexHtml(): string {
       executeButton.disabled = busy || !canStartContinuousExecution();
       retryExecutionTaskButton.disabled = busy || !canRetryExecutionTask();
       retryExecutionTaskButton.title = getExecutionRecoveryButtonTitle("retry");
+      reconcileArtifactsButton.disabled = busy || !canReconcileArtifacts();
+      reconcileArtifactsButton.title = getReconcileArtifactsButtonTitle();
       markExecutionTaskCompletedButton.disabled = busy || !canRecoverExecutionTask();
       markExecutionTaskCompletedButton.title = getExecutionRecoveryButtonTitle("mark-completed");
       requestExecutionRevisionButton.disabled = busy || !canRecoverExecutionTask();
@@ -1104,6 +1114,8 @@ export function renderIndexHtml(): string {
       executeButton.disabled = running || executionRunning || !canStartContinuousExecution();
       retryExecutionTaskButton.disabled = running || !canRetryExecutionTask();
       retryExecutionTaskButton.title = getExecutionRecoveryButtonTitle("retry");
+      reconcileArtifactsButton.disabled = running || !canReconcileArtifacts();
+      reconcileArtifactsButton.title = getReconcileArtifactsButtonTitle();
       markExecutionTaskCompletedButton.disabled = running || !canRecoverExecutionTask();
       markExecutionTaskCompletedButton.title = getExecutionRecoveryButtonTitle("mark-completed");
       requestExecutionRevisionButton.disabled = running || !canRecoverExecutionTask();
@@ -1203,6 +1215,8 @@ export function renderIndexHtml(): string {
         lines.push("已中断，需要人工处理：请根据现场情况选择“重试任务”“人工标记完成”或“提交重规划请求”。", "");
       } else if (execution.status === "paused_for_replan") {
         lines.push("已暂停等待重规划：可点击“提交重规划请求”修复任务计划。", "");
+      } else if (execution.status === "waiting_manual_gate") {
+        lines.push("等待门禁复核：调度器会在继续执行时自动派发 AO reviewer；仅在 AO 无法解决、证据缺失或反复阻断时需要人工处理。", "");
       }
       if (activeTask.taskId) {
         lines.push(
@@ -1260,7 +1274,42 @@ export function renderIndexHtml(): string {
         event.aoSessionId ? "aoSession=" + event.aoSessionId : "",
         event.actor ? "actor=" + event.actor : ""
       ].filter(Boolean);
-      return parts.join(" | ");
+      const details = [];
+      if (event.type === "artifact_output_reconcile_started") {
+        details.push("开始检查 canonical 产物与 AO worktree 候选。");
+      }
+      if (event.recovered) {
+        details.push("from=" + event.recovered.from);
+        details.push("to=" + event.recovered.to);
+        if (event.recovered.normalized) details.push("已归一化 AO review 元数据");
+      }
+      if (event.skipped) {
+        details.push("skip=" + event.skipped.reason);
+        if (event.skipped.detail) details.push(event.skipped.detail);
+      }
+      if (event.failures) {
+        details.push("failures=" + formatArtifactEventDetails(event.failures));
+      }
+      if (event.conflicts) {
+        details.push("conflicts=" + formatArtifactEventDetails(event.conflicts));
+      }
+      if (event.missing) {
+        details.push("missing=" + formatArtifactEventDetails(event.missing));
+      }
+      return parts.join(" | ") + (details.length ? " | " + details.join(" | ") : "");
+    }
+
+    function formatArtifactEventDetails(items) {
+      if (!Array.isArray(items)) return String(items || "");
+      return items.map((item) => {
+        if (!item || typeof item !== "object") return String(item);
+        return [
+          item.kind || "artifact",
+          item.reason || "",
+          item.path || "",
+          item.candidatePath ? "candidate=" + item.candidatePath : ""
+        ].filter(Boolean).join(" ");
+      }).join("; ");
     }
 
     async function loadExecutionSnapshot(workflowId, projectRoot, activateExecutionTab) {
@@ -1375,6 +1424,33 @@ export function renderIndexHtml(): string {
         activateTab("execution");
         renderActiveTab();
         updateSummary();
+        if (["running", "waiting_manual_gate", "paused_for_replan"].includes(state.execution.status)) {
+          startPollingExecutionJob(jobId);
+        }
+      } catch (error) {
+        setStatus("bad", error.message || String(error));
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function reconcileArtifacts(busyMessage) {
+      const jobId = state.execution?.jobId;
+      if (!jobId) return;
+      setBusy(true, busyMessage);
+      try {
+        const response = await fetch("/api/ao/execution-jobs/" + encodeURIComponent(jobId) + "/reconcile-artifacts", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ projectRoot: getProjectRoot() })
+        });
+        const result = await readResponse(response);
+        state.execution = result.job || result;
+        state.activeTab = "execution";
+        activateTab("execution");
+        renderActiveTab();
+        updateSummary();
+        setStatus(result.completed ? "ok" : "warn", result.completed ? "产物校验通过，调度器会继续后续任务。" : "已完成重新检查，结果：" + (result.failureKind || "未完成") + "，请查看 AO 执行页的产物归集日志。");
         if (["running", "waiting_manual_gate", "paused_for_replan"].includes(state.execution.status)) {
           startPollingExecutionJob(jobId);
         }
@@ -1508,6 +1584,20 @@ export function renderIndexHtml(): string {
       return canRecoverExecutionTask() && (taskStatus === "blocked_for_human" || taskStatus === "failed" || failedDuringDispatch);
     }
 
+    function canReconcileArtifacts() {
+      const kind = state.execution?.failure?.kind || "";
+      return Boolean(getRecoverableExecutionTaskId()) &&
+        (state.execution?.status === "failed" || state.execution?.status === "paused_for_replan") &&
+        (kind.includes("artifact_output") || kind === "");
+    }
+
+    function getReconcileArtifactsButtonTitle() {
+      const taskId = getRecoverableExecutionTaskId();
+      if (!taskId) return "任务产物缺失或冲突时，可重新检查 AO worktree 产物。";
+      if (canReconcileArtifacts()) return "重新检查任务 " + taskId + " 的 canonical 产物，并尝试从 AO worktree 归集。";
+      return "仅产物缺失、产物冲突或归集失败的中断任务需要重新检查产物。";
+    }
+
     function getExecutionRecoveryButtonTitle(action) {
       const taskId = getRecoverableExecutionTaskId();
       if (!taskId) return "连续执行中断后可处理当前任务。";
@@ -1567,9 +1657,22 @@ export function renderIndexHtml(): string {
       const lines = [
         "门禁上下文：",
         "当前门禁：" + context.taskId + " / " + (context.title || "未命名门禁"),
+        "复核目标：" + (context.description || "未提供描述。"),
         "依赖任务：" + ((context.dependencies || []).join("、") || "无"),
-        "可审查输入产物："
+        "验收标准："
       ];
+      if ((context.acceptanceCriteria || []).length === 0) {
+        lines.push("- 未声明验收标准。");
+      } else {
+        (context.acceptanceCriteria || []).forEach((criterion, index) => {
+          lines.push(String(index + 1) + ". " + criterion);
+        });
+      }
+      lines.push(
+        "AO 复核提示：",
+        context.aoPrompt || "未提供 AO prompt。",
+        "可审查输入产物："
+      );
       const missingPaths = new Set((context.missingArtifacts || []).map((artifact) => artifact.path));
       if ((context.inputArtifacts || []).length === 0) {
         lines.push("- 无结构化输入产物。");

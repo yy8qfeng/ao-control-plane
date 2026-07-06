@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
@@ -138,6 +138,81 @@ describe("ExecutionJobManager", () => {
     );
   });
 
+  it("reconciles failed task artifacts from the AO worktree and resumes execution", async () => {
+    const workflowId = "WF-JOB-RECONCILE";
+    const { store } = await seedManager(workflowId, "failed", true);
+    const artifactDir = store.getWorkflowDir(workflowId);
+    const actualWorktreePath = join(tempDir ?? "", ".agent-orchestrator", "projects", "project", "worktrees", "ft-7");
+    await atomicWriteJson(join(artifactDir, "task-plan.json"), createPlan(workflowId, [
+      {
+        kind: "gate_decision",
+        path: "gate_decision.json",
+        required: true
+      },
+      {
+        kind: "approved_flag",
+        path: "approved.flag",
+        requiredWhen: "decision=approved"
+      }
+    ]));
+    await mkdir(join(actualWorktreePath, ".ao-control-plane", workflowId), { recursive: true });
+    await writeFile(join(actualWorktreePath, ".ao-control-plane", workflowId, "gate_decision.json"), JSON.stringify({
+      workflowId,
+      taskId: "TASK-001",
+      decision: "approved"
+    }), "utf8");
+    await writeFile(join(actualWorktreePath, ".ao-control-plane", workflowId, "approved.flag"), "approved\n", "utf8");
+    await store.update(workflowId, (state) => ({
+      ...state,
+      currentTaskId: "TASK-001",
+      failure: {
+        taskId: "TASK-001",
+        kind: "artifact_output_missing",
+        message: "missing output",
+        occurredAt: new Date().toISOString()
+      },
+      taskStates: {
+        ...state.taskStates,
+        "TASK-001": {
+          ...state.taskStates["TASK-001"]!,
+          aoSessionId: "ft-7"
+        }
+      }
+    }));
+    const managerWithWorktree = new ExecutionJobManager({
+      store,
+      artifactRoot: tempDir ?? "",
+      createAo: () => ({
+        async spawnTask(task) {
+          return { sessionId: `session-${task.taskId}`, stdout: "", stderr: "" };
+        },
+        async listSessions() {
+          return { data: [{ id: "ft-7", status: "completed", worktreePath: actualWorktreePath }] };
+        }
+      })
+    });
+    await managerWithWorktree.getSnapshot(`EXEC-${workflowId}`);
+
+    const result = await managerWithWorktree.reconcileArtifacts(`EXEC-${workflowId}`);
+    const snapshot = await waitForSnapshotStatus(managerWithWorktree, `EXEC-${workflowId}`, "completed");
+
+    expect(result.completed).toBe(true);
+    expect(snapshot.status).toBe("completed");
+    const decision = JSON.parse(await readFile(join(artifactDir, "gate_decision.json"), "utf8")) as { workflowId: string };
+    expect(decision.workflowId).toBe(workflowId);
+  });
+
+  it("rejects artifact reconciliation while the task is still working", async () => {
+    const workflowId = "WF-RECONCILE-WORKING";
+    const { manager } = await seedManager(workflowId, "running", true);
+    await manager.getSnapshot(`EXEC-${workflowId}`);
+
+    await expect(manager.reconcileArtifacts(`EXEC-${workflowId}`)).rejects.toMatchObject({
+      statusCode: 409,
+      message: expect.stringContaining("still working")
+    });
+  });
+
 
   it("releases the prepared lock when retry validation fails", async () => {
     const workflowId = "WF-RETRY-UNKNOWN-TASK";
@@ -241,7 +316,7 @@ async function waitForSnapshotStatus(
   return snapshot;
 }
 
-function createPlan(workflowId: string): TaskPlan {
+function createPlan(workflowId: string, outputArtifacts?: TaskPlan["tasks"][number]["outputArtifacts"]): TaskPlan {
   return {
     workflowId,
     title: "Plan",
@@ -258,7 +333,8 @@ function createPlan(workflowId: string): TaskPlan {
         acceptanceCriteria: ["Done"],
         aoPrompt: `[${workflowId} / TASK-001] Task.`,
         executionPolicy: defaultExecutionPolicy,
-        status: "pending"
+        status: "pending",
+        outputArtifacts
       }
     ]
   };

@@ -15,6 +15,11 @@ import {
   type MissingArtifact
 } from "./ao-dispatch-context.js";
 import { normalizeAoSessions, type AoSessionSnapshot } from "./ao-status.js";
+import {
+  reconcileTaskOutputsFromAoWorktree,
+  rollbackRecoveredArtifacts,
+  type ArtifactReconcileResult
+} from "./ao-output-reconcile.js";
 import { isConditionalReworkTaskText, skipsOnApprovedPath, skipsOnPassPath } from "./conditional-task-conventions.js";
 import {
   type ExecutionErrorKind,
@@ -24,7 +29,7 @@ import {
   type ExecutionTaskState,
   summarizeExecutionState
 } from "./execution-state-store.js";
-import { findNextReadyTask, getCompletedTaskIds, getTaskReadiness } from "./task-readiness.js";
+import { findNextReadyTask, getCompletedTaskIds } from "./task-readiness.js";
 import type { ExecutionTask, TaskPlan } from "../schemas/task-plan.js";
 
 export interface ContinuousExecutionRunnerOptions {
@@ -53,6 +58,14 @@ export interface ContinuousExecutionTickResult {
 type DispatchDecision =
   | { action: "dispatch"; task: ExecutionTask; dispatchId: string }
   | { action: "waiting_manual_gate" | "failed" | "paused"; taskId?: string };
+
+interface OutputValidationFailure {
+  kind: "artifact_output_missing" | "artifact_output_conflict" | "artifact_output_reconcile_failed";
+  missingArtifacts: MissingArtifact[];
+  conflictArtifacts: ConflictArtifact[];
+  reconcileResult?: ArtifactReconcileResult;
+  message: string;
+}
 
 const terminalSuccessStatuses = new Set(["completed", "mergeable", "merged", "done"]);
 const terminalFailureStatusKinds: Record<string, ExecutionErrorKind> = {
@@ -90,7 +103,7 @@ export class ContinuousExecutionRunner {
     while (!this.stopped) {
       const result = await this.tick();
       ticks += 1;
-      if (result.action === "completed" || result.action === "failed" || result.action === "waiting_manual_gate" || result.action === "paused" || result.action === "stopped") {
+      if (result.action === "completed" || result.action === "failed" || result.action === "paused" || result.action === "stopped") {
         return;
       }
       if (this.options.maxTicks && ticks >= this.options.maxTicks) {
@@ -111,8 +124,8 @@ export class ContinuousExecutionRunner {
     if (state.status === "completed") {
       return { action: "completed" };
     }
-    if (state.status === "waiting_manual_gate" || state.status === "paused_for_replan") {
-      return { action: state.status === "waiting_manual_gate" ? "waiting_manual_gate" : "paused", taskId: state.currentTaskId ?? undefined };
+    if (state.status === "paused_for_replan") {
+      return { action: "paused", taskId: state.currentTaskId ?? undefined };
     }
 
     const plan = await this.options.store.readActiveTaskPlan(state);
@@ -139,41 +152,20 @@ export class ContinuousExecutionRunner {
         return { state: current, value: { action: "paused" as const } };
       }
       const completed = getCompletedTaskIds(plan, { getStatus: (taskId) => current.taskStates[taskId]?.status });
+      const autoReviewManualGateTaskIds = getAutoReviewManualGateTaskIds(plan);
       const nextTask = findNextReadyTask({
         plan,
         completed,
-        releasedManualGateTaskIds: new Set<string>(),
+        releasedManualGateTaskIds: autoReviewManualGateTaskIds,
         runtime: { getStatus: (taskId) => current.taskStates[taskId]?.status }
       });
       if (!nextTask) {
-        const blockedManualGate = findBlockedManualGate(plan, current, completed, new Set<string>());
-        if (blockedManualGate) {
-          return {
-            state: {
-              ...current,
-              status: "waiting_manual_gate",
-              currentTaskId: blockedManualGate.taskId
-            },
-            value: { action: "waiting_manual_gate" as const, taskId: blockedManualGate.taskId }
-          };
-        }
         return {
           state: failCurrentState(current, {
             kind: "dependency_deadlock",
-            message: "No working task, no ready task, and no explainable manual gate wait"
+            message: "No working task and no ready task"
           }),
           value: { action: "failed" as const }
-        };
-      }
-
-      if (nextTask.dependencyCondition === "manual_gate") {
-        return {
-          state: {
-            ...current,
-            status: "waiting_manual_gate",
-            currentTaskId: nextTask.taskId
-          },
-          value: { action: "waiting_manual_gate" as const, taskId: nextTask.taskId }
         };
       }
 
@@ -224,7 +216,7 @@ export class ContinuousExecutionRunner {
 
   private async activateState(): Promise<void> {
     await this.options.store.update(this.options.workflowId, (state) => {
-      if (state.status !== "idle" && state.status !== "stopped") {
+      if (state.status !== "idle" && state.status !== "stopped" && state.status !== "waiting_manual_gate") {
         return state;
       }
       const now = new Date().toISOString();
@@ -259,6 +251,15 @@ export class ContinuousExecutionRunner {
         ...current,
         currentTaskId: task.taskId,
         pendingDispatch: null,
+        manualGateReleases: task.dependencyCondition === "manual_gate"
+          ? withAoReviewManualGateRelease(current.manualGateReleases, {
+            taskId: task.taskId,
+            rationale: "AO reviewer dispatched by continuous scheduler before restart",
+            attempt: state.pendingDispatch?.attempt ?? 1,
+            aoSessionId: candidates[0]?.id,
+            dispatchContextPath: state.pendingDispatch?.dispatchContextPath
+          })
+          : current.manualGateReleases,
         taskStates: {
           ...current.taskStates,
           [task.taskId]: {
@@ -412,6 +413,15 @@ export class ContinuousExecutionRunner {
           ...current,
           currentTaskId: task.taskId,
           pendingDispatch: null,
+          manualGateReleases: task.dependencyCondition === "manual_gate"
+            ? withAoReviewManualGateRelease(current.manualGateReleases, {
+              taskId: task.taskId,
+              rationale: "AO reviewer auto-dispatched by continuous scheduler",
+              attempt,
+              aoSessionId: spawnResult.sessionId,
+              dispatchContextPath
+            })
+            : current.manualGateReleases,
           taskStates: {
             ...current.taskStates,
             [task.taskId]: {
@@ -450,6 +460,16 @@ export class ContinuousExecutionRunner {
       aoSessionId: spawnResult.sessionId,
       dispatchContextPath
     });
+    if (task.dependencyCondition === "manual_gate") {
+      await this.options.store.appendLog(this.options.workflowId, {
+        type: "manual_gate_review_dispatched",
+        taskId: task.taskId,
+        attempt: 0,
+        actor: "runner",
+        aoSessionId: spawnResult.sessionId,
+        dispatchContextPath
+      });
+    }
   }
 
   private async syncWorkingTasksWithAo(plan: TaskPlan): Promise<void> {
@@ -476,8 +496,7 @@ export class ContinuousExecutionRunner {
     }
 
     const missingSessionTaskIds: string[] = [];
-    const outputMissingByTaskId = new Map<string, MissingArtifact[]>();
-    const outputConflictsByTaskId = new Map<string, ConflictArtifact[]>();
+    const outputFailuresByTaskId = new Map<string, OutputValidationFailure>();
     for (const taskState of working) {
       const planTask = plan.tasks.find((task) => task.taskId === taskState.taskId);
       if (!planTask || taskState.aoSessionId && state.supersededSessions?.includes(taskState.aoSessionId)) {
@@ -486,17 +505,19 @@ export class ContinuousExecutionRunner {
       const session = findSessionForTaskState(taskState, planTask, sessions);
       if (session?.status && terminalSuccessStatuses.has(session.status)) {
         const manualGateRelease = state.manualGateReleases.find((release) => release.taskId === taskState.taskId);
-        const validation = await validateTaskOutputArtifacts({
+        const failure = await this.validateOrReconcileOutputs({
           task: planTask,
-          artifactDir: this.options.store.getWorkflowDir(this.options.workflowId),
-          manualGateMode: manualGateRelease?.mode,
-          aoSessionId: taskState.aoSessionId
+          taskState: {
+            ...taskState,
+            aoSessionId: taskState.aoSessionId ?? session.id
+          },
+          state,
+          plan,
+          sessions,
+          manualGateMode: manualGateRelease?.mode
         });
-        if (validation.missingArtifacts.length > 0) {
-          outputMissingByTaskId.set(taskState.taskId, validation.missingArtifacts);
-        }
-        if (validation.conflictArtifacts.length > 0) {
-          outputConflictsByTaskId.set(taskState.taskId, validation.conflictArtifacts);
+        if (failure) {
+          outputFailuresByTaskId.set(taskState.taskId, failure);
         }
       }
     }
@@ -534,45 +555,30 @@ export class ContinuousExecutionRunner {
         if (session?.id && !taskState.aoSessionId) {
           next = attachAoSessionId(next, taskState.taskId, session.id);
         }
+        const effectiveTaskState = {
+          ...taskState,
+          aoSessionId: taskState.aoSessionId ?? session?.id
+        };
         const status = session?.status;
         if (!status) {
           continue;
         }
-        const missingOutputs = outputMissingByTaskId.get(taskState.taskId);
-        const conflictOutputs = outputConflictsByTaskId.get(taskState.taskId);
-        if (conflictOutputs?.length) {
+        const outputFailure = outputFailuresByTaskId.get(taskState.taskId);
+        if (outputFailure) {
           next = failCurrentState({
             ...next,
             taskStates: {
               ...next.taskStates,
               [taskState.taskId]: {
-                ...taskState,
+                ...effectiveTaskState,
                 status: "blocked_for_human",
-                failureReason: "artifact_output_conflict"
+                failureReason: outputFailure.kind
               }
             }
           }, {
             taskId: taskState.taskId,
-            kind: "artifact_output_conflict",
-            message: formatConflictArtifacts(conflictOutputs)
-          });
-          break;
-        }
-        if (missingOutputs?.length) {
-          next = failCurrentState({
-            ...next,
-            taskStates: {
-              ...next.taskStates,
-              [taskState.taskId]: {
-                ...taskState,
-                status: "blocked_for_human",
-                failureReason: "artifact_output_missing"
-              }
-            }
-          }, {
-            taskId: taskState.taskId,
-            kind: "artifact_output_missing",
-            message: formatMissingArtifacts(missingOutputs)
+            kind: outputFailure.kind,
+            message: outputFailure.message
           });
           break;
         }
@@ -589,22 +595,164 @@ export class ContinuousExecutionRunner {
         error: "Working task has no aoSessionId and no matching AO session"
       });
     }
-    for (const [taskId, conflicts] of outputConflictsByTaskId.entries()) {
+    for (const [taskId, failure] of outputFailuresByTaskId.entries()) {
       await this.options.store.appendLog(this.options.workflowId, {
-        type: "artifact_output_conflict",
+        type: failure.kind === "artifact_output_conflict"
+          ? "artifact_output_conflict"
+          : failure.kind === "artifact_output_missing"
+            ? "artifact_output_missing"
+            : "artifact_output_reconcile_failed",
         taskId,
         attempt: state.taskStates[taskId]?.attempt ?? 0,
         actor: "runner",
-        conflicts
+        missing: failure.missingArtifacts,
+        conflicts: failure.conflictArtifacts,
+        reconcileResult: failure.reconcileResult
       });
     }
-    for (const [taskId, missing] of outputMissingByTaskId.entries()) {
+  }
+
+  private async validateOrReconcileOutputs(input: {
+    task: ExecutionTask;
+    taskState: ExecutionTaskState;
+    state: ExecutionState;
+    plan: TaskPlan;
+    sessions: AoSessionSnapshot[];
+    manualGateMode?: "manual_approve" | "ao_review";
+  }): Promise<OutputValidationFailure | undefined> {
+    const artifactDir = this.options.store.getWorkflowDir(this.options.workflowId);
+    const validation = await validateTaskOutputArtifacts({
+      task: input.task,
+      artifactDir,
+      manualGateMode: input.manualGateMode,
+      aoSessionId: input.taskState.aoSessionId
+    });
+    if (validation.missingArtifacts.length === 0 && validation.conflictArtifacts.length === 0) {
+      return undefined;
+    }
+
+    await this.options.store.appendLog(this.options.workflowId, {
+      type: "artifact_output_reconcile_started",
+      taskId: input.task.taskId,
+      attempt: input.taskState.attempt,
+      actor: "runner",
+      aoSessionId: input.taskState.aoSessionId,
+      missing: validation.missingArtifacts,
+      conflicts: validation.conflictArtifacts
+    });
+
+    const reconcileResult = await reconcileTaskOutputsFromAoWorktree({
+      task: input.task,
+      plan: input.plan,
+      state: input.state,
+      artifactDir,
+      projectRoot: this.options.projectRoot,
+      aoSessionId: input.taskState.aoSessionId,
+      manualGateMode: input.manualGateMode,
+      sessions: input.sessions
+    });
+    await this.logReconcileResult(input.taskState, reconcileResult);
+
+    if (reconcileResult.failures.length > 0) {
+      return {
+        kind: "artifact_output_reconcile_failed",
+        missingArtifacts: validation.missingArtifacts,
+        conflictArtifacts: validation.conflictArtifacts,
+        reconcileResult,
+        message: formatReconcileFailure(reconcileResult)
+      };
+    }
+    if (reconcileResult.conflicts.length > 0) {
+      return {
+        kind: "artifact_output_conflict",
+        missingArtifacts: validation.missingArtifacts,
+        conflictArtifacts: validation.conflictArtifacts,
+        reconcileResult,
+        message: formatReconcileConflicts(reconcileResult)
+      };
+    }
+
+    const afterReconcile = await validateTaskOutputArtifacts({
+      task: input.task,
+      artifactDir,
+      manualGateMode: input.manualGateMode,
+      aoSessionId: input.taskState.aoSessionId
+    });
+    if (afterReconcile.missingArtifacts.length === 0 && afterReconcile.conflictArtifacts.length === 0) {
+      return undefined;
+    }
+    let finalReconcileResult = reconcileResult;
+    if (reconcileResult.recovered.length > 0) {
+      const rollbackFailure = await rollbackRecoveredArtifacts(reconcileResult);
+      if (rollbackFailure) {
+        finalReconcileResult = withReconcileFailure(reconcileResult, rollbackFailure);
+        await this.options.store.appendLog(this.options.workflowId, {
+          type: "artifact_output_reconcile_failed",
+          taskId: input.task.taskId,
+          attempt: input.taskState.attempt,
+          actor: "runner",
+          aoSessionId: input.taskState.aoSessionId,
+          failures: finalReconcileResult.failures
+        });
+      }
+    }
+    if (afterReconcile.conflictArtifacts.length > 0) {
+      return {
+        kind: "artifact_output_conflict",
+        missingArtifacts: afterReconcile.missingArtifacts,
+        conflictArtifacts: afterReconcile.conflictArtifacts,
+        reconcileResult: finalReconcileResult,
+        message: formatConflictArtifacts(afterReconcile.conflictArtifacts)
+      };
+    }
+    return {
+      kind: "artifact_output_missing",
+      missingArtifacts: afterReconcile.missingArtifacts,
+      conflictArtifacts: afterReconcile.conflictArtifacts,
+      reconcileResult: finalReconcileResult,
+      message: formatMissingArtifacts(afterReconcile.missingArtifacts)
+    };
+  }
+
+  private async logReconcileResult(taskState: ExecutionTaskState, result: ArtifactReconcileResult): Promise<void> {
+    for (const recovered of result.recovered) {
       await this.options.store.appendLog(this.options.workflowId, {
-        type: "artifact_output_missing",
-        taskId,
-        attempt: state.taskStates[taskId]?.attempt ?? 0,
+        type: "artifact_output_recovered_from_worktree",
+        taskId: taskState.taskId,
+        attempt: taskState.attempt,
         actor: "runner",
-        missing
+        aoSessionId: taskState.aoSessionId,
+        recovered
+      });
+      if (recovered.normalized) {
+        await this.options.store.appendLog(this.options.workflowId, {
+          type: "artifact_output_normalized",
+          taskId: taskState.taskId,
+          attempt: taskState.attempt,
+          actor: "runner",
+          aoSessionId: taskState.aoSessionId,
+          recovered
+        });
+      }
+    }
+    for (const skipped of result.skipped) {
+      await this.options.store.appendLog(this.options.workflowId, {
+        type: "artifact_output_reconcile_skipped",
+        taskId: taskState.taskId,
+        attempt: taskState.attempt,
+        actor: "runner",
+        aoSessionId: taskState.aoSessionId,
+        skipped
+      });
+    }
+    if (result.failures.length > 0) {
+      await this.options.store.appendLog(this.options.workflowId, {
+        type: "artifact_output_reconcile_failed",
+        taskId: taskState.taskId,
+        attempt: taskState.attempt,
+        actor: "runner",
+        aoSessionId: taskState.aoSessionId,
+        failures: result.failures
       });
     }
   }
@@ -821,6 +969,114 @@ export async function markExecutionTaskCompleted(input: {
     rationale
   });
   return state;
+}
+
+export async function reconcileExecutionTaskArtifacts(input: {
+  store: ExecutionStateStore;
+  workflowId: string;
+  taskId: string;
+  projectRoot?: string;
+  sessions?: AoSessionSnapshot[];
+  actor?: "user" | "cli" | "web";
+}): Promise<{
+  state: ExecutionState;
+  reconcileResult?: ArtifactReconcileResult;
+  completed: boolean;
+  failureKind?: "artifact_output_missing" | "artifact_output_conflict" | "artifact_output_reconcile_failed";
+}> {
+  const current = await input.store.readState(input.workflowId);
+  const plan = await input.store.readActiveTaskPlan(current);
+  const task = plan.tasks.find((item) => item.taskId === input.taskId);
+  if (!task) {
+    throw new Error(`Unknown task ${input.taskId}`);
+  }
+  const taskState = current.taskStates[input.taskId];
+  if (!taskState) {
+    throw new Error(`Task ${input.taskId} has no execution state`);
+  }
+  if (!["blocked_for_human", "failed", "pending"].includes(taskState.status)) {
+    throw new Error(`Task ${input.taskId} is in status ${taskState.status}, cannot reconcile artifacts`);
+  }
+  const release = current.manualGateReleases.find((item) => item.taskId === input.taskId);
+  const artifactDir = input.store.getWorkflowDir(input.workflowId);
+  const initialValidation = await validateTaskOutputArtifacts({
+    task,
+    artifactDir,
+    manualGateMode: release?.mode,
+    aoSessionId: taskState.aoSessionId
+  });
+  if (initialValidation.missingArtifacts.length === 0 && initialValidation.conflictArtifacts.length === 0) {
+    const state = await completeReconciledTask(input.store, input.workflowId, task, taskState);
+    return { state, completed: true };
+  }
+  await input.store.appendLog(input.workflowId, {
+    type: "artifact_output_reconcile_started",
+    taskId: input.taskId,
+    attempt: taskState.attempt,
+    actor: input.actor ?? "web",
+    aoSessionId: taskState.aoSessionId,
+    missing: initialValidation.missingArtifacts,
+    conflicts: initialValidation.conflictArtifacts
+  });
+  const reconcileResult = await reconcileTaskOutputsFromAoWorktree({
+    task,
+    plan,
+    state: current,
+    artifactDir,
+    projectRoot: input.projectRoot,
+    aoSessionId: taskState.aoSessionId,
+    manualGateMode: release?.mode,
+    sessions: input.sessions
+  });
+  await logStandaloneReconcileResult({
+    store: input.store,
+    workflowId: input.workflowId,
+    taskState,
+    actor: input.actor ?? "web",
+    reconcileResult
+  });
+  if (reconcileResult.failures.length > 0) {
+    const state = await input.store.failState(input.workflowId, {
+      taskId: input.taskId,
+      kind: "artifact_output_reconcile_failed",
+      message: formatReconcileFailure(reconcileResult)
+    });
+    return { state, reconcileResult, completed: false, failureKind: "artifact_output_reconcile_failed" };
+  }
+  if (reconcileResult.conflicts.length > 0) {
+    const state = await input.store.failState(input.workflowId, {
+      taskId: input.taskId,
+      kind: "artifact_output_conflict",
+      message: formatReconcileConflicts(reconcileResult)
+    });
+    return { state, reconcileResult, completed: false, failureKind: "artifact_output_conflict" };
+  }
+  const validation = await validateTaskOutputArtifacts({
+    task,
+    artifactDir,
+    manualGateMode: release?.mode,
+    aoSessionId: taskState.aoSessionId
+  });
+  if (validation.missingArtifacts.length === 0 && validation.conflictArtifacts.length === 0) {
+    const state = await completeReconciledTask(input.store, input.workflowId, task, taskState);
+    return { state, reconcileResult, completed: true };
+  }
+  let finalReconcileResult = reconcileResult;
+  if (reconcileResult.recovered.length > 0) {
+    const rollbackFailure = await rollbackRecoveredArtifacts(reconcileResult);
+    if (rollbackFailure) {
+      finalReconcileResult = withReconcileFailure(reconcileResult, rollbackFailure);
+    }
+  }
+  const failureKind = validation.conflictArtifacts.length > 0 ? "artifact_output_conflict" : "artifact_output_missing";
+  const state = await input.store.failState(input.workflowId, {
+    taskId: input.taskId,
+    kind: failureKind,
+    message: validation.conflictArtifacts.length > 0
+      ? formatConflictArtifacts(validation.conflictArtifacts)
+      : formatMissingArtifacts(validation.missingArtifacts)
+  });
+  return { state, reconcileResult: finalReconcileResult, completed: false, failureKind };
 }
 
 export async function approveManualGate(input: {
@@ -1326,6 +1582,97 @@ function applyAoStatusObservation(
   };
 }
 
+async function completeReconciledTask(
+  store: ExecutionStateStore,
+  workflowId: string,
+  task: ExecutionTask,
+  taskState: ExecutionTaskState
+): Promise<ExecutionState> {
+  const completedAt = new Date().toISOString();
+  const state = await store.update(workflowId, (current) => ({
+    ...current,
+    status: "running",
+    currentTaskId: current.currentTaskId === task.taskId ? null : current.currentTaskId,
+    failure: null,
+    taskStates: {
+      ...current.taskStates,
+      [task.taskId]: {
+        ...taskState,
+        ...(current.taskStates[task.taskId] ?? {}),
+        status: "completed" as const,
+        completedAt,
+        failureReason: null,
+        statusObservations: [
+          ...(current.taskStates[task.taskId]?.statusObservations ?? []),
+          {
+            attempt: taskState.attempt,
+            status: "completed",
+            observedAt: completedAt
+          }
+        ].slice(-5)
+      }
+    }
+  })) as ExecutionState;
+  await store.appendLog(workflowId, {
+    type: "task_completed_from_ao_report",
+    taskId: task.taskId,
+    attempt: taskState.attempt,
+    actor: "runner",
+    aoSessionId: taskState.aoSessionId,
+    reportedState: "completed"
+  });
+  return state;
+}
+
+async function logStandaloneReconcileResult(input: {
+  store: ExecutionStateStore;
+  workflowId: string;
+  taskState: ExecutionTaskState;
+  actor: "user" | "cli" | "web";
+  reconcileResult: ArtifactReconcileResult;
+}): Promise<void> {
+  for (const recovered of input.reconcileResult.recovered) {
+    await input.store.appendLog(input.workflowId, {
+      type: "artifact_output_recovered_from_worktree",
+      taskId: input.taskState.taskId,
+      attempt: input.taskState.attempt,
+      actor: input.actor,
+      aoSessionId: input.taskState.aoSessionId,
+      recovered
+    });
+    if (recovered.normalized) {
+      await input.store.appendLog(input.workflowId, {
+        type: "artifact_output_normalized",
+        taskId: input.taskState.taskId,
+        attempt: input.taskState.attempt,
+        actor: input.actor,
+        aoSessionId: input.taskState.aoSessionId,
+        recovered
+      });
+    }
+  }
+  for (const skipped of input.reconcileResult.skipped) {
+    await input.store.appendLog(input.workflowId, {
+      type: "artifact_output_reconcile_skipped",
+      taskId: input.taskState.taskId,
+      attempt: input.taskState.attempt,
+      actor: input.actor,
+      aoSessionId: input.taskState.aoSessionId,
+      skipped
+    });
+  }
+  if (input.reconcileResult.failures.length > 0) {
+    await input.store.appendLog(input.workflowId, {
+      type: "artifact_output_reconcile_failed",
+      taskId: input.taskState.taskId,
+      attempt: input.taskState.attempt,
+      actor: input.actor,
+      aoSessionId: input.taskState.aoSessionId,
+      failures: input.reconcileResult.failures
+    });
+  }
+}
+
 function attachAoSessionId(state: ExecutionState, taskId: string, aoSessionId: string): ExecutionState {
   const task = state.taskStates[taskId];
   if (!task) {
@@ -1343,20 +1690,37 @@ function attachAoSessionId(state: ExecutionState, taskId: string, aoSessionId: s
   };
 }
 
-function findBlockedManualGate(
-  plan: TaskPlan,
-  state: ExecutionState,
-  completed: ReadonlySet<string>,
-  released: ReadonlySet<string>
-): ExecutionTask | undefined {
-  return plan.tasks.find((task) => {
-    const runtimeStatus = state.taskStates[task.taskId]?.status ?? task.status;
-    if (runtimeStatus !== "pending" || task.dependencyCondition !== "manual_gate") {
-      return false;
+function getAutoReviewManualGateTaskIds(plan: TaskPlan): Set<string> {
+  return new Set(
+    plan.tasks
+      .filter((task) => task.dependencyCondition === "manual_gate")
+      .map((task) => task.taskId)
+  );
+}
+
+function withAoReviewManualGateRelease(
+  releases: ExecutionState["manualGateReleases"],
+  input: {
+    taskId: string;
+    rationale: string;
+    attempt: number;
+    aoSessionId?: string;
+    dispatchContextPath?: string;
+  }
+): ExecutionState["manualGateReleases"] {
+  return [
+    ...releases.filter((release) => release.taskId !== input.taskId),
+    {
+      taskId: input.taskId,
+      decision: "review_dispatched" as const,
+      mode: "ao_review" as const,
+      rationale: input.rationale,
+      releasedAt: new Date().toISOString(),
+      attempt: input.attempt,
+      aoSessionId: input.aoSessionId,
+      dispatchContextPath: input.dispatchContextPath
     }
-    const readiness = getTaskReadiness({ task, completed, releasedManualGateTaskIds: released });
-    return !readiness.ready && readiness.kind === "manual_gate";
-  });
+  ];
 }
 
 function findSessionForTaskState(
@@ -1505,6 +1869,40 @@ function formatConflictArtifacts(conflicts: ConflictArtifact[]): string {
       `- ${artifact.taskId ? `${artifact.taskId} / ` : ""}${artifact.kind}: ${artifact.path} (${artifact.reason}, expected=${artifact.expected}, actual=${artifact.actual ?? ""})`
     )
   ].join("\n");
+}
+
+function formatReconcileFailure(result: ArtifactReconcileResult): string {
+  return [
+    "Control-plane output artifact reconciliation failed:",
+    ...result.failures.map((failure) =>
+      `- ${failure.kind}: ${failure.path} (${failure.reason}${failure.detail ? `, ${failure.detail}` : ""})`
+    ),
+    ...result.missing.map((artifact) =>
+      `- ${artifact.kind}: expected ${artifact.path}, candidate ${artifact.candidatePath} (${artifact.reason})`
+    ),
+    ...result.skipped.map((skip) =>
+      `- skipped${skip.kind ? ` ${skip.kind}` : ""}: ${skip.reason}${skip.detail ? `, ${skip.detail}` : ""}`
+    )
+  ].join("\n");
+}
+
+function formatReconcileConflicts(result: ArtifactReconcileResult): string {
+  return [
+    "Control-plane output artifacts conflict with AO worktree candidates:",
+    ...result.conflicts.map((artifact) =>
+      `- ${artifact.kind}: ${artifact.path}${artifact.candidatePath ? `, candidate ${artifact.candidatePath}` : ""} (${artifact.reason}, expected=${artifact.expected ?? ""}, actual=${artifact.actual ?? ""})`
+    )
+  ].join("\n");
+}
+
+function withReconcileFailure(
+  result: ArtifactReconcileResult,
+  failure: ArtifactReconcileResult["failures"][number]
+): ArtifactReconcileResult {
+  return {
+    ...result,
+    failures: [...result.failures, failure]
+  };
 }
 
 function sleep(ms: number): Promise<void> {

@@ -10,6 +10,7 @@ export interface AoSessionSnapshot {
   createdAt?: string;
   displayName?: string;
   branch?: string;
+  worktreePath?: string;
   prUrl?: string;
   ciStatus?: string;
   reviewStatus?: string;
@@ -56,6 +57,7 @@ export function normalizeAoSessions(value: unknown): AoSessionSnapshot[] {
       createdAt: readString(session, ["createdAt", "created_at"]),
       displayName: readString(session, ["displayName", "display_name", "name"]),
       branch: readString(session, ["branch"]),
+      worktreePath: readString(session, ["worktreePath", "worktree_path", "worktree", "workspacePath", "workspace_path", "workspace"]),
       prUrl: readString(session, ["prUrl", "pr_url"]),
       ciStatus: readString(session, ["ciStatus", "ci_status"]),
       reviewStatus: readString(session, ["reviewStatus", "review_status"])
@@ -114,7 +116,8 @@ export function getAoSessionSnapshotKeys(): string[] {
     "reportedState",
     "reviewStatus",
     "role",
-    "status"
+    "status",
+    "worktreePath"
   ];
 }
 

@@ -75,6 +75,21 @@ const coreInputFiles = [
   { kind: "execution_log", file: "execution-log.jsonl", required: false }
 ] as const;
 
+const dispatchInstructions = [
+  "Do not rely only on the AO worktree.",
+  "An empty AO worktree is not evidence that control-plane artifacts are missing.",
+  "Read the dispatchContextManifest for machine-readable context before reporting missing inputs.",
+  "Treat artifactDir as the authoritative control-plane evidence and output directory.",
+  "Dependency artifacts are required inputs; read every required dependency artifact from artifactDir before asking for user help.",
+  "Expected outputs are files you must create for this task; their absence before the task starts is normal.",
+  "Do not treat a missing expected output as missing input.",
+  "Write every required expected output to the exact absolute expectedOutputs.path shown in this prompt and manifest.",
+  "Do not write control-plane outputs only under your AO worktree.",
+  "Before reporting completed, verify every required expectedOutputs.path exists in the canonical artifactDir.",
+  "If you accidentally wrote an output under your worktree .ao-control-plane, copy it to the exact expectedOutputs.path before reporting completed.",
+  "For AO review manual gates, gate decision JSON must use source=\"ao_review\" and include your AO session id as aoSessionId."
+] as const;
+
 export async function buildAoDispatchContext(input: {
   task: ExecutionTask;
   plan: TaskPlan;
@@ -105,23 +120,20 @@ export async function buildAoDispatchContext(input: {
     `artifactDir: ${manifest.artifactDir}`,
     `dispatchContextManifest: ${contextPath}`,
     "",
-    "coreInputs:",
-    ...manifest.coreInputs.map((artifact, index) => `${index + 1}. ${artifact.kind}: ${artifact.path}`),
+    "coreInputs: control-plane inputs",
+    ...manifest.coreInputs.map((artifact, index) => `${index + 1}. INPUT ${formatArtifactForPrompt(artifact)}`),
     "",
-    "dependencyArtifacts:",
+    "dependencyArtifacts: required task inputs; read before asking for user help",
     ...manifest.dependencyArtifacts.flatMap((dependency) => [
       `- ${dependency.taskId} / ${dependency.title}`,
-      ...dependency.artifacts.map((artifact) => `  - ${artifact.kind}: ${artifact.path}`)
+      ...dependency.artifacts.map((artifact) => `  - INPUT ${formatArtifactForPrompt(artifact)}`)
     ]),
     "",
-    "expectedOutputs:",
-    ...manifest.expectedOutputs.map((artifact, index) => `${index + 1}. ${artifact.kind}: ${artifact.path}`),
+    "expectedOutputs: task outputs to create; absence before task execution is normal",
+    ...manifest.expectedOutputs.map((artifact, index) => `${index + 1}. OUTPUT ${formatArtifactForPrompt(artifact)}`),
     "",
     "instructions:",
-    "1. Do not rely only on the AO worktree.",
-    "2. Read the dispatchContextManifest for machine-readable context.",
-    "3. Treat artifactDir as the authoritative evidence and output directory.",
-    "4. Write required task evidence outputs to artifactDir.",
+    ...dispatchInstructions.map((instruction, index) => `${index + 1}. ${instruction}`),
     "---"
   ].join("\n");
 
@@ -166,11 +178,7 @@ export function buildDispatchManifest(input: {
       };
     }),
     expectedOutputs: outputArtifacts,
-    instructions: [
-      "Do not rely only on the AO worktree.",
-      "Use artifactDir as the control-plane evidence directory.",
-      "Write task evidence outputs to artifactDir."
-    ]
+    instructions: [...dispatchInstructions]
   };
 }
 
@@ -429,6 +437,13 @@ function resolveArtifact(artifact: TaskArtifact, artifactDir: string): ResolvedA
     required: artifact.required ?? artifact.requiredOnSuccess ?? artifact.requiredWhen === undefined,
     requiredWhen: artifact.requiredWhen
   };
+}
+
+function formatArtifactForPrompt(artifact: ResolvedArtifact): string {
+  const requirement = artifact.requiredWhen
+    ? `requiredWhen=${artifact.requiredWhen}`
+    : `required=${artifact.required}`;
+  return `${artifact.kind}: ${artifact.path} (${requirement})`;
 }
 
 function getManualGateArtifactPaths(task: ExecutionTask, artifactDir: string): { decisionPath: string; flagPath: string } {
