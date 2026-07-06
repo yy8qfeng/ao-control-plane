@@ -374,11 +374,11 @@ export function renderIndexHtml(): string {
           <button id="planButton" class="secondary" type="button" disabled>继续审查任务计划</button>
           <button id="executeButton" class="secondary" type="button" disabled>启动连续执行</button>
           <button id="retryExecutionTaskButton" class="secondary" type="button" disabled title="连续执行中断后，可重试当前失败任务。">重试任务</button>
-          <button id="markExecutionTaskCompletedButton" class="secondary" type="button" disabled title="连续执行中断后，可人工确认当前任务已完成。">人工确认完成</button>
-          <button id="requestExecutionRevisionButton" class="secondary" type="button" disabled title="连续执行中断后，可要求修复任务计划并继续。">重规划</button>
-          <button id="releaseManualGateButton" class="secondary" type="button" disabled title="启动连续执行后，调度器会在需要人工门禁时暂停。">放行门禁</button>
-          <button id="replanManualGateButton" class="secondary" type="button" disabled title="启动连续执行后，调度器会在需要人工门禁时暂停。">要求重规划</button>
-          <button id="blockManualGateButton" class="secondary" type="button" disabled title="启动连续执行后，调度器会在需要人工门禁时暂停。">标记阻断</button>
+          <button id="markExecutionTaskCompletedButton" class="secondary" type="button" disabled title="任务中断后，人工把当前任务标记为已完成并继续。">人工标记完成</button>
+          <button id="requestExecutionRevisionButton" class="secondary" type="button" disabled title="任务中断后，提交任务计划修订请求。">提交重规划请求</button>
+          <button id="releaseManualGateButton" class="secondary" type="button" disabled title="manual_gate 等待时，批准门禁并继续执行。">门禁放行继续</button>
+          <button id="replanManualGateButton" class="secondary" type="button" disabled title="manual_gate 等待时，要求先修复任务计划。">门禁要求重规划</button>
+          <button id="blockManualGateButton" class="secondary" type="button" disabled title="manual_gate 等待时，标记该门禁阻断执行。">门禁标记阻断</button>
         </div>
         <div id="draftStatus" class="status">表单草稿会自动保存到本地。</div>
         <div id="formStatus" class="status"></div>
@@ -625,32 +625,32 @@ export function renderIndexHtml(): string {
     markExecutionTaskCompletedButton.addEventListener("click", async () => {
       const taskId = getRecoverableExecutionTaskId();
       if (!taskId) return;
-      const rationale = prompt("请输入人工确认完成原因，调度器会跳过该任务并继续后续任务。", "已人工核验任务结果符合验收标准");
+      const rationale = prompt("请输入人工标记完成原因，调度器会把当前任务置为完成并继续后续任务。", "已人工核验任务结果符合验收标准");
       if (!rationale || !rationale.trim()) return;
-      await submitExecutionRecovery("mark-completed", "正在人工确认任务完成...", rationale.trim());
+      await submitExecutionRecovery("mark-completed", "正在人工标记任务完成...", rationale.trim());
     });
 
     requestExecutionRevisionButton.addEventListener("click", async () => {
       const taskId = getRecoverableExecutionTaskId();
       if (!taskId) return;
-      const rationale = prompt("请输入重规划原因，系统会基于当前失败点修复任务计划。", getDefaultRevisionRationale());
+      const rationale = prompt("请输入重规划请求原因，系统会基于当前失败点修复任务计划。", getDefaultRevisionRationale());
       if (!rationale || !rationale.trim()) return;
       await submitExecutionRecovery("request-revision", "正在提交重规划请求...", rationale.trim());
     });
 
     releaseManualGateButton.addEventListener("click", async () => {
-      if (!confirm("确认放行当前 manual_gate 并继续执行？")) return;
-      await submitManualGateDecision("approved", "Web UI 人工放行");
+      if (!confirm("确认批准当前 manual_gate 并继续执行？")) return;
+      await submitManualGateDecision("approved", "Web UI 门禁放行继续");
     });
 
     replanManualGateButton.addEventListener("click", async () => {
-      if (!confirm("确认要求修复任务计划？连续执行会暂停到重规划流程。")) return;
-      await submitManualGateDecision("requires_replan", "Web UI 要求重规划");
+      if (!confirm("确认当前 manual_gate 要求先修复任务计划？连续执行会暂停到重规划流程。")) return;
+      await submitManualGateDecision("requires_replan", "Web UI 门禁要求重规划");
     });
 
     blockManualGateButton.addEventListener("click", async () => {
-      if (!confirm("确认标记当前 manual_gate 阻断？连续执行会中断。")) return;
-      await submitManualGateDecision("blocked", "Web UI 标记阻断");
+      if (!confirm("确认将当前 manual_gate 标记为阻断？连续执行会中断。")) return;
+      await submitManualGateDecision("blocked", "Web UI 门禁标记阻断");
     });
 
     document.querySelectorAll(".tab").forEach((tab) => {
@@ -1189,9 +1189,9 @@ export function renderIndexHtml(): string {
         ""
       ];
       if (execution.status === "failed") {
-        lines.push("已中断，需要人工处理：请根据现场情况选择“重试任务”“人工确认完成”或“重规划”。", "");
+        lines.push("已中断，需要人工处理：请根据现场情况选择“重试任务”“人工标记完成”或“提交重规划请求”。", "");
       } else if (execution.status === "paused_for_replan") {
-        lines.push("已暂停等待重规划：可点击“重规划”修复任务计划。", "");
+        lines.push("已暂停等待重规划：可点击“提交重规划请求”修复任务计划。", "");
       }
       if (activeTask.taskId) {
         lines.push(
@@ -1298,7 +1298,7 @@ export function renderIndexHtml(): string {
         const message = error.message || String(error);
         if (message.includes("Workflow execution is failed")) {
           await loadExecutionSnapshot(workflowId, getProjectRoot(), true);
-          setStatus("warn", "连续执行已中断，请在 AO 执行页选择重试任务、人工确认完成或重规划。");
+          setStatus("warn", "连续执行已中断，请在 AO 执行页选择重试任务、人工标记完成或提交重规划请求。");
         } else {
           setStatus("bad", message);
         }
@@ -1328,7 +1328,7 @@ export function renderIndexHtml(): string {
             headers: { "content-type": "application/json" },
             body: JSON.stringify({
               projectRoot: getProjectRoot(),
-              rationale: rationale || "Web UI 人工确认完成"
+              rationale: rationale || "Web UI 人工标记完成"
             })
           });
           state.execution = await readResponse(response);
@@ -1442,8 +1442,8 @@ export function renderIndexHtml(): string {
           ? "重新派发当前任务 " + taskId + "。"
           : "只有 failed、blocked_for_human 或派发失败的任务可以重试。";
       }
-      if (action === "mark-completed") return "人工确认当前任务 " + taskId + " 已完成，并继续后续任务。";
-      return "基于当前任务 " + taskId + " 请求修复任务计划。";
+      if (action === "mark-completed") return "人工把当前任务 " + taskId + " 标记为已完成，并继续后续任务。";
+      return "基于当前任务 " + taskId + " 提交重规划请求。";
     }
 
     function getRevisionReasonCategory() {
@@ -1464,15 +1464,15 @@ export function renderIndexHtml(): string {
 
     function getReleaseManualGateButtonTitle() {
       const count = getManualGateBlockedTaskIds().length;
-      if (count > 0) return "放行当前等待的 " + count + " 个 manual_gate 任务。";
-      return "启动连续执行后，调度器会在需要人工门禁时暂停。";
+      if (count > 0) return "批准当前等待的 " + count + " 个 manual_gate，并继续执行。";
+      return "manual_gate 等待时，批准门禁并继续执行。";
     }
 
     function getManualGateDecisionButtonTitle(decision) {
       const count = getManualGateBlockedTaskIds().length;
-      if (count === 0) return "启动连续执行后，调度器会在需要人工门禁时暂停。";
+      if (count === 0) return "manual_gate 等待时，可要求重规划或标记阻断。";
       if (decision === "requires_replan") return "将当前等待的 " + count + " 个 manual_gate 标记为需要重规划。";
-      return "将当前等待的 " + count + " 个 manual_gate 标记为阻断。";
+      return "将当前等待的 " + count + " 个 manual_gate 标记为阻断执行。";
     }
 
     function getExecutionSuccessMessage(execution) {
