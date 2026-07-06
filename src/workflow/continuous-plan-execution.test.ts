@@ -74,6 +74,137 @@ describe("ContinuousExecutionRunner", () => {
     expect(state.currentTaskId).toBe("TASK-002");
   });
 
+  it("skips replan-only manual gate branches after an approved upstream gate", async () => {
+    const workflowId = "WF-SKIP-APPROVED-REPLAN";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", { title: "G0 仓库现实校准", status: "completed" }),
+      createTask(workflowId, "TASK-002", {
+        title: "G0 人工复核放行",
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        type: "review",
+        aoRole: "reviewer"
+      }),
+      createTask(workflowId, "TASK-003", {
+        title: "G0 复核失败回流重规划",
+        description: "仅在 TASK-002 非 approved 时触发，approved 路径不派发。",
+        dependencies: ["TASK-002"],
+        dependencyCondition: "manual_gate",
+        type: "design",
+        aoRole: "architect"
+      }),
+      createTask(workflowId, "TASK-004", {
+        title: "后续设计任务",
+        dependencies: ["TASK-002"]
+      })
+    ]));
+    await writeFile(join(store.getWorkflowDir(workflowId), "g0_repo_reality_check.json"), "{}\n", "utf8");
+    await writeFile(join(store.getWorkflowDir(workflowId), "g0_review_gate_decision.json"), JSON.stringify({
+      workflowId,
+      taskId: "TASK-002",
+      decision: "approved",
+      source: "control_plane_manual_gate"
+    }), "utf8");
+    await writeFile(join(store.getWorkflowDir(workflowId), "g0_approved.flag"), "approved\n", "utf8");
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "running",
+      taskStates: {
+        "TASK-001": {
+          taskId: "TASK-001",
+          status: "completed",
+          aoRole: "architect",
+          attempt: 1,
+          maxAttempts: 3
+        },
+        "TASK-002": {
+          taskId: "TASK-002",
+          status: "completed",
+          aoRole: "reviewer",
+          attempt: 1,
+          maxAttempts: 3
+        }
+      },
+      manualGateReleases: [{
+        taskId: "TASK-002",
+        decision: "approved",
+        mode: "manual_approve",
+        rationale: "approved",
+        releasedAt: new Date().toISOString()
+      }]
+    }));
+    const ao = createFakeAo(["completed"]);
+    const runner = new ContinuousExecutionRunner({
+      workflowId,
+      store,
+      ao: ao as Pick<AoCliAdapter, "spawnTask" | "listSessions">,
+      pollIntervalMs: 1,
+      maxTicks: 3
+    });
+
+    await runner.run();
+
+    const state = await store.readState(workflowId);
+    expect(state.taskStates["TASK-003"]?.status).toBe("superseded");
+    expect(ao.spawned).toEqual(["TASK-004"]);
+    await expect(store.readLogs(workflowId)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "task_skipped",
+          taskId: "TASK-003",
+          outcome: "approved"
+        })
+      ])
+    );
+  });
+
+  it("skips fail-only QA replan branches after a pass verdict", async () => {
+    const workflowId = "WF-SKIP-PASS-REPLAN";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-094", {
+        title: "统一发布前 QA verdict 汇总裁决",
+        type: "verification",
+        aoRole: "qa",
+        status: "completed"
+      }),
+      createTask(workflowId, "TASK-095", {
+        title: "统一 QA verdict 失败回流重规划",
+        description: "仅在 TASK-094 verdict=fail 时由 manual_gate 触发；pass 路径不派发。",
+        dependencies: ["TASK-094"],
+        dependencyCondition: "manual_gate",
+        type: "design",
+        aoRole: "architect"
+      })
+    ]));
+    await writeFile(join(store.getWorkflowDir(workflowId), "unified_qa_verdict.json"), JSON.stringify({ verdict: "pass" }), "utf8");
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "running",
+      taskStates: {
+        "TASK-094": {
+          taskId: "TASK-094",
+          status: "completed",
+          aoRole: "qa",
+          attempt: 1,
+          maxAttempts: 3
+        }
+      }
+    }));
+    const runner = new ContinuousExecutionRunner({
+      workflowId,
+      store,
+      ao: createListOnlyAo([]) as Pick<AoCliAdapter, "spawnTask" | "listSessions">,
+      pollIntervalMs: 1,
+      maxTicks: 2
+    });
+
+    await runner.run();
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("completed");
+    expect(state.taskStates["TASK-095"]?.status).toBe("superseded");
+  });
+
   it("requires repeated same-attempt AO failure observations before failing", async () => {
     const workflowId = "WF-FAILED";
     const { store } = await seedPlan(createPlan(workflowId, [

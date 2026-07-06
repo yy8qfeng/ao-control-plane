@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import type { AoCliAdapter, AoSpawnResult } from "../adapters/ao.js";
 import {
   buildAoDispatchContext,
@@ -7,12 +8,14 @@ import {
   findExistingManualGateArtifacts,
   getDispatchContextPath,
   resolveInputArtifacts,
+  resolveOutputArtifacts,
   synthesizeManualGateArtifacts,
   validateTaskOutputArtifacts,
   type ConflictArtifact,
   type MissingArtifact
 } from "./ao-dispatch-context.js";
 import { normalizeAoSessions, type AoSessionSnapshot } from "./ao-status.js";
+import { isConditionalReworkTaskText, skipsOnApprovedPath, skipsOnPassPath } from "./conditional-task-conventions.js";
 import {
   type ExecutionErrorKind,
   type ExecutionFailure,
@@ -114,6 +117,7 @@ export class ContinuousExecutionRunner {
 
     const plan = await this.options.store.readActiveTaskPlan(state);
     await this.syncWorkingTasksWithAo(plan);
+    await this.skipInactiveConditionalTasks(plan);
 
     const afterSync = await this.options.store.readState(this.options.workflowId);
     if (afterSync.status === "failed") {
@@ -611,7 +615,7 @@ export class ContinuousExecutionRunner {
         return { state, value: undefined };
       }
       const summary = summarizeExecutionState(plan, state);
-      if (summary.completed === plan.tasks.length) {
+      if (summary.completed + summary.superseded === plan.tasks.length) {
         const completed = {
           ...state,
           status: "completed" as const,
@@ -637,6 +641,74 @@ export class ContinuousExecutionRunner {
         taskId,
         attempt: 0,
         actor: "runner"
+      });
+    }
+  }
+
+  private async skipInactiveConditionalTasks(plan: TaskPlan): Promise<void> {
+    const state = await this.options.store.readState(this.options.workflowId);
+    if (state.status !== "running") {
+      return;
+    }
+    const completed = getCompletedTaskIds(plan, { getStatus: (taskId) => state.taskStates[taskId]?.status });
+    const artifactDir = this.options.store.getWorkflowDir(this.options.workflowId);
+    const skipped: Array<{ taskId: string; reason: string; dependencyTaskId?: string; outcome?: string }> = [];
+    for (const task of plan.tasks) {
+      const status = state.taskStates[task.taskId]?.status ?? task.status;
+      if (status !== "pending" || !task.dependencies.every((dependency) => completed.has(dependency))) {
+        continue;
+      }
+      const skip = await getConditionalSkipDecision({
+        task,
+        plan,
+        state,
+        artifactDir
+      });
+      if (skip) {
+        skipped.push({ taskId: task.taskId, ...skip });
+      }
+    }
+    if (skipped.length === 0) {
+      return;
+    }
+    const updated = await this.options.store.update(this.options.workflowId, (current) => {
+      const at = new Date().toISOString();
+      const taskStates = { ...current.taskStates };
+      for (const item of skipped) {
+        const planTask = plan.tasks.find((task) => task.taskId === item.taskId);
+        if (!planTask) {
+          continue;
+        }
+        const currentTask = taskStates[item.taskId];
+        if ((currentTask?.status ?? planTask.status) !== "pending") {
+          continue;
+        }
+        taskStates[item.taskId] = {
+          ...(currentTask ?? createTaskState(planTask, 0)),
+          status: "superseded",
+          aoRole: planTask.aoRole,
+          completedAt: at,
+          failureReason: item.reason
+        };
+      }
+      return {
+        ...current,
+        currentTaskId: skipped.some((item) => item.taskId === current.currentTaskId) ? null : current.currentTaskId,
+        taskStates
+      };
+    }) as ExecutionState;
+    for (const item of skipped) {
+      if (updated.taskStates[item.taskId]?.status !== "superseded") {
+        continue;
+      }
+      await this.options.store.appendLog(this.options.workflowId, {
+        type: "task_skipped",
+        taskId: item.taskId,
+        attempt: updated.taskStates[item.taskId]?.attempt ?? 0,
+        actor: "runner",
+        reason: item.reason,
+        dependencyTaskId: item.dependencyTaskId,
+        outcome: item.outcome
       });
     }
   }
@@ -1330,6 +1402,87 @@ function failCurrentState(
   };
 }
 
+async function getConditionalSkipDecision(input: {
+  task: ExecutionTask;
+  plan: TaskPlan;
+  state: ExecutionState;
+  artifactDir: string;
+}): Promise<{ reason: string; dependencyTaskId?: string; outcome?: string } | undefined> {
+  const text = taskText(input.task);
+  if (!isConditionalReworkTaskText(text)) {
+    return undefined;
+  }
+  const dependencyTaskId = input.task.dependencies[0];
+  if (!dependencyTaskId) {
+    return undefined;
+  }
+  const outcome = await readDependencyOutcome({
+    dependencyTaskId,
+    plan: input.plan,
+    state: input.state,
+    artifactDir: input.artifactDir
+  });
+  if (!outcome) {
+    return undefined;
+  }
+  if (isApprovedOutcome(outcome) && skipsOnApprovedPath(text)) {
+    return {
+      reason: "conditional branch skipped because upstream gate is approved",
+      dependencyTaskId,
+      outcome
+    };
+  }
+  if (isPassOutcome(outcome) && skipsOnPassPath(text)) {
+    return {
+      reason: "conditional branch skipped because upstream verdict is pass",
+      dependencyTaskId,
+      outcome
+    };
+  }
+  return undefined;
+}
+
+async function readDependencyOutcome(input: {
+  dependencyTaskId: string;
+  plan: TaskPlan;
+  state: ExecutionState;
+  artifactDir: string;
+}): Promise<string | undefined> {
+  const release = input.state.manualGateReleases.find((item) =>
+    item.taskId === input.dependencyTaskId && item.decision !== "review_dispatched"
+  );
+  if (release) {
+    return release.decision;
+  }
+  const dependencyTask = input.plan.tasks.find((task) => task.taskId === input.dependencyTaskId);
+  if (!dependencyTask) {
+    return undefined;
+  }
+  const decisionArtifact = resolveOutputArtifacts(dependencyTask, input.artifactDir)
+    .find((artifact) => artifact.kind.includes("decision") || artifact.kind.includes("verdict"));
+  if (!decisionArtifact) {
+    return undefined;
+  }
+  try {
+    const decision = JSON.parse(await readFile(decisionArtifact.path, "utf8")) as Record<string, unknown>;
+    return typeof decision.decision === "string"
+      ? decision.decision
+      : typeof decision.verdict === "string"
+        ? decision.verdict
+        : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isApprovedOutcome(outcome: string): boolean {
+  return outcome === "approved";
+}
+
+function isPassOutcome(outcome: string): boolean {
+  return outcome === "pass";
+}
+
 class ArtifactContextMissingError extends Error {
   constructor(readonly missing: MissingArtifact[]) {
     super(formatMissingArtifacts(missing));
@@ -1356,4 +1509,8 @@ function formatConflictArtifacts(conflicts: ConflictArtifact[]): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function taskText(task: ExecutionTask): string {
+  return [task.title, task.description, task.aoPrompt, ...task.acceptanceCriteria].join("\n");
 }

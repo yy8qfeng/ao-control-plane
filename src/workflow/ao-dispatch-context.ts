@@ -1,6 +1,7 @@
 import { access, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, normalize, resolve } from "node:path";
 import type { ExecutionTask, TaskArtifact, TaskPlan } from "../schemas/task-plan.js";
+import { manualGateTemplates, taskOutputTemplates, type ManualGateTemplate } from "./task-artifact-templates.js";
 import type { ExecutionState } from "./execution-state-store.js";
 
 export interface ResolvedArtifact {
@@ -357,20 +358,16 @@ export function resolveInputArtifacts(
     return explicit;
   }
 
-  const text = taskText(task);
-  const artifacts: ResolvedArtifact[] = [];
-  if (/G0|仓库现实|人工复核|复核失败/.test(text)) {
-    const dependencyId = task.dependencies[0];
-    if (dependencyId && /人工复核|复核失败/.test(text)) {
-      artifacts.push({
-        kind: /复核失败/.test(text) ? "g0_review_gate_decision" : "g0_repo_reality_check",
-        path: join(artifactDir, /复核失败/.test(text) ? "g0_review_gate_decision.json" : "g0_repo_reality_check.json"),
-        taskId: dependencyId,
-        required: true
-      });
+  return task.dependencies.flatMap((dependencyId) => {
+    const dependencyTask = plan.tasks.find((item) => item.taskId === dependencyId);
+    if (!dependencyTask) {
+      return [];
     }
-  }
-  return artifacts;
+    return resolveOutputArtifacts(dependencyTask, artifactDir).map((artifact) => ({
+      ...artifact,
+      taskId: dependencyId
+    }));
+  });
 }
 
 export function resolveOutputArtifacts(task: ExecutionTask, artifactDir: string): ResolvedArtifact[] {
@@ -380,21 +377,33 @@ export function resolveOutputArtifacts(task: ExecutionTask, artifactDir: string)
   }
 
   const text = taskText(task);
-  if (/G0|人工复核放行/.test(text)) {
-    if (/仓库现实校准/.test(text)) {
-      return [{ kind: "g0_repo_reality_check", path: join(artifactDir, "g0_repo_reality_check.json"), required: true }];
-    }
-    if (/人工复核放行/.test(text)) {
-      return [
-        { kind: "g0_review_gate_decision", path: join(artifactDir, "g0_review_gate_decision.json"), required: true },
-        { kind: "g0_approved_flag", path: join(artifactDir, "g0_approved.flag"), required: true, requiredWhen: "decision=approved" }
-      ];
-    }
-    if (/复核失败回流/.test(text)) {
-      return [{ kind: "g0_replan_request", path: join(artifactDir, "g0_replan_request.json"), required: true }];
+  const manualGate = inferManualGateTemplate(text);
+  if (manualGate) {
+    return [
+      { kind: manualGate.decision.kind, path: join(artifactDir, manualGate.decision.file), required: manualGate.decision.required ?? true },
+      { kind: manualGate.flag.kind, path: join(artifactDir, manualGate.flag.file), required: manualGate.flag.required ?? false, requiredWhen: manualGate.flag.requiredWhen },
+      ...(manualGate.rework
+        ? [
+          { kind: manualGate.rework.kind, path: join(artifactDir, manualGate.rework.file), required: false, requiredWhen: "decision=rework_required" },
+          { kind: `${manualGate.rework.kind}_rejected`, path: join(artifactDir, manualGate.rework.file), required: false, requiredWhen: "decision=rejected" }
+        ]
+        : [])
+    ];
+  }
+  for (const template of taskOutputTemplates) {
+    if (template.match.test(text)) {
+      return template.artifacts.map((artifact) => ({
+        kind: artifact.kind,
+        path: join(artifactDir, artifact.file),
+        required: artifact.required ?? true,
+        requiredWhen: artifact.requiredWhen
+      }));
     }
   }
-  if (/qa verdict/i.test(text)) {
+  if (/复核失败回流/.test(text)) {
+    return [{ kind: "g0_replan_request", path: join(artifactDir, "g0_replan_request.json"), required: true }];
+  }
+  if (/(^|\n)(QA verdict|Write QA verdict)|产出\s*qa_verdict\.json|QA verdict.*裁决/i.test(text)) {
     return [{ kind: "qa_verdict", path: join(artifactDir, "qa_verdict.json"), required: true }];
   }
   if (/planning gate|task plan gate|任务计划.*门禁|计划.*审批/i.test(text)) {
@@ -403,7 +412,7 @@ export function resolveOutputArtifacts(task: ExecutionTask, artifactDir: string)
   if (/contract freeze|契约冻结/i.test(text)) {
     return [{ kind: "contract_freeze_evidence", path: join(artifactDir, "contract-freeze-evidence.json"), required: true }];
   }
-  if (/release|发布/.test(text) && /decision|门禁|复核/.test(text)) {
+  if (/release decision|发布.*决策文件/i.test(text)) {
     return [{ kind: "release_decision", path: join(artifactDir, "release_decision.json"), required: true }];
   }
   return [];
@@ -506,6 +515,10 @@ function isDecisionArtifactKind(kind: string): boolean {
 
 function isFlagArtifactKind(kind: string): boolean {
   return /(^|_)flag$/.test(kind) || kind.includes("flag") || kind.includes("标记");
+}
+
+function inferManualGateTemplate(text: string): ManualGateTemplate | undefined {
+  return manualGateTemplates.find((template) => template.match.test(text));
 }
 
 function taskText(task: ExecutionTask): string {

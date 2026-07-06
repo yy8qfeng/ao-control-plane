@@ -10,6 +10,8 @@ import {
   taskTypeSchema,
   type TaskPlan
 } from "../schemas/task-plan.js";
+import { hasConditionalSkipConvention } from "./conditional-task-conventions.js";
+import { manualGateTemplates, taskOutputTemplates } from "./task-artifact-templates.js";
 
 export type TaskPlanNormalizationSource = "codex" | "artifact" | "cli";
 export type TaskPlanNormalizationOutcome = "passed" | "raw_failed" | "strict_failed";
@@ -207,6 +209,12 @@ export function normalizeTaskPlanModelOutput(
     report.outcome = "strict_failed";
     return { report, rawValue: raw, normalizedValue };
   }
+  const conventionIssues = validateConditionalBranchConventions(strictResult.data);
+  if (conventionIssues.length > 0) {
+    report.strictSchemaErrors = conventionIssues;
+    report.outcome = "strict_failed";
+    return { report, rawValue: raw, normalizedValue };
+  }
 
   report.outcome = "passed";
   report.workflowId = strictResult.data.workflowId;
@@ -284,6 +292,29 @@ function normalizeRawTaskPlan(
   };
 }
 
+function validateConditionalBranchConventions(plan: TaskPlan): TaskPlanNormalizationIssue[] {
+  const tasksById = new Map(plan.tasks.map((task) => [task.taskId, task]));
+  return plan.tasks.flatMap((task, index) => {
+    if (task.dependencyCondition !== "manual_gate") {
+      return [];
+    }
+    const dependsOnManualGate = task.dependencies.some((dependencyId) =>
+      tasksById.get(dependencyId)?.dependencyCondition === "manual_gate"
+    );
+    if (!dependsOnManualGate) {
+      return [];
+    }
+    const text = [task.title, task.description, task.aoPrompt, ...task.acceptanceCriteria].join("\n");
+    if (hasConditionalSkipConvention(text)) {
+      return [];
+    }
+    return [{
+      path: `tasks.${index}.description`,
+      message: "Conditional manual_gate branch tasks must declare when they run, for example: 仅在上游非 approved 时触发，approved 路径不派发；or pass 路径不派发"
+    }];
+  });
+}
+
 function normalizeTask(
   task: z.output<typeof rawExecutionTaskSchema>,
   index: number,
@@ -353,6 +384,51 @@ function normalizeArtifactContracts(
     }
     return;
   }
+  const manualGateTemplate = manualGateTemplates.find((template) => template.match.test(text));
+  if (manualGateTemplate) {
+    const dependencyId = Array.isArray(task.dependencies) && typeof task.dependencies[0] === "string" ? task.dependencies[0] : undefined;
+    if (manualGateTemplate.input && dependencyId) {
+      task.inputArtifacts = [{
+        taskId: dependencyId,
+        kind: manualGateTemplate.input.kind,
+        path: manualGateTemplate.input.file,
+        required: manualGateTemplate.input.required ?? true
+      }];
+    }
+    task.outputArtifacts = [
+      {
+        kind: manualGateTemplate.decision.kind,
+        path: manualGateTemplate.decision.file,
+        required: manualGateTemplate.decision.required ?? true
+      },
+      {
+        kind: manualGateTemplate.flag.kind,
+        path: manualGateTemplate.flag.file,
+        required: manualGateTemplate.flag.required,
+        requiredWhen: manualGateTemplate.flag.requiredWhen
+      },
+      ...(manualGateTemplate.rework
+        ? [
+          { kind: manualGateTemplate.rework.kind, path: manualGateTemplate.rework.file, requiredWhen: "decision=rework_required" },
+          { kind: `${manualGateTemplate.rework.kind}_rejected`, path: manualGateTemplate.rework.file, requiredWhen: "decision=rejected" }
+        ]
+        : [])
+    ];
+    addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "manual gate output artifacts inferred");
+    return;
+  }
+  for (const template of taskOutputTemplates) {
+    if (template.match.test(text)) {
+      task.outputArtifacts = template.artifacts.map((artifact) => ({
+        kind: artifact.kind,
+        path: artifact.file,
+        required: artifact.required,
+        requiredWhen: artifact.requiredWhen
+      }));
+      addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "domain output artifacts inferred");
+      return;
+    }
+  }
   if (/planning gate|task plan gate|任务计划.*门禁|计划.*审批/i.test(text)) {
     task.outputArtifacts = [
       { kind: "task_plan_approval_report", path: "task-plan-approval-report.json", required: true }
@@ -367,14 +443,14 @@ function normalizeArtifactContracts(
     addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "contract freeze output artifact inferred");
     return;
   }
-  if (/qa verdict/i.test(text)) {
+  if (/(^|\n)(QA verdict|Write QA verdict)|产出\s*qa_verdict\.json|QA verdict.*裁决/i.test(text)) {
     task.outputArtifacts = [
       { kind: "qa_verdict", path: "qa_verdict.json", required: true }
     ];
     addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "QA verdict output artifact inferred");
     return;
   }
-  if (/release|发布/i.test(text) && /decision|门禁|复核/i.test(text)) {
+  if (/release decision|发布.*决策文件/i.test(text)) {
     task.outputArtifacts = [
       { kind: "release_decision", path: "release_decision.json", required: true }
     ];

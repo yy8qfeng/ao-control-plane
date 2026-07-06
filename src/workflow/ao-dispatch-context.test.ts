@@ -6,6 +6,8 @@ import { defaultExecutionPolicy } from "../schemas/execution-policy.js";
 import type { ExecutionTask } from "../schemas/task-plan.js";
 import {
   buildAoDispatchContext,
+  resolveInputArtifacts,
+  resolveOutputArtifacts,
   synthesizeManualGateArtifacts,
   validateTaskOutputArtifacts
 } from "./ao-dispatch-context.js";
@@ -144,6 +146,41 @@ describe("ao dispatch context", () => {
     expect(synthesized.generatedArtifacts).toEqual(["custom-decision.json", "custom-approved.flag"]);
     await expect(readFile(join(artifactDir, "custom-decision.json"), "utf8")).resolves.toContain("control_plane_manual_gate");
     await expect(readFile(join(artifactDir, "custom-approved.flag"), "utf8")).resolves.toContain("approved");
+  });
+
+  it("infers domain manual gate inputs and outputs from dependency artifacts", async () => {
+    const artifactDir = await createTempArtifactDir();
+    const workflowId = "WF-DOMAIN-GATE";
+    const producer = createTask(workflowId, {
+      taskId: "TASK-005",
+      title: "冻结跨语言 IPC 核心字节布局契约",
+      description: "冻结 IPC 布局。",
+      aoPrompt: `[${workflowId} / TASK-005] freeze ipc.`,
+      acceptanceCriteria: ["冻结控制块字段。"]
+    });
+    const reviewer = createTask(workflowId, {
+      taskId: "TASK-006",
+      title: "跨语言 IPC 契约人工复核门禁",
+      description: "reviewer 复核 IPC 契约是否跨 Rust/Java 同步冻结。",
+      dependencies: ["TASK-005"],
+      dependencyCondition: "manual_gate",
+      aoPrompt: `[${workflowId} / TASK-006] review ipc.`,
+      acceptanceCriteria: ["approved 时产出 ipc_contract_approved.flag。"]
+    });
+    const plan = { workflowId, title: "Plan", tasks: [producer, reviewer] };
+
+    expect(resolveInputArtifacts(reviewer, plan, artifactDir)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ taskId: "TASK-005", kind: "ipc_byte_layout_freeze" }),
+        expect.objectContaining({ taskId: "TASK-005", kind: "ipc_byte_layout_qa_verdict" })
+      ])
+    );
+    expect(resolveOutputArtifacts(reviewer, artifactDir)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "ipc_contract_review_gate_decision", path: join(artifactDir, "ipc_contract_review_gate_decision.json") }),
+        expect.objectContaining({ kind: "ipc_contract_approved_flag", path: join(artifactDir, "ipc_contract_approved.flag"), requiredWhen: "decision=approved" })
+      ])
+    );
   });
 });
 

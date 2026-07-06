@@ -81,7 +81,8 @@ export const executionLogTypeSchema = z.enum([
   "task_dispatched",
   "task_execution_missing_session",
   "task_marked_completed",
-  "task_retry_requested"
+  "task_retry_requested",
+  "task_skipped"
 ]);
 
 export type ExecutionLogType = z.infer<typeof executionLogTypeSchema>;

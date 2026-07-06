@@ -181,6 +181,90 @@ describe("normalizeTaskPlanModelOutput", () => {
     ]);
   });
 
+  it("infers domain artifact templates from the shared template table", () => {
+    const result = normalizeTaskPlanModelOutput(
+      createRawPlan({
+        tasks: [
+          createRawTask({
+            taskId: "TASK-001",
+            title: "冻结共享传输抽象与平台边界",
+            description: "输出共享传输抽象与平台边界冻结产物。",
+            type: "verification",
+            aoRole: "reviewer"
+          }),
+          createRawTask({
+            taskId: "TASK-002",
+            title: "冻结 OutboundTransport 发送契约",
+            description: "输出 OutboundTransport 发送契约冻结产物。",
+            type: "verification",
+            aoRole: "reviewer"
+          }),
+          createRawTask({
+            taskId: "TASK-003",
+            title: "冻结 JDK 21 JAR 公开 API 与示例依赖契约",
+            description: "输出 JDK 21 JAR 公开 API 与示例依赖契约。",
+            type: "verification",
+            aoRole: "reviewer"
+          })
+        ]
+      }),
+      { workflowId: "WF-NORMALIZE", source: "codex" }
+    );
+
+    expect(result.report.outcome).toBe("passed");
+    expect(result.plan?.tasks.map((task) => task.outputArtifacts?.[0]?.path)).toEqual([
+      "transport_contract_freeze.json",
+      "outbound_contract_freeze.json",
+      "jar_api_contract_freeze.json"
+    ]);
+  });
+
+  it("fails normalization when a manual gate rework branch omits the skip convention", () => {
+    const result = normalizeTaskPlanModelOutput(
+      createRawPlan({
+        tasks: [
+          createRawTask({
+            taskId: "TASK-001",
+            title: "G0 仓库现实校准",
+            description: "校准仓库现实。",
+            type: "review",
+            aoRole: "reviewer"
+          }),
+          createRawTask({
+            taskId: "TASK-002",
+            title: "G0 人工复核放行",
+            description: "人工复核 G0。",
+            type: "review",
+            aoRole: "reviewer",
+            dependencies: ["TASK-001"],
+            dependencyCondition: "manual_gate"
+          }),
+          createRawTask({
+            taskId: "TASK-003",
+            title: "G0 复核失败回流重规划",
+            description: "处理 G0 复核失败。",
+            type: "design",
+            aoRole: "architect",
+            dependencies: ["TASK-002"],
+            dependencyCondition: "manual_gate"
+          })
+        ]
+      }),
+      { workflowId: "WF-NORMALIZE", source: "codex" }
+    );
+
+    expect(result.plan).toBeUndefined();
+    expect(result.report.outcome).toBe("strict_failed");
+    expect(result.report.strictSchemaErrors).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "tasks.2.description",
+          message: expect.stringContaining("approved 路径不派发")
+        })
+      ])
+    );
+  });
+
   it("reports raw schema failures without throwing enum errors", () => {
     const result = normalizeTaskPlanModelOutput(
       { workflowId: "WF-BAD", title: "Bad plan", tasks: [{}] },

@@ -1036,3 +1036,76 @@ legacy state fixture 示例：
 - 需要人拍板时，使用“门禁放行”，控制平面直接完成门禁并生成审计产物。
 - 需要 AO 独立复核时，使用“派发门禁复核”，调度器必须把待审产物路径和上下文 manifest 明确交给 AO。
 - 所有 AO 任务都通过统一上下文桥接获得 `projectRoot`、`artifactDir`、上游产物和预期输出，避免只看 AO worktree 导致误判。
+
+## 21. 执行期模板与条件分支补充
+
+本轮实现补齐了连续执行阶段暴露出的两个语义缺口：条件性回流任务自动跳过，以及领域门禁的上下文产物桥接。模板定义集中在 `src/workflow/task-artifact-templates.ts`，`ao-dispatch-context.ts` 和 `task-plan-normalizer.ts` 共同引用该表，避免归一化阶段与运行期派发阶段继续出现模板漂移。
+
+### 21.1 内置门禁模板
+
+当前内置 `manual_gate` 模板如下：
+
+| gateId | 任务特征 | 决策文件 | 放行标记 | 回流文件 |
+| --- | --- | --- | --- | --- |
+| `g0` | `G0 人工复核放行` | `g0_review_gate_decision.json` | `g0_approved.flag` | `g0_replan_request.json` |
+| `ipc_contract` | `IPC 契约人工复核门禁` | `ipc_contract_review_gate_decision.json` | `ipc_contract_approved.flag` | `ipc_contract_rework_request.json` |
+| `transport_contract` | `共享传输抽象契约人工复核门禁` | `transport_contract_review_gate_decision.json` | `transport_contract_approved.flag` | `transport_contract_rework_request.json` |
+| `outbound_contract` | `OutboundTransport 契约人工复核门禁` | `outbound_contract_review_gate_decision.json` | `outbound_contract_approved.flag` | `outbound_contract_rework_request.json` |
+| `platform_adapter` | `平台适配器人工复核门禁` | `platform_adapter_review_gate_decision.json` | `platform_adapter_approved.flag` | `platform_adapter_rework_request.json` |
+| `jar_api_contract` | `JAR 公开 API 契约人工复核门禁` | `jar_api_contract_review_gate_decision.json` | `jar_api_contract_approved.flag` | `jar_api_contract_rework_request.json` |
+| `shared_boundary` | `共享文件边界人工门禁` | `shared_boundary_review_gate_decision.json` | `shared_boundary_approved.flag` | `shared_boundary_rework_request.json` |
+| `release` | `最终发布人工复核门禁` | `release_review_gate_decision.json` | `release_approved.flag` | `release_rework_request.json` |
+
+### 21.2 内置输出产物模板
+
+当前内置输出产物模板如下：
+
+| 任务特征 | 输出产物 |
+| --- | --- |
+| `仓库现实校准` | `g0_repo_reality_check.json` |
+| `治理门禁决策文件`、`gate 文件`、`回流规范` | `gate_governance_freeze.json`、`gate_governance_freeze.md`、`gate_decision_schema.json`、`qa_verdict.json` |
+| `跨语言 IPC 核心字节布局契约` | `ipc_byte_layout_freeze.json`、`ipc_byte_layout_freeze.md`、`ipc_byte_layout_qa_verdict.json` |
+| `共享传输抽象与平台边界` | `transport_contract_freeze.json`、`transport_contract_freeze.md` |
+| `OutboundTransport 发送契约` | `outbound_contract_freeze.json`、`outbound_contract_freeze.md` |
+| `平台适配器统一接口与状态映射契约` | `platform_adapter_contract.json` |
+| `JDK 21 JAR 公开 API 与示例依赖契约` | `jar_api_contract_freeze.json` |
+| `跨平台后端特性矩阵与共享夹具契约` | `shared_boundary_manifest.json` |
+| `统一发布前 QA verdict 汇总裁决` | `unified_qa_verdict.json` |
+| `统一 QA verdict 失败回流重规划` | `qa_verdict_rework_request.json` |
+| `发布驳回回流重规划` | `release_rework_request.json` |
+| `发布二进制候选产物归档` | `release_binary_archive.json` |
+| `发布文档与证据索引归档` | `release_docs_evidence_archive.json` |
+| `回滚预案与回滚验证入口` | `rollback_plan.json` |
+
+### 21.3 决策类产物字段约定
+
+决策类 JSON 产物必须使用稳定字段名，调度器据此判断后续条件分支：
+
+- 门禁决策文件使用 `decision` 字段，合法值为 `approved`、`rework_required`、`rejected`。
+- QA 或发布裁决文件使用 `verdict` 字段，合法值为 `pass`、`fail`。
+- 人工放行产物必须包含 `source: "control_plane_manual_gate"`。
+- AO 复核门禁产物必须包含 `source: "ao_review"` 和当前 `aoSessionId`。
+
+运行期条件跳过只读取 `decision` 和 `verdict`。如果产物使用 `outcome`、`status`、`result` 等字段，调度器不会把它当作可判定分支，任务会继续按阻断或人工处理路径走。
+
+### 21.4 条件分支跳过语义
+
+条件性回流任务不是普通必跑任务。调度器在每轮 `tick()` 中完成 AO 状态同步后，会扫描依赖已完成的 `pending` 任务：
+
+- 如果任务文本声明 `approved 路径不派发`，并且上游门禁 `decision=approved`，该任务置为 `superseded`。
+- 如果任务文本声明 `pass 路径不派发`，并且上游裁决 `verdict=pass`，该任务置为 `superseded`。
+- 被跳过任务写入 `task_skipped` 执行日志，日志包含 `taskId`、上游 `dependencyTaskId` 和实际 `outcome`。
+- 工作流完成判定使用 `completed + superseded === plan.tasks.length`，因此被跳过的条件分支不会造成执行死锁。
+
+为了避免自然语言约定漂移，任务计划归一化阶段会校验“依赖上游 `manual_gate` 的条件性 `manual_gate` 分支”是否明确写出跳过约定。缺少 `仅在上游非 approved 时触发，approved 路径不派发` 或 `仅在 verdict=fail 时触发，pass 路径不派发` 这类语义时，归一化失败并要求修订任务计划。
+
+### 21.5 校验顺序
+
+条件跳过发生在输出产物校验之后、下一任务派发之前：
+
+1. AO working 任务先同步 AO 状态。
+2. AO report completed 的任务先校验 `outputArtifacts`。
+3. 已完成依赖的条件性回流任务根据上游 `decision` 或 `verdict` 判断是否 `superseded`。
+4. 调度器再计算是否整体完成，或派发下一个 ready task。
+
+这个顺序保证了：只有上游决策产物真实存在、且状态已经完成时，调度器才会跳过条件分支；不会因为缺少证据而静默越过回流任务。
