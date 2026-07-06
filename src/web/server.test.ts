@@ -339,6 +339,106 @@ describe("web server", () => {
     expect(completed.logs.some((event) => event.type === "task_dispatched")).toBe(true);
   });
 
+  it("approves a waiting manual gate through the split execution job API", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    const projectRoot = join(tempDir, "project");
+    await mkdir(projectRoot);
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir
+    });
+    await seedExecutingWorkflow(projectRoot, "WF-GATE-APPROVE", createManualGatePlan("WF-GATE-APPROVE"));
+
+    const startResponse = await fetch(`${server.url}/api/ao/execution-jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectRoot,
+        workflowId: "WF-GATE-APPROVE",
+        dryRun: true,
+        pollIntervalMs: 1
+      })
+    });
+    const started = (await startResponse.json()) as { jobId: string };
+    const waiting = await waitForExecutionJobStatus(server.url, started.jobId, projectRoot, "waiting_manual_gate");
+    expect(waiting.manualGateContext?.taskId).toBe("TASK-002");
+
+    const approveResponse = await fetch(
+      `${server.url}/api/ao/execution-jobs/${encodeURIComponent(started.jobId)}/manual-gates/TASK-002/approve`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectRoot,
+          rationale: "人工确认放行"
+        })
+      }
+    );
+    const approved = (await approveResponse.json()) as { status: string; tasks?: Array<{ taskId: string; status: string }> };
+
+    expect(approveResponse.status).toBe(200);
+    expect(["running", "completed"]).toContain(approved.status);
+    expect(approved.tasks?.find((task) => task.taskId === "TASK-002")?.status).toBe("completed");
+    await waitForExecutionJobStatus(server.url, started.jobId, projectRoot, "completed");
+    await expect(readFile(join(projectRoot, ".ao-control-plane", "WF-GATE-APPROVE", "task-002_gate_decision.json"), "utf8"))
+      .resolves.toContain("control_plane_manual_gate");
+  });
+
+  it("dispatches a waiting manual gate review through the split execution job API", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
+    const projectRoot = join(tempDir, "project");
+    await mkdir(projectRoot);
+    server = await startWebServer({
+      port: 0,
+      artifactRoot: tempDir
+    });
+    await seedExecutingWorkflow(projectRoot, "WF-GATE-DISPATCH", createManualGatePlan("WF-GATE-DISPATCH"));
+
+    const startResponse = await fetch(`${server.url}/api/ao/execution-jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectRoot,
+        workflowId: "WF-GATE-DISPATCH",
+        dryRun: true,
+        pollIntervalMs: 1
+      })
+    });
+    const started = (await startResponse.json()) as { jobId: string };
+    await waitForExecutionJobStatus(server.url, started.jobId, projectRoot, "waiting_manual_gate");
+
+    const dispatchResponse = await fetch(
+      `${server.url}/api/ao/execution-jobs/${encodeURIComponent(started.jobId)}/manual-gates/TASK-002/dispatch-review`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectRoot,
+          rationale: "派发 AO reviewer 复核"
+        })
+      }
+    );
+    const dispatched = (await dispatchResponse.json()) as {
+      status: string;
+      activeTask?: { taskId: string; aoSessionId?: string; status: string };
+      logs: Array<{ type: string }>;
+    };
+
+    expect(dispatchResponse.status).toBe(200);
+    expect(dispatched.status).toBe("running");
+    expect(dispatched.activeTask).toMatchObject({
+      taskId: "TASK-002",
+      status: "working"
+    });
+    expect(dispatched.activeTask?.aoSessionId).toBeTruthy();
+    expect(dispatched.logs.some((event) => event.type === "manual_gate_review_dispatched")).toBe(true);
+    await fetch(`${server.url}/api/ao/execution-jobs/${encodeURIComponent(started.jobId)}/stop`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ projectRoot })
+    });
+  });
+
   it("runs the real governance endpoint through injected adapters", async () => {
     tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-web-"));
     const projectRoot = join(tempDir, "project");
@@ -939,13 +1039,15 @@ describe("web server", () => {
     expect(html).toContain('id="markExecutionTaskCompletedButton"');
     expect(html).toContain('id="requestExecutionRevisionButton"');
     expect(html).toContain('id="releaseManualGateButton"');
+    expect(html).toContain('id="dispatchManualGateReviewButton"');
     expect(html).toContain('id="replanManualGateButton"');
     expect(html).toContain('id="blockManualGateButton"');
     expect(html).toContain("启动连续执行");
     expect(html).toContain("重试任务");
     expect(html).toContain("人工标记完成");
     expect(html).toContain("提交重规划请求");
-    expect(html).toContain("门禁放行继续");
+    expect(html).toContain("门禁放行");
+    expect(html).toContain("派发门禁复核");
     expect(html).toContain("门禁要求重规划");
     expect(html).toContain("门禁标记阻断");
     expect(html).toContain("dryRun: false");
@@ -963,12 +1065,16 @@ describe("web server", () => {
     expect(html).toContain("getRecoverableExecutionTaskId");
     expect(html).toContain("getExecutionRecoveryButtonTitle");
     expect(html).toContain("loadExecutionSnapshot");
-    expect(html).toContain("manual_gate 等待时，批准门禁并继续执行。");
+    expect(html).toContain("manual_gate 等待时，人工批准门禁并继续执行。");
+    expect(html).toContain("manual_gate 等待时，派发 AO reviewer 复核上下文产物。");
     expect(html).toContain("taskPlanApprovalReport");
-    expect(html).toContain('submitManualGateDecision("approved"');
+    expect(html).toContain("approveManualGate");
+    expect(html).toContain("dispatchManualGateReview");
     expect(html).toContain('submitManualGateDecision("requires_replan"');
     expect(html).toContain('submitManualGateDecision("blocked"');
-    expect(html).toContain("Web UI 门禁放行继续");
+    expect(html).toContain("Web UI 门禁放行");
+    expect(html).toContain("Web UI 派发门禁复核");
+    expect(html).toContain("门禁上下文：");
     expect(html).toContain("Web UI 门禁要求重规划");
     expect(html).toContain("Web UI 门禁标记阻断");
     expect(html).toContain("审批状态：");
@@ -1069,6 +1175,7 @@ async function waitForExecutionJobStatus(
       tasks?: Array<{ status: string }>;
       logs: Array<{ type: string }>;
       failure?: { message: string };
+      manualGateContext?: { taskId: string };
     };
     if (job.status === expectedStatus) {
       return job;

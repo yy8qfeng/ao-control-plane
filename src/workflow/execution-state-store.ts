@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { access, appendFile, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -39,6 +40,10 @@ export type ExecutionErrorKind =
   | "revision_requested"
   | "revision_failed"
   | "dependency_deadlock"
+  | "artifact_context_missing"
+  | "artifact_output_missing"
+  | "artifact_output_conflict"
+  | "manual_gate_artifact_write_failed"
   | "plan_missing"
   | "plan_invalid"
   | "state_corrupted"
@@ -58,6 +63,29 @@ export interface AoStatusObservation {
   observedAt: string;
 }
 
+export const executionLogTypeSchema = z.enum([
+  "ao_dispatch_context_created",
+  "artifact_context_missing",
+  "artifact_output_conflict",
+  "artifact_output_missing",
+  "dispatcher_stopped",
+  "manual_gate_approved",
+  "manual_gate_artifact_write_failed",
+  "manual_gate_decided",
+  "manual_gate_review_dispatched",
+  "manual_gate_waiting",
+  "task_completed_from_ao_report",
+  "task_dispatch_failed",
+  "task_dispatch_missing_session",
+  "task_dispatch_orphaned",
+  "task_dispatched",
+  "task_execution_missing_session",
+  "task_marked_completed",
+  "task_retry_requested"
+]);
+
+export type ExecutionLogType = z.infer<typeof executionLogTypeSchema>;
+
 export interface ExecutionTaskState {
   taskId: string;
   status: ExecutionTaskRuntimeStatus;
@@ -69,6 +97,7 @@ export interface ExecutionTaskState {
   completedAt?: string | null;
   failureReason?: string | null;
   statusObservations?: AoStatusObservation[];
+  dispatchContextPath?: string;
   markedCompletedBy?: {
     actor: "user" | "cli";
     rationale: string;
@@ -81,6 +110,7 @@ export interface PendingDispatch {
   taskId: string;
   attempt: number;
   createdAt: string;
+  dispatchContextPath?: string;
   spawnCandidateSessionIds?: string[];
 }
 
@@ -98,6 +128,7 @@ export interface ExecutionState {
   taskStates: Record<string, ExecutionTaskState>;
   manualGateReleases: ManualGateRelease[];
   pendingDispatch?: PendingDispatch | null;
+  supersededSessions?: string[];
 }
 
 export interface ExecutionLogEvent {
@@ -108,6 +139,11 @@ export interface ExecutionLogEvent {
   at: string;
   [key: string]: unknown;
 }
+
+export type AppendExecutionLogEvent = Omit<ExecutionLogEvent, "at" | "type"> & {
+  type: ExecutionLogType;
+  at?: string;
+};
 
 export interface RevisionAmendment {
   revision: number;
@@ -158,6 +194,10 @@ const executionStateSchema = z.object({
       "revision_requested",
       "revision_failed",
       "dependency_deadlock",
+      "artifact_context_missing",
+      "artifact_output_missing",
+      "artifact_output_conflict",
+      "manual_gate_artifact_write_failed",
       "plan_missing",
       "plan_invalid",
       "state_corrupted",
@@ -182,6 +222,7 @@ const executionStateSchema = z.object({
       status: z.string().min(1),
       observedAt: z.string().min(1)
     })).optional(),
+    dispatchContextPath: z.string().min(1).optional(),
     markedCompletedBy: z.object({
       actor: z.enum(["user", "cli"]),
       rationale: z.string().min(1),
@@ -190,17 +231,25 @@ const executionStateSchema = z.object({
   })),
   manualGateReleases: z.array(z.object({
     taskId: z.string().min(1),
-    decision: z.enum(["approved", "requires_replan", "blocked"]),
+    decision: z.enum(["approved", "requires_replan", "blocked", "review_dispatched"]),
+    mode: z.enum(["manual_approve", "ao_review"]).optional(),
     rationale: z.string().optional(),
-    releasedAt: z.string().optional()
+    releasedAt: z.string().optional(),
+    attempt: z.number().int().nonnegative().optional(),
+    generatedArtifacts: z.array(z.string().min(1)).optional(),
+    dispatchContextPath: z.string().min(1).optional(),
+    aoSessionId: z.string().min(1).optional(),
+    supersededAoSessionId: z.string().min(1).optional()
   })).default([]),
   pendingDispatch: z.object({
     dispatchId: z.string().min(1),
     taskId: z.string().min(1),
     attempt: z.number().int().positive(),
     createdAt: z.string().min(1),
+    dispatchContextPath: z.string().min(1).optional(),
     spawnCandidateSessionIds: z.array(z.string().min(1)).optional()
-  }).nullable().optional()
+  }).nullable().optional(),
+  supersededSessions: z.array(z.string().min(1)).default([])
 });
 
 const stateStores = new Map<string, ExecutionStateStore>();
@@ -270,7 +319,7 @@ export class ExecutionStateStore {
     });
   }
 
-  async appendLog(workflowId: string, event: Omit<ExecutionLogEvent, "at"> & { at?: string }): Promise<void> {
+  async appendLog(workflowId: string, event: AppendExecutionLogEvent): Promise<void> {
     await this.enqueue(workflowId, async () => {
       const workflowDir = this.getWorkflowDir(workflowId);
       await mkdir(workflowDir, { recursive: true });
@@ -504,7 +553,8 @@ export function createInitialState(workflowId: string): ExecutionState {
     failure: null,
     taskStates: {},
     manualGateReleases: [],
-    pendingDispatch: null
+    pendingDispatch: null,
+    supersededSessions: []
   };
 }
 
@@ -527,10 +577,17 @@ export function createFailedState(
 }
 
 export async function atomicWriteJson(file: string, value: unknown): Promise<void> {
-  const tmpFile = `${file}.tmp-${process.pid}-${Date.now()}`;
+  const tmpFile = `${file}.tmp-${process.pid}-${Date.now()}-${randomUUID()}`;
   await mkdir(dirname(file), { recursive: true });
   await writeFile(tmpFile, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  await rename(tmpFile, file);
+  try {
+    await rename(tmpFile, file);
+  } catch (error) {
+    await rm(file, { force: true }).catch(() => undefined);
+    await rename(tmpFile, file).catch(() => {
+      throw error;
+    });
+  }
   await rm(tmpFile, { force: true }).catch(() => undefined);
 }
 

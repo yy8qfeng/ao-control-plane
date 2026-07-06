@@ -55,6 +55,15 @@ export const designCoverageTraceSchema = z.object({
   rationale: z.string().min(1).optional()
 });
 
+export const taskArtifactSchema = z.object({
+  taskId: z.string().min(1).optional(),
+  kind: z.string().min(1),
+  path: z.string().min(1),
+  required: z.boolean().optional(),
+  requiredOnSuccess: z.boolean().optional(),
+  requiredWhen: z.string().min(1).optional()
+});
+
 export const executionTaskSchema = z
   .object({
     taskId: z.string().min(1),
@@ -70,7 +79,9 @@ export const executionTaskSchema = z
     phase: taskPhaseSchema.optional(),
     status: taskStatusSchema.default("pending"),
     executionPolicy: executionPolicySchema.optional(),
-    aoSessionId: z.string().min(1).optional()
+    aoSessionId: z.string().min(1).optional(),
+    inputArtifacts: z.array(taskArtifactSchema).optional(),
+    outputArtifacts: z.array(taskArtifactSchema).optional()
   })
   .passthrough()
   .superRefine((task, context) => {
@@ -224,6 +235,7 @@ export const taskPlanSchema = z
 
 export type ExecutionTask = z.output<typeof executionTaskSchema>;
 export type TaskPlan = z.output<typeof taskPlanSchema>;
+export type TaskArtifact = z.output<typeof taskArtifactSchema>;
 
 function findDependencyCycle(graph: Map<string, string[]>): string[] {
   const visiting = new Set<string>();

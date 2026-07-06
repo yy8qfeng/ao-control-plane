@@ -14,6 +14,7 @@ import {
 } from "./workflow/ao-status.js";
 import { executePlan } from "./workflow/plan-execution.js";
 import {
+  approveManualGate,
   ContinuousExecutionRunner,
   decideManualGate,
   markExecutionTaskCompleted,
@@ -301,14 +302,24 @@ program
     artifactRoot: string;
   }) => {
     const store = getExecutionStateStore(options.artifactRoot);
-    console.log(JSON.stringify(await decideManualGate({
-      store,
-      workflowId: options.workflowId,
-      taskId: options.taskId,
-      decision: options.decision,
-      rationale: options.rationale,
-      actor: "cli"
-    }), null, 2));
+    const state = options.decision === "approved"
+      ? await approveManualGate({
+          store,
+          workflowId: options.workflowId,
+          taskId: options.taskId,
+          rationale: options.rationale,
+          actor: "cli",
+          recovery: true
+        })
+      : await decideManualGate({
+          store,
+          workflowId: options.workflowId,
+          taskId: options.taskId,
+          decision: options.decision,
+          rationale: options.rationale,
+          actor: "cli"
+        });
+    console.log(JSON.stringify(state, null, 2));
   });
 
 program

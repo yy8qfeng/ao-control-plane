@@ -1,11 +1,18 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AoCliAdapter } from "../adapters/ao.js";
 import { defaultExecutionPolicy } from "../schemas/execution-policy.js";
 import type { TaskPlan } from "../schemas/task-plan.js";
-import { ContinuousExecutionRunner, retryExecutionTask, stopExecution } from "./continuous-plan-execution.js";
+import {
+  approveManualGate,
+  ContinuousExecutionRunner,
+  decideManualGate,
+  dispatchManualGateReview,
+  retryExecutionTask,
+  stopExecution
+} from "./continuous-plan-execution.js";
 import { atomicWriteJson, ExecutionStateStore } from "./execution-state-store.js";
 
 let tempDir: string | undefined;
@@ -491,6 +498,475 @@ describe("ContinuousExecutionRunner", () => {
     expect(state.status).toBe("running");
     expect(state.taskStates["TASK-001"]?.status).toBe("pending");
     expect(state.failure).toBeNull();
+  });
+
+  it("manual gate approval completes the task and writes gate artifacts without AO spawn", async () => {
+    const workflowId = "WF-MANUAL-APPROVE";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", {
+        title: "G0 仓库现实校准",
+        status: "completed"
+      }),
+      createTask(workflowId, "TASK-002", {
+        title: "G0 人工复核放行",
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        type: "verification",
+        aoRole: "reviewer"
+      })
+    ]));
+    await writeFile(join(store.getWorkflowDir(workflowId), "g0_repo_reality_check.json"), "{}\n", "utf8");
+    const runner = new ContinuousExecutionRunner({
+      workflowId,
+      store,
+      ao: createListOnlyAo([]) as Pick<AoCliAdapter, "spawnTask" | "listSessions">,
+      pollIntervalMs: 1,
+      maxTicks: 2
+    });
+    await runner.run();
+
+    const state = await approveManualGate({
+      store,
+      workflowId,
+      taskId: "TASK-002",
+      rationale: "人工确认 G0 产物可作为后续输入",
+      actor: "user"
+    });
+
+    expect(state.status).toBe("running");
+    expect(state.taskStates["TASK-002"]?.status).toBe("completed");
+    expect(state.manualGateReleases[0]).toMatchObject({
+      taskId: "TASK-002",
+      decision: "approved",
+      mode: "manual_approve",
+      generatedArtifacts: ["g0_review_gate_decision.json", "g0_approved.flag"]
+    });
+    const decision = JSON.parse(await readFile(join(store.getWorkflowDir(workflowId), "g0_review_gate_decision.json"), "utf8")) as { source: string };
+    expect(decision.source).toBe("control_plane_manual_gate");
+    await expect(access(join(store.getWorkflowDir(workflowId), "g0_approved.flag"))).resolves.toBeUndefined();
+  });
+
+  it("reuses matching existing manual gate artifacts when release state is missing", async () => {
+    const workflowId = "WF-MANUAL-APPROVE-EXISTING";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", {
+        title: "G0 仓库现实校准",
+        status: "completed"
+      }),
+      createTask(workflowId, "TASK-002", {
+        title: "G0 人工复核放行",
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        type: "verification",
+        aoRole: "reviewer"
+      })
+    ]));
+    const artifactDir = store.getWorkflowDir(workflowId);
+    await writeFile(join(artifactDir, "g0_repo_reality_check.json"), "{}\n", "utf8");
+    await writeFile(join(artifactDir, "g0_review_gate_decision.json"), JSON.stringify({
+      workflowId,
+      taskId: "TASK-002",
+      decision: "approved",
+      source: "control_plane_manual_gate"
+    }), "utf8");
+    await writeFile(join(artifactDir, "g0_approved.flag"), "approved\n", "utf8");
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "waiting_manual_gate",
+      currentTaskId: "TASK-002"
+    }));
+
+    const state = await approveManualGate({
+      store,
+      workflowId,
+      taskId: "TASK-002",
+      rationale: "补齐旧状态 release",
+      actor: "user"
+    });
+
+    expect(state.taskStates["TASK-002"]?.status).toBe("completed");
+    expect(state.manualGateReleases[0]?.generatedArtifacts).toEqual([
+      "g0_review_gate_decision.json",
+      "g0_approved.flag"
+    ]);
+  });
+
+  it("keeps manual gate approval idempotent under concurrent requests", async () => {
+    const workflowId = "WF-MANUAL-APPROVE-CONCURRENT";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", {
+        title: "G0 仓库现实校准",
+        status: "completed"
+      }),
+      createTask(workflowId, "TASK-002", {
+        title: "G0 人工复核放行",
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        type: "verification",
+        aoRole: "reviewer"
+      })
+    ]));
+    await writeFile(join(store.getWorkflowDir(workflowId), "g0_repo_reality_check.json"), "{}\n", "utf8");
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "waiting_manual_gate",
+      currentTaskId: "TASK-002"
+    }));
+
+    await Promise.all([
+      approveManualGate({
+        store,
+        workflowId,
+        taskId: "TASK-002",
+        rationale: "并发放行请求 A",
+        actor: "user"
+      }),
+      approveManualGate({
+        store,
+        workflowId,
+        taskId: "TASK-002",
+        rationale: "并发放行请求 B",
+        actor: "user"
+      })
+    ]);
+
+    const state = await store.readState(workflowId);
+    const releases = state.manualGateReleases.filter((release) => release.taskId === "TASK-002");
+    expect(releases).toHaveLength(1);
+    expect(releases[0]).toMatchObject({
+      decision: "approved",
+      mode: "manual_approve",
+      generatedArtifacts: ["g0_review_gate_decision.json", "g0_approved.flag"]
+    });
+    expect(state.taskStates["TASK-002"]?.status).toBe("completed");
+  });
+
+  it("dispatches manual gate review with a dispatch context manifest", async () => {
+    const workflowId = "WF-MANUAL-REVIEW";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", {
+        title: "G0 仓库现实校准",
+        status: "completed"
+      }),
+      createTask(workflowId, "TASK-002", {
+        title: "G0 人工复核放行",
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        type: "verification",
+        aoRole: "reviewer"
+      })
+    ]));
+    await writeFile(join(store.getWorkflowDir(workflowId), "g0_repo_reality_check.json"), "{}\n", "utf8");
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "waiting_manual_gate",
+      currentTaskId: "TASK-002"
+    }));
+    const spawnedPrompts: string[] = [];
+    const state = await dispatchManualGateReview({
+      store,
+      workflowId,
+      taskId: "TASK-002",
+      rationale: "需要 AO 独立复核",
+      projectRoot: "C:\\workspace\\fast transport",
+      actor: "user",
+      ao: {
+        async spawnTask(task) {
+          spawnedPrompts.push(task.aoPrompt);
+          return { sessionId: "ft-review", stdout: "", stderr: "" };
+        },
+        async listSessions() {
+          return { sessions: [] };
+        }
+      }
+    });
+
+    expect(state.taskStates["TASK-002"]?.status).toBe("working");
+    expect(state.taskStates["TASK-002"]?.aoSessionId).toBe("ft-review");
+    expect(state.manualGateReleases[0]).toMatchObject({
+      decision: "review_dispatched",
+      mode: "ao_review",
+      aoSessionId: "ft-review"
+    });
+    expect(spawnedPrompts[0]).toContain("projectRoot: C:\\workspace\\fast transport");
+    expect(spawnedPrompts[0]).toContain("artifactDir:");
+    expect(spawnedPrompts[0]).toContain("g0_repo_reality_check.json");
+    expect(spawnedPrompts[0]).toContain("g0_review_gate_decision.json");
+    const contextPath = state.taskStates["TASK-002"]?.dispatchContextPath ?? "";
+    const manifest = JSON.parse(await readFile(contextPath, "utf8")) as { projectRoot: string; dependencyArtifacts: unknown[] };
+    expect(manifest.projectRoot).toBe("C:\\workspace\\fast transport");
+    expect(manifest.dependencyArtifacts).toHaveLength(1);
+  });
+
+  it("rejects direct approved decisions so gate artifacts cannot be skipped", async () => {
+    const workflowId = "WF-DIRECT-APPROVED-REJECTED";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", {
+        dependencies: [],
+        dependencyCondition: "manual_gate",
+        type: "verification",
+        aoRole: "reviewer"
+      })
+    ]));
+
+    await expect(decideManualGate({
+      store,
+      workflowId,
+      taskId: "TASK-001",
+      decision: "approved",
+      rationale: "旧路径直接批准",
+      actor: "user"
+    })).rejects.toThrow("approved manual gate decisions must use approveManualGate");
+  });
+
+  it("cleans up manual gate review context manifest when AO spawn fails", async () => {
+    const workflowId = "WF-MANUAL-REVIEW-SPAWN-FAIL";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", {
+        title: "G0 仓库现实校准",
+        status: "completed"
+      }),
+      createTask(workflowId, "TASK-002", {
+        title: "G0 人工复核放行",
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        type: "verification",
+        aoRole: "reviewer"
+      })
+    ]));
+    await writeFile(join(store.getWorkflowDir(workflowId), "g0_repo_reality_check.json"), "{}\n", "utf8");
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "waiting_manual_gate",
+      currentTaskId: "TASK-002"
+    }));
+
+    const state = await dispatchManualGateReview({
+      store,
+      workflowId,
+      taskId: "TASK-002",
+      rationale: "需要 AO 独立复核",
+      actor: "user",
+      ao: {
+        async spawnTask() {
+          throw new Error("ao spawn failed");
+        },
+        async listSessions() {
+          return { sessions: [] };
+        }
+      }
+    });
+
+    const contextPath = state.taskStates["TASK-002"]?.dispatchContextPath ?? "";
+    expect(state.status).toBe("failed");
+    expect(state.failure?.kind).toBe("ao_spawn_failed");
+    await expect(access(contextPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("blocks dispatch when a required dependency artifact is missing", async () => {
+    const workflowId = "WF-MISSING-CONTEXT";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", {
+        title: "G0 仓库现实校准",
+        status: "completed"
+      }),
+      createTask(workflowId, "TASK-002", {
+        title: "G0 人工复核放行",
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        type: "verification",
+        aoRole: "reviewer"
+      })
+    ]));
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "waiting_manual_gate",
+      currentTaskId: "TASK-002"
+    }));
+
+    const state = await dispatchManualGateReview({
+      store,
+      workflowId,
+      taskId: "TASK-002",
+      rationale: "需要 AO 独立复核",
+      actor: "user",
+      ao: {
+        async spawnTask() {
+          throw new Error("spawnTask should not be called");
+        },
+        async listSessions() {
+          return { sessions: [] };
+        }
+      }
+    });
+
+    expect(state.status).toBe("failed");
+    expect(state.failure?.kind).toBe("artifact_context_missing");
+    expect(state.failure?.message).toContain("g0_repo_reality_check.json");
+  });
+
+  it("blocks completed AO tasks when required output artifacts are missing", async () => {
+    const workflowId = "WF-MISSING-OUTPUT";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", {
+        title: "G0 仓库现实校准"
+      })
+    ]));
+    const runner = new ContinuousExecutionRunner({
+      workflowId,
+      store,
+      ao: createFakeAo(["completed"]) as Pick<AoCliAdapter, "spawnTask" | "listSessions">,
+      pollIntervalMs: 1,
+      maxTicks: 3
+    });
+
+    await runner.run();
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("failed");
+    expect(state.failure?.kind).toBe("artifact_output_missing");
+    expect(state.failure?.message).toContain("g0_repo_reality_check.json");
+  });
+
+  it("blocks completed AO review when gate decision source conflicts with release mode", async () => {
+    const workflowId = "WF-CONFLICT-OUTPUT";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", {
+        title: "G0 仓库现实校准",
+        status: "completed"
+      }),
+      createTask(workflowId, "TASK-002", {
+        title: "G0 人工复核放行",
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        type: "verification",
+        aoRole: "reviewer"
+      })
+    ]));
+    const artifactDir = store.getWorkflowDir(workflowId);
+    await writeFile(join(artifactDir, "g0_repo_reality_check.json"), "{}\n", "utf8");
+    await writeFile(join(artifactDir, "g0_review_gate_decision.json"), JSON.stringify({
+      workflowId,
+      taskId: "TASK-002",
+      decision: "approved",
+      source: "control_plane_manual_gate"
+    }), "utf8");
+    await writeFile(join(artifactDir, "g0_approved.flag"), "approved\n", "utf8");
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "running",
+      currentTaskId: "TASK-002",
+      taskStates: {
+        "TASK-002": {
+          taskId: "TASK-002",
+          status: "working",
+          aoRole: "reviewer",
+          aoSessionId: "ft-review",
+          attempt: 1,
+          maxAttempts: 3,
+          statusObservations: []
+        }
+      },
+      manualGateReleases: [{
+        taskId: "TASK-002",
+        decision: "review_dispatched",
+        mode: "ao_review",
+        rationale: "派发 AO 门禁复核",
+        releasedAt: new Date().toISOString(),
+        attempt: 1,
+        aoSessionId: "ft-review"
+      }]
+    }));
+    const runner = new ContinuousExecutionRunner({
+      workflowId,
+      store,
+      ao: createListOnlyAo([{ id: "ft-review", status: "completed", prompt: `[${workflowId} / TASK-002] review` }]) as Pick<AoCliAdapter, "spawnTask" | "listSessions">,
+      pollIntervalMs: 1,
+      maxTicks: 1
+    });
+
+    await runner.run();
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("failed");
+    expect(state.failure?.kind).toBe("artifact_output_conflict");
+    expect(state.taskStates["TASK-002"]?.status).toBe("blocked_for_human");
+    await expect(store.readLogs(workflowId)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "artifact_output_conflict",
+          taskId: "TASK-002"
+        })
+      ])
+    );
+  });
+
+  it("ignores superseded AO sessions after manual gate recovery", async () => {
+    const workflowId = "WF-SUPERSEDED";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", {
+        title: "G0 仓库现实校准",
+        status: "completed"
+      }),
+      createTask(workflowId, "TASK-002", {
+        title: "G0 人工复核放行",
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        type: "verification",
+        aoRole: "reviewer"
+      })
+    ]));
+    await writeFile(join(store.getWorkflowDir(workflowId), "g0_repo_reality_check.json"), "{}\n", "utf8");
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "waiting_manual_gate",
+      currentTaskId: "TASK-002",
+      taskStates: {
+        "TASK-002": {
+          taskId: "TASK-002",
+          status: "working",
+          aoRole: "reviewer",
+          aoSessionId: "ft-2",
+          attempt: 1,
+          maxAttempts: 3
+        }
+      },
+      manualGateReleases: [{
+        taskId: "TASK-002",
+        decision: "approved",
+        rationale: "旧语义放行",
+        releasedAt: new Date().toISOString()
+      }]
+    }));
+    await approveManualGate({
+      store,
+      workflowId,
+      taskId: "TASK-002",
+      rationale: "转换为人工门禁放行",
+      actor: "user"
+    });
+    await writeFile(join(store.getWorkflowDir(workflowId), "g0_review_gate_decision.json"), JSON.stringify({
+      workflowId,
+      taskId: "TASK-002",
+      decision: "approved",
+      source: "ao_review",
+      aoSessionId: "ft-2"
+    }), "utf8");
+    const runner = new ContinuousExecutionRunner({
+      workflowId,
+      store,
+      ao: createListOnlyAo([{ id: "ft-2", status: "failed", prompt: `[${workflowId} / TASK-002] old` }]) as Pick<AoCliAdapter, "spawnTask" | "listSessions">,
+      pollIntervalMs: 1,
+      failureConfirmationCount: 1,
+      maxTicks: 1
+    });
+
+    await runner.run();
+
+    const state = await store.readState(workflowId);
+    expect(state.supersededSessions).toContain("ft-2");
+    expect(state.taskStates["TASK-002"]?.status).toBe("completed");
+    expect(state.status).not.toBe("failed");
   });
 });
 

@@ -376,7 +376,8 @@ export function renderIndexHtml(): string {
           <button id="retryExecutionTaskButton" class="secondary" type="button" disabled title="连续执行中断后，可重试当前失败任务。">重试任务</button>
           <button id="markExecutionTaskCompletedButton" class="secondary" type="button" disabled title="任务中断后，人工把当前任务标记为已完成并继续。">人工标记完成</button>
           <button id="requestExecutionRevisionButton" class="secondary" type="button" disabled title="任务中断后，提交任务计划修订请求。">提交重规划请求</button>
-          <button id="releaseManualGateButton" class="secondary" type="button" disabled title="manual_gate 等待时，批准门禁并继续执行。">门禁放行继续</button>
+          <button id="releaseManualGateButton" class="secondary" type="button" disabled title="manual_gate 等待时，人工批准门禁并继续执行。">门禁放行</button>
+          <button id="dispatchManualGateReviewButton" class="secondary" type="button" disabled title="manual_gate 等待时，派发 AO reviewer 复核上下文产物。">派发门禁复核</button>
           <button id="replanManualGateButton" class="secondary" type="button" disabled title="manual_gate 等待时，要求先修复任务计划。">门禁要求重规划</button>
           <button id="blockManualGateButton" class="secondary" type="button" disabled title="manual_gate 等待时，标记该门禁阻断执行。">门禁标记阻断</button>
         </div>
@@ -445,6 +446,7 @@ export function renderIndexHtml(): string {
     const markExecutionTaskCompletedButton = document.querySelector("#markExecutionTaskCompletedButton");
     const requestExecutionRevisionButton = document.querySelector("#requestExecutionRevisionButton");
     const releaseManualGateButton = document.querySelector("#releaseManualGateButton");
+    const dispatchManualGateReviewButton = document.querySelector("#dispatchManualGateReviewButton");
     const replanManualGateButton = document.querySelector("#replanManualGateButton");
     const blockManualGateButton = document.querySelector("#blockManualGateButton");
     const projectButton = document.querySelector("#projectButton");
@@ -639,8 +641,13 @@ export function renderIndexHtml(): string {
     });
 
     releaseManualGateButton.addEventListener("click", async () => {
-      if (!confirm("确认批准当前 manual_gate 并继续执行？")) return;
-      await submitManualGateDecision("approved", "Web UI 门禁放行继续");
+      if (!confirm("确认人工批准当前门禁并继续执行？该动作不会调用 AO，会由控制平面生成门禁产物。")) return;
+      await approveManualGate("Web UI 门禁放行");
+    });
+
+    dispatchManualGateReviewButton.addEventListener("click", async () => {
+      if (!confirm("确认派发 AO reviewer 复核当前门禁？该动作会调用 AO，并要求 AO 读取控制平面上下文产物。")) return;
+      await dispatchManualGateReview("Web UI 派发门禁复核");
     });
 
     replanManualGateButton.addEventListener("click", async () => {
@@ -1050,6 +1057,8 @@ export function renderIndexHtml(): string {
       requestExecutionRevisionButton.title = getExecutionRecoveryButtonTitle("request-revision");
       releaseManualGateButton.disabled = busy || getManualGateBlockedTaskIds().length === 0;
       releaseManualGateButton.title = getReleaseManualGateButtonTitle();
+      dispatchManualGateReviewButton.disabled = busy || !canDispatchManualGateReview();
+      dispatchManualGateReviewButton.title = getDispatchManualGateReviewButtonTitle();
       replanManualGateButton.disabled = busy || getManualGateBlockedTaskIds().length === 0;
       replanManualGateButton.title = getManualGateDecisionButtonTitle("requires_replan");
       blockManualGateButton.disabled = busy || getManualGateBlockedTaskIds().length === 0;
@@ -1101,6 +1110,8 @@ export function renderIndexHtml(): string {
       requestExecutionRevisionButton.title = getExecutionRecoveryButtonTitle("request-revision");
       releaseManualGateButton.disabled = running || getManualGateBlockedTaskIds().length === 0;
       releaseManualGateButton.title = getReleaseManualGateButtonTitle();
+      dispatchManualGateReviewButton.disabled = running || !canDispatchManualGateReview();
+      dispatchManualGateReviewButton.title = getDispatchManualGateReviewButtonTitle();
       replanManualGateButton.disabled = running || getManualGateBlockedTaskIds().length === 0;
       replanManualGateButton.title = getManualGateDecisionButtonTitle("requires_replan");
       blockManualGateButton.disabled = running || getManualGateBlockedTaskIds().length === 0;
@@ -1210,6 +1221,17 @@ export function renderIndexHtml(): string {
       }
       if (execution.failure) {
         lines.push("", "失败信息：" + execution.failure.kind + " / " + execution.failure.message);
+      }
+      if (execution.manualGateContext) {
+        lines.push("", formatManualGateContext(execution.manualGateContext));
+      }
+      const latestManualGateRelease = (execution.manualGateReleases || []).filter((release) => (release.generatedArtifacts || []).length > 0).at(-1);
+      if (latestManualGateRelease) {
+        lines.push(
+          "",
+          "最近门禁产物：" + latestManualGateRelease.taskId,
+          ...(latestManualGateRelease.generatedArtifacts || []).map((artifact) => "- " + artifact)
+        );
       }
       lines.push("", "过程日志：");
       const logs = execution.logs || [];
@@ -1390,6 +1412,58 @@ export function renderIndexHtml(): string {
       }
     }
 
+    async function approveManualGate(rationale) {
+      const taskId = getManualGateBlockedTaskIds()[0];
+      const jobId = state.execution?.jobId;
+      if (!taskId || !jobId) return;
+      setBusy(true, "正在门禁放行...");
+      try {
+        const response = await fetch("/api/ao/execution-jobs/" + encodeURIComponent(jobId) + "/manual-gates/" + encodeURIComponent(taskId) + "/approve", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            projectRoot: getProjectRoot(),
+            rationale
+          })
+        });
+        state.execution = await readResponse(response);
+        renderActiveTab();
+        updateSummary();
+        setStatus("ok", "门禁已放行，调度器会继续后续任务。");
+        startPollingExecutionJob(jobId);
+      } catch (error) {
+        setStatus("bad", error.message || String(error));
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function dispatchManualGateReview(rationale) {
+      const taskId = getManualGateBlockedTaskIds()[0];
+      const jobId = state.execution?.jobId;
+      if (!taskId || !jobId) return;
+      setBusy(true, "正在派发门禁复核...");
+      try {
+        const response = await fetch("/api/ao/execution-jobs/" + encodeURIComponent(jobId) + "/manual-gates/" + encodeURIComponent(taskId) + "/dispatch-review", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            projectRoot: getProjectRoot(),
+            rationale
+          })
+        });
+        state.execution = await readResponse(response);
+        renderActiveTab();
+        updateSummary();
+        setStatus("ok", "门禁复核已派发给 AO。");
+        startPollingExecutionJob(jobId);
+      } catch (error) {
+        setStatus("bad", error.message || String(error));
+      } finally {
+        setBusy(false);
+      }
+    }
+
     function startPollingExecutionJob(jobId) {
       if (!jobId) return;
       if (state.executionPollTimer) clearInterval(state.executionPollTimer);
@@ -1464,8 +1538,22 @@ export function renderIndexHtml(): string {
 
     function getReleaseManualGateButtonTitle() {
       const count = getManualGateBlockedTaskIds().length;
-      if (count > 0) return "批准当前等待的 " + count + " 个 manual_gate，并继续执行。";
-      return "manual_gate 等待时，批准门禁并继续执行。";
+      if (count > 0) return "人工批准当前等待的 " + count + " 个 manual_gate，并由控制平面生成门禁产物。";
+      return "manual_gate 等待时，人工批准门禁并继续执行。";
+    }
+
+    function canDispatchManualGateReview() {
+      const context = state.execution?.manualGateContext;
+      return getManualGateBlockedTaskIds().length > 0 &&
+        (!context || ((context.inputArtifacts || []).length > 0 && (context.missingArtifacts || []).length === 0));
+    }
+
+    function getDispatchManualGateReviewButtonTitle() {
+      const context = state.execution?.manualGateContext;
+      if (!getManualGateBlockedTaskIds().length) return "manual_gate 等待时，可派发 AO reviewer 复核。";
+      if (context && (context.inputArtifacts || []).length === 0) return "当前门禁没有结构化输入产物，不能派发 AO reviewer；请补齐产物契约或提交重规划请求。";
+      if ((context?.missingArtifacts || []).length > 0) return "存在缺失输入产物，不能派发 AO reviewer；请补齐产物或提交重规划请求。";
+      return "派发 AO reviewer 复核当前门禁上下文产物。";
     }
 
     function getManualGateDecisionButtonTitle(decision) {
@@ -1473,6 +1561,43 @@ export function renderIndexHtml(): string {
       if (count === 0) return "manual_gate 等待时，可要求重规划或标记阻断。";
       if (decision === "requires_replan") return "将当前等待的 " + count + " 个 manual_gate 标记为需要重规划。";
       return "将当前等待的 " + count + " 个 manual_gate 标记为阻断执行。";
+    }
+
+    function formatManualGateContext(context) {
+      const lines = [
+        "门禁上下文：",
+        "当前门禁：" + context.taskId + " / " + (context.title || "未命名门禁"),
+        "依赖任务：" + ((context.dependencies || []).join("、") || "无"),
+        "可审查输入产物："
+      ];
+      const missingPaths = new Set((context.missingArtifacts || []).map((artifact) => artifact.path));
+      if ((context.inputArtifacts || []).length === 0) {
+        lines.push("- 无结构化输入产物。");
+      } else {
+        (context.inputArtifacts || []).forEach((artifact) => {
+          lines.push("- " + (missingPaths.has(artifact.path) ? "缺失 " : "存在 ") + artifact.kind + "：" + artifact.path);
+        });
+      }
+      lines.push("门禁预期输出：");
+      if ((context.expectedOutputs || []).length === 0) {
+        lines.push("- 未声明预期输出。");
+      } else {
+        (context.expectedOutputs || []).forEach((artifact) => {
+          lines.push("- " + artifact.kind + "：" + artifact.path);
+        });
+      }
+      if ((context.missingArtifacts || []).length > 0) {
+        lines.push("缺失产物告警：");
+        (context.missingArtifacts || []).forEach((artifact) => {
+          lines.push("- " + (artifact.taskId ? artifact.taskId + " / " : "") + artifact.kind + "：" + artifact.path);
+        });
+        lines.push("可直接点击“提交重规划请求”，或补齐上述产物后再派发门禁复核。");
+      }
+      if ((context.generatedArtifacts || []).length > 0) {
+        lines.push("已生成门禁产物：");
+        (context.generatedArtifacts || []).forEach((artifact) => lines.push("- " + artifact));
+      }
+      return lines.join("\\n");
     }
 
     function getExecutionSuccessMessage(execution) {

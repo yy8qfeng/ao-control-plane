@@ -4,9 +4,15 @@ export type BlockedTaskKind = "waiting_dependencies" | "manual_gate";
 
 export interface ManualGateRelease {
   taskId: string;
-  decision: "approved" | "requires_replan" | "blocked";
+  decision: "approved" | "requires_replan" | "blocked" | "review_dispatched";
+  mode?: "manual_approve" | "ao_review";
   rationale?: string;
   releasedAt?: string;
+  attempt?: number;
+  generatedArtifacts?: string[];
+  dispatchContextPath?: string;
+  aoSessionId?: string;
+  supersededAoSessionId?: string;
 }
 
 export interface RuntimeTaskStatusSource {

@@ -304,7 +304,82 @@ function normalizeTask(
 
   taskRecord.aoRole = normalizeAoRole(task, taskRecord, index, report);
   taskRecord.executionPolicy = normalizeExecutionPolicy(taskRecord.type, task.executionPolicy, report, path("executionPolicy"));
+  normalizeArtifactContracts(taskRecord, index, report);
   return taskRecord;
+}
+
+function normalizeArtifactContracts(
+  task: Record<string, unknown>,
+  index: number,
+  report: TaskPlanNormalizationReport
+): void {
+  if (Array.isArray(task.inputArtifacts) || Array.isArray(task.outputArtifacts)) {
+    return;
+  }
+  const text = [task.title, task.description, task.aoPrompt, ...(Array.isArray(task.acceptanceCriteria) ? task.acceptanceCriteria : [])]
+    .filter((value): value is string => typeof value === "string")
+    .join("\n");
+  if (/G0|人工复核放行|仓库现实校准|复核失败回流/i.test(text)) {
+    if (/仓库现实校准/.test(text)) {
+      task.outputArtifacts = [
+        { kind: "g0_repo_reality_check", path: "g0_repo_reality_check.json", required: true }
+      ];
+      addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "G0 repository reality check output artifact inferred");
+      return;
+    }
+    if (/人工复核放行/.test(text)) {
+      const dependencyId = Array.isArray(task.dependencies) && typeof task.dependencies[0] === "string" ? task.dependencies[0] : undefined;
+      task.inputArtifacts = dependencyId
+        ? [{ taskId: dependencyId, kind: "g0_repo_reality_check", path: "g0_repo_reality_check.json", required: true }]
+        : [];
+      task.outputArtifacts = [
+        { kind: "g0_review_gate_decision", path: "g0_review_gate_decision.json", required: true },
+        { kind: "g0_approved_flag", path: "g0_approved.flag", requiredWhen: "decision=approved" }
+      ];
+      addChange(report, `tasks.${index}.inputArtifacts`, undefined, task.inputArtifacts, "G0 manual gate input artifact inferred");
+      addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "G0 manual gate output artifacts inferred");
+      return;
+    }
+    if (/复核失败回流/.test(text)) {
+      const dependencyId = Array.isArray(task.dependencies) && typeof task.dependencies[0] === "string" ? task.dependencies[0] : undefined;
+      task.inputArtifacts = dependencyId
+        ? [{ taskId: dependencyId, kind: "g0_review_gate_decision", path: "g0_review_gate_decision.json", required: true }]
+        : [];
+      task.outputArtifacts = [
+        { kind: "g0_replan_request", path: "g0_replan_request.json", required: true }
+      ];
+      addChange(report, `tasks.${index}.inputArtifacts`, undefined, task.inputArtifacts, "G0 replan input artifact inferred");
+      addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "G0 replan output artifact inferred");
+    }
+    return;
+  }
+  if (/planning gate|task plan gate|任务计划.*门禁|计划.*审批/i.test(text)) {
+    task.outputArtifacts = [
+      { kind: "task_plan_approval_report", path: "task-plan-approval-report.json", required: true }
+    ];
+    addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "task-plan gate output artifact inferred");
+    return;
+  }
+  if (/contract freeze|契约冻结/i.test(text)) {
+    task.outputArtifacts = [
+      { kind: "contract_freeze_evidence", path: "contract-freeze-evidence.json", required: true }
+    ];
+    addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "contract freeze output artifact inferred");
+    return;
+  }
+  if (/qa verdict/i.test(text)) {
+    task.outputArtifacts = [
+      { kind: "qa_verdict", path: "qa_verdict.json", required: true }
+    ];
+    addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "QA verdict output artifact inferred");
+    return;
+  }
+  if (/release|发布/i.test(text) && /decision|门禁|复核/i.test(text)) {
+    task.outputArtifacts = [
+      { kind: "release_decision", path: "release_decision.json", required: true }
+    ];
+    addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "release decision output artifact inferred");
+  }
 }
 
 function normalizeTaskType(value: unknown): { type: unknown; phase?: string } {

@@ -47,6 +47,7 @@ export async function startWebServer(options: WebServerOptions): Promise<{
   const defaultExecutionManager = new ExecutionJobManager({
     store: getExecutionStateStore(defaultArtifactRoot),
     artifactRoot: defaultArtifactRoot,
+    projectRoot: options.aoProjectRoot,
     createAo: () => new AoCliAdapter({ projectRoot: options.aoProjectRoot, dryRun: false }),
     createCodex: () => options.createCodexAdapter?.(options.aoProjectRoot) ?? new CodexCliAdapter({ projectRoot: options.aoProjectRoot }),
     createClaudeCode: () =>
@@ -406,6 +407,33 @@ async function routeRequest(input: {
     return;
   }
 
+  if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/manual-gates\/[^/]+\/approve$/)) {
+    const parts = url.pathname.split("/");
+    const jobId = decodeURIComponent(parts[4] ?? "");
+    const taskId = decodeURIComponent(parts[6] ?? "");
+    const body = (await readJsonBody(input.request)) as { rationale?: string } & ProjectScopedRequest;
+    const manager = getExecutionManager(body, input);
+    sendJson(input.response, 200, await manager.decideManualGate(jobId, taskId, {
+      decision: "approved",
+      rationale: body.rationale ?? "Web UI 门禁放行"
+    }));
+    return;
+  }
+
+  if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/manual-gates\/[^/]+\/dispatch-review$/)) {
+    const parts = url.pathname.split("/");
+    const jobId = decodeURIComponent(parts[4] ?? "");
+    const taskId = decodeURIComponent(parts[6] ?? "");
+    const body = (await readJsonBody(input.request)) as { rationale?: string } & ProjectScopedRequest;
+    const manager = getExecutionManager(body, input);
+    sendJson(input.response, 200, await manager.dispatchManualGateReview(
+      jobId,
+      taskId,
+      body.rationale ?? "Web UI 派发门禁复核"
+    ));
+    return;
+  }
+
   if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/revision-requests$/)) {
     const jobId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
     const body = (await readJsonBody(input.request)) as {
@@ -478,6 +506,7 @@ function getExecutionManager(
     manager = new ExecutionJobManager({
       store: getExecutionStateStore(artifactRoot),
       artifactRoot,
+      projectRoot,
       createAo: () => new AoCliAdapter({ projectRoot, dryRun: request.dryRun ?? false }),
       createCodex: () => createCodexAdapterForRequest(input.createCodexAdapter, request, input.aoProjectRoot),
       createClaudeCode: () => createClaudeCodeAdapterForRequest(input.createClaudeCodeAdapter, request, input.aoProjectRoot)

@@ -136,6 +136,51 @@ describe("normalizeTaskPlanModelOutput", () => {
     expect(result.report.droppedEntries.map((entry) => entry.path)).toContain("tasks.0.executionPolicy.policyRationale");
   });
 
+  it("infers structured artifact contracts for planning, contract, QA, and release gates", () => {
+    const result = normalizeTaskPlanModelOutput(
+      createRawPlan({
+        tasks: [
+          createRawTask({
+            taskId: "TASK-001",
+            title: "Task plan gate",
+            description: "Review task plan gate.",
+            type: "verification",
+            aoRole: "reviewer"
+          }),
+          createRawTask({
+            taskId: "TASK-002",
+            title: "Contract freeze",
+            description: "Write contract freeze evidence.",
+            type: "verification",
+            aoRole: "reviewer"
+          }),
+          createRawTask({
+            taskId: "TASK-003",
+            title: "QA verdict",
+            description: "Write QA verdict.",
+            type: "verification",
+            aoRole: "qa"
+          }),
+          createRawTask({
+            taskId: "TASK-004",
+            title: "Release decision gate",
+            description: "Write release decision.",
+            type: "verification",
+            aoRole: "docs"
+          })
+        ]
+      }),
+      { workflowId: "WF-NORMALIZE", source: "codex" }
+    );
+
+    expect(result.plan?.tasks.map((task) => task.outputArtifacts?.[0]?.path)).toEqual([
+      "task-plan-approval-report.json",
+      "contract-freeze-evidence.json",
+      "qa_verdict.json",
+      "release_decision.json"
+    ]);
+  });
+
   it("reports raw schema failures without throwing enum errors", () => {
     const result = normalizeTaskPlanModelOutput(
       { workflowId: "WF-BAD", title: "Bad plan", tasks: [{}] },

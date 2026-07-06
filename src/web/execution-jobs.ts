@@ -4,8 +4,17 @@ import type { AoCliAdapter } from "../adapters/ao.js";
 import type { ClaudeCodeAdapter } from "../adapters/claude-code.js";
 import type { CodexAdapter } from "../adapters/codex.js";
 import {
+  findMissingRequiredArtifacts,
+  resolveInputArtifacts,
+  resolveOutputArtifacts,
+  type MissingArtifact,
+  type ResolvedArtifact
+} from "../workflow/ao-dispatch-context.js";
+import {
+  approveManualGate,
   ContinuousExecutionRunner,
   decideManualGate,
+  dispatchManualGateReview,
   markExecutionTaskCompleted,
   retryExecutionTask,
   stopExecution
@@ -35,6 +44,18 @@ export interface ExecutionJobSnapshot {
   failure?: ExecutionState["failure"];
   logs?: unknown[];
   readonly?: boolean;
+  manualGateReleases?: ExecutionState["manualGateReleases"];
+  manualGateContext?: ManualGateContextSnapshot;
+}
+
+export interface ManualGateContextSnapshot {
+  taskId: string;
+  title?: string;
+  dependencies: string[];
+  inputArtifacts: ResolvedArtifact[];
+  expectedOutputs: ResolvedArtifact[];
+  missingArtifacts: MissingArtifact[];
+  generatedArtifacts?: string[];
 }
 
 export interface ExecutionTaskSnapshot {
@@ -66,6 +87,7 @@ export class ExecutionJobManager {
   constructor(private readonly input: {
     store: ExecutionStateStore;
     artifactRoot: string;
+    projectRoot?: string;
     createAo: () => ExecutionAoAdapter;
     createCodex?: () => CodexAdapter;
     createClaudeCode?: () => ClaudeCodeAdapter;
@@ -87,7 +109,8 @@ export class ExecutionJobManager {
           const runner = new ContinuousExecutionRunner({
             workflowId: state.workflowId,
             store: this.input.store,
-            ao: this.input.createAo()
+            ao: this.input.createAo(),
+            projectRoot: this.input.projectRoot
           });
           this.jobs.set(jobId, { jobId, workflowId: state.workflowId, runner, lock });
           runner.start();
@@ -145,6 +168,7 @@ export class ExecutionJobManager {
       workflowId: input.workflowId,
       store: this.input.store,
       ao,
+      projectRoot: this.input.projectRoot,
       pollIntervalMs: input.pollIntervalMs
     });
     this.jobs.set(jobId, { jobId, workflowId: input.workflowId, runner, lock });
@@ -162,6 +186,7 @@ export class ExecutionJobManager {
     let summary: ReturnType<typeof summarizeExecutionState> | undefined;
     let tasks: ExecutionTaskSnapshot[] | undefined;
     let activeTask: ExecutionTaskSnapshot | undefined;
+    let manualGateContext: ManualGateContextSnapshot | undefined;
     try {
       const plan = await this.input.store.readActiveTaskPlan(state);
       summary = summarizeExecutionState(plan, state);
@@ -185,6 +210,7 @@ export class ExecutionJobManager {
       activeTask = tasks.find((task) => task.taskId === state.currentTaskId) ??
         tasks.find((task) => task.status === "working") ??
         tasks.find((task) => task.status === "blocked_for_human");
+      manualGateContext = await this.buildManualGateContext(plan, state);
     } catch {
       summary = undefined;
     }
@@ -198,7 +224,9 @@ export class ExecutionJobManager {
       tasks,
       failure: state.failure,
       logs: await this.input.store.readLogs(job.workflowId, 100),
-      readonly: job.readonly
+      readonly: job.readonly,
+      manualGateReleases: state.manualGateReleases,
+      manualGateContext
     };
   }
 
@@ -257,16 +285,28 @@ export class ExecutionJobManager {
     rationale: string;
   }): Promise<ExecutionJobSnapshot> {
     const job = this.requireJob(jobId);
-    const ao = input.decision === "approved" ? await this.prepareContinuation(job) : undefined;
+    const ao = input.decision === "approved" ? await this.prepareContinuation(job, { skipAoCheck: true }) : undefined;
     try {
-      await decideManualGate({
-        store: this.input.store,
-        workflowId: job.workflowId,
-        taskId,
-        decision: input.decision,
-        rationale: input.rationale,
-        actor: "user"
-      });
+      if (input.decision === "approved") {
+        const state = await this.input.store.ensureState(job.workflowId);
+        await approveManualGate({
+          store: this.input.store,
+          workflowId: job.workflowId,
+          taskId,
+          rationale: input.rationale,
+          actor: "user",
+          recovery: state.status === "running"
+        });
+      } else {
+        await decideManualGate({
+          store: this.input.store,
+          workflowId: job.workflowId,
+          taskId,
+          decision: input.decision,
+          rationale: input.rationale,
+          actor: "user"
+        });
+      }
       if (input.decision === "approved") {
         this.startRunner(job, ao);
       }
@@ -275,6 +315,27 @@ export class ExecutionJobManager {
       if (input.decision === "approved") {
         await this.releasePreparedContinuation(job);
       }
+      throw error;
+    }
+  }
+
+  async dispatchManualGateReview(jobId: string, taskId: string, rationale: string): Promise<ExecutionJobSnapshot> {
+    const job = this.requireJob(jobId);
+    const ao = await this.prepareContinuation(job);
+    try {
+      await dispatchManualGateReview({
+        store: this.input.store,
+        ao: ao ?? this.input.createAo(),
+        workflowId: job.workflowId,
+        taskId,
+        rationale,
+        projectRoot: this.input.projectRoot,
+        actor: "user"
+      });
+      this.startRunner(job, ao);
+      return this.getSnapshot(jobId);
+    } catch (error) {
+      await this.releasePreparedContinuation(job);
       throw error;
     }
   }
@@ -349,13 +410,16 @@ export class ExecutionJobManager {
   }
 
   private async prepareContinuation(
-    job: ManagedExecutionJob
+    job: ManagedExecutionJob,
+    options: { skipAoCheck?: boolean } = {}
   ): Promise<ExecutionAoAdapter | undefined> {
     if (job.runner) {
       return undefined;
     }
     const ao = this.input.createAo();
-    await this.ensureAoAvailable(ao, job);
+    if (!options.skipAoCheck) {
+      await this.ensureAoAvailable(ao, job);
+    }
     job.lock ??= await acquireExecutionLock({
       artifactRoot: this.input.artifactRoot,
       workflowId: job.workflowId,
@@ -385,7 +449,8 @@ export class ExecutionJobManager {
     job.runner = new ContinuousExecutionRunner({
       workflowId: job.workflowId,
       store: this.input.store,
-      ao: ao ?? this.input.createAo()
+      ao: ao ?? this.input.createAo(),
+      projectRoot: this.input.projectRoot
     });
     job.readonly = false;
     job.runner.start();
@@ -421,6 +486,9 @@ export class ExecutionJobManager {
     }
     const task = state.taskStates[taskId];
     if (!task?.aoSessionId) {
+      return state;
+    }
+    if (state.supersededSessions?.includes(task.aoSessionId)) {
       return state;
     }
 
@@ -473,6 +541,31 @@ export class ExecutionJobManager {
       reportedState: session.reportedState ?? "completed"
     });
     return recovered;
+  }
+
+  private async buildManualGateContext(
+    plan: Awaited<ReturnType<ExecutionStateStore["readActiveTaskPlan"]>>,
+    state: ExecutionState
+  ): Promise<ManualGateContextSnapshot | undefined> {
+    if (state.status !== "waiting_manual_gate" || !state.currentTaskId) {
+      return undefined;
+    }
+    const task = plan.tasks.find((item) => item.taskId === state.currentTaskId);
+    if (!task || task.dependencyCondition !== "manual_gate") {
+      return undefined;
+    }
+    const artifactDir = this.input.store.getWorkflowDir(state.workflowId);
+    const inputArtifacts = resolveInputArtifacts(task, plan, artifactDir);
+    const release = state.manualGateReleases.find((item) => item.taskId === task.taskId && item.mode === "manual_approve");
+    return {
+      taskId: task.taskId,
+      title: task.title,
+      dependencies: task.dependencies,
+      inputArtifacts,
+      expectedOutputs: resolveOutputArtifacts(task, artifactDir),
+      missingArtifacts: await findMissingRequiredArtifacts(inputArtifacts),
+      generatedArtifacts: release?.generatedArtifacts
+    };
   }
 }
 
