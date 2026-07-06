@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { readFile } from "node:fs/promises";
-import { basename, resolve } from "node:path";
+import { access, readdir, readFile } from "node:fs/promises";
+import { basename, join, normalize, resolve } from "node:path";
 import { Command } from "commander";
 import { appVersion } from "./app-version.js";
 import { AoCliAdapter } from "./adapters/ao.js";
@@ -21,11 +21,21 @@ import {
   retryExecutionTask,
   stopExecution
 } from "./workflow/continuous-plan-execution.js";
+import { getArtifactContractRegistry, getCandidatePaths } from "./workflow/artifact-contract-registry.js";
 import { acquireExecutionLock } from "./workflow/execution-lock.js";
-import { getExecutionStateStore } from "./workflow/execution-state-store.js";
+import {
+  atomicWriteJson,
+  getExecutionStateStore,
+  getPlanPath
+} from "./workflow/execution-state-store.js";
 import type { PlanVersion } from "./workflow/execution-state-store.js";
+import type { ExecutionState } from "./workflow/execution-state-store.js";
 import { runWorkflow } from "./workflow/run-workflow.js";
-import { TASK_PLAN_NORMALIZATION_SOURCE, parseTaskPlanWithNormalization } from "./workflow/task-plan-normalizer.js";
+import {
+  TASK_PLAN_NORMALIZATION_SOURCE,
+  parseTaskPlanWithNormalization
+} from "./workflow/task-plan-normalizer.js";
+import type { ExecutionTask } from "./schemas/task-plan.js";
 import { startWebServer } from "./web/server.js";
 import { stopServiceOnPort } from "./web/service-control.js";
 
@@ -40,14 +50,20 @@ program
   .command("run-workflow")
   .argument("<requirement-file>", "Requirement JSON file")
   .option("--project-root <path>", "Project root used as cwd for Codex and ClaudeCode")
-  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .option(
+    "--artifact-root <path>",
+    "Directory used to store generated workflow artifacts",
+    ".ao-control-plane"
+  )
   .option("--codex-bin <command>", "Codex CLI command", "codex")
   .option("--claude-bin <command>", "ClaudeCode CLI command", "claude")
   .option("--codex-model <model>", "Codex model", "gpt-5.5")
   .option("--codex-effort <level>", "Codex reasoning effort", "high")
   .option("--claude-model <model>", "ClaudeCode model")
   .option("--claude-effort <level>", "ClaudeCode effort", "high")
-  .description("Run requirement design, ClaudeCode review, Codex revision, and task-plan generation")
+  .description(
+    "Run requirement design, ClaudeCode review, Codex revision, and task-plan generation"
+  )
   .action(
     async (
       requirementFile: string,
@@ -110,7 +126,13 @@ program
   .description("Validate a structured task plan before sending it to AO")
   .action(async (file: string) => {
     const plan = await readTaskPlan(file);
-    console.log(JSON.stringify({ valid: true, workflowId: plan.workflowId, taskCount: plan.tasks.length }, null, 2));
+    console.log(
+      JSON.stringify(
+        { valid: true, workflowId: plan.workflowId, taskCount: plan.tasks.length },
+        null,
+        2
+      )
+    );
   });
 
 program
@@ -118,173 +140,380 @@ program
   .argument("<file>", "Task plan JSON file")
   .option("--project-root <path>", "AO project root used as cwd for ao CLI")
   .option("--dry-run", "Print intended AO calls without spawning sessions")
-  .option("--release-manual-gate <taskId...>", "Explicitly release manual_gate task ids for dispatch")
+  .option(
+    "--release-manual-gate <taskId...>",
+    "Explicitly release manual_gate task ids for dispatch"
+  )
   .description("Execute a validated task plan through AO built-in roles")
-  .action(async (file: string, options: { projectRoot?: string; dryRun?: boolean; releaseManualGate?: string[] }) => {
-    const plan = await readTaskPlan(file);
-    const ao = new AoCliAdapter({
-      projectRoot: options.projectRoot,
-      dryRun: options.dryRun
-    });
-    const result = await executePlan({
-      plan,
-      ao,
-      releasedManualGateTaskIds: options.releaseManualGate
-    });
-    console.log(JSON.stringify(result, null, 2));
-  });
+  .action(
+    async (
+      file: string,
+      options: { projectRoot?: string; dryRun?: boolean; releaseManualGate?: string[] }
+    ) => {
+      const plan = await readTaskPlan(file);
+      const ao = new AoCliAdapter({
+        projectRoot: options.projectRoot,
+        dryRun: options.dryRun
+      });
+      const result = await executePlan({
+        plan,
+        ao,
+        releasedManualGateTaskIds: options.releaseManualGate
+      });
+      console.log(JSON.stringify(result, null, 2));
+    }
+  );
 
 program
   .command("execute-plan-continuous")
   .argument("<task-plan-file>", "Task plan JSON file")
   .option("--project-root <path>", "AO project root used as cwd for ao CLI")
-  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .option(
+    "--artifact-root <path>",
+    "Directory used to store generated workflow artifacts",
+    ".ao-control-plane"
+  )
   .option("--workflow-id <id>", "Workflow id; defaults to task-plan.workflowId")
   .option("--poll-interval-ms <number>", "AO status poll interval", "5000")
   .option("--stale-lock-ms <number>", "Execution lock stale threshold")
   .option("--dry-run", "Run continuous scheduling without spawning real AO sessions")
   .option("--attach", "Only print current execution state and logs without driving the runner")
   .description("Execute a task plan continuously, serially dispatching ready AO tasks")
-  .action(async (
-    taskPlanFile: string,
-    options: {
-      projectRoot?: string;
-      artifactRoot: string;
-      workflowId?: string;
-      pollIntervalMs: string;
-      staleLockMs?: string;
-      dryRun?: boolean;
-      attach?: boolean;
-    }
-  ) => {
-    const plan = await readTaskPlan(taskPlanFile);
-    const workflowId = options.workflowId ?? plan.workflowId;
-    const store = getExecutionStateStore(options.artifactRoot);
-    if (options.attach) {
-      console.log(JSON.stringify({
-        state: await store.ensureState(workflowId),
-        logs: await store.readLogs(workflowId)
-      }, null, 2));
-      return;
-    }
+  .action(
+    async (
+      taskPlanFile: string,
+      options: {
+        projectRoot?: string;
+        artifactRoot: string;
+        workflowId?: string;
+        pollIntervalMs: string;
+        staleLockMs?: string;
+        dryRun?: boolean;
+        attach?: boolean;
+      }
+    ) => {
+      const plan = await readTaskPlan(taskPlanFile);
+      const workflowId = options.workflowId ?? plan.workflowId;
+      const store = getExecutionStateStore(options.artifactRoot);
+      if (options.attach) {
+        console.log(
+          JSON.stringify(
+            {
+              state: await store.ensureState(workflowId),
+              logs: await store.readLogs(workflowId)
+            },
+            null,
+            2
+          )
+        );
+        return;
+      }
 
-    await activateCliPlanFile({ store, workflowId, taskPlanFile });
-    const lock = options.dryRun
-      ? undefined
-      : await acquireExecutionLock({
-          artifactRoot: options.artifactRoot,
+      await activateCliPlanFile({ store, workflowId, taskPlanFile });
+      const lock = options.dryRun
+        ? undefined
+        : await acquireExecutionLock({
+            artifactRoot: options.artifactRoot,
+            workflowId,
+            holder: "cli",
+            staleLockMs: options.staleLockMs ? Number(options.staleLockMs) : undefined
+          });
+      try {
+        const runner = new ContinuousExecutionRunner({
           workflowId,
-          holder: "cli",
-          staleLockMs: options.staleLockMs ? Number(options.staleLockMs) : undefined
+          store,
+          ao: new AoCliAdapter({
+            projectRoot: options.projectRoot,
+            dryRun: options.dryRun
+          }),
+          pollIntervalMs: Number(options.pollIntervalMs)
         });
-    try {
-      const runner = new ContinuousExecutionRunner({
-        workflowId,
-        store,
-        ao: new AoCliAdapter({
-          projectRoot: options.projectRoot,
-          dryRun: options.dryRun
-        }),
-        pollIntervalMs: Number(options.pollIntervalMs)
-      });
-      await runner.run();
-      console.log(JSON.stringify(await store.ensureState(workflowId), null, 2));
-    } finally {
-      await lock?.release();
+        await runner.run();
+        console.log(JSON.stringify(await store.ensureState(workflowId), null, 2));
+      } finally {
+        await lock?.release();
+      }
     }
-  });
+  );
 
 program
   .command("execution-status")
   .requiredOption("--workflow-id <id>", "Workflow id")
-  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .option(
+    "--artifact-root <path>",
+    "Directory used to store generated workflow artifacts",
+    ".ao-control-plane"
+  )
   .description("Print continuous execution state and recent logs")
   .action(async (options: { workflowId: string; artifactRoot: string }) => {
     const store = getExecutionStateStore(options.artifactRoot);
-    console.log(JSON.stringify({
-      state: await store.ensureState(options.workflowId),
-      logs: await store.readLogs(options.workflowId)
-    }, null, 2));
+    console.log(
+      JSON.stringify(
+        {
+          state: await store.ensureState(options.workflowId),
+          logs: await store.readLogs(options.workflowId)
+        },
+        null,
+        2
+      )
+    );
   });
 
 program
   .command("execution-stop")
   .requiredOption("--workflow-id <id>", "Workflow id")
-  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .option(
+    "--artifact-root <path>",
+    "Directory used to store generated workflow artifacts",
+    ".ao-control-plane"
+  )
   .description("Stop continuous execution without killing AO sessions")
   .action(async (options: { workflowId: string; artifactRoot: string }) => {
     const store = getExecutionStateStore(options.artifactRoot);
-    console.log(JSON.stringify(await stopExecution({ store, workflowId: options.workflowId, actor: "cli" }), null, 2));
+    console.log(
+      JSON.stringify(
+        await stopExecution({ store, workflowId: options.workflowId, actor: "cli" }),
+        null,
+        2
+      )
+    );
   });
 
 program
   .command("execution-resume")
   .requiredOption("--workflow-id <id>", "Workflow id")
   .option("--project-root <path>", "AO project root used as cwd for ao CLI")
-  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .option(
+    "--artifact-root <path>",
+    "Directory used to store generated workflow artifacts",
+    ".ao-control-plane"
+  )
   .option("--poll-interval-ms <number>", "AO status poll interval", "5000")
   .option("--stale-lock-ms <number>", "Execution lock stale threshold")
   .option("--dry-run", "Run continuous scheduling without spawning real AO sessions")
   .description("Resume a stopped continuous execution")
-  .action(async (options: {
-    workflowId: string;
-    projectRoot?: string;
-    artifactRoot: string;
-    pollIntervalMs: string;
-    staleLockMs?: string;
-    dryRun?: boolean;
-  }) => {
-    const store = getExecutionStateStore(options.artifactRoot);
-    const lock = options.dryRun
-      ? undefined
-      : await acquireExecutionLock({
-          artifactRoot: options.artifactRoot,
+  .action(
+    async (options: {
+      workflowId: string;
+      projectRoot?: string;
+      artifactRoot: string;
+      pollIntervalMs: string;
+      staleLockMs?: string;
+      dryRun?: boolean;
+    }) => {
+      const store = getExecutionStateStore(options.artifactRoot);
+      const lock = options.dryRun
+        ? undefined
+        : await acquireExecutionLock({
+            artifactRoot: options.artifactRoot,
+            workflowId: options.workflowId,
+            holder: "cli",
+            staleLockMs: options.staleLockMs ? Number(options.staleLockMs) : undefined
+          });
+      try {
+        const runner = new ContinuousExecutionRunner({
           workflowId: options.workflowId,
-          holder: "cli",
-          staleLockMs: options.staleLockMs ? Number(options.staleLockMs) : undefined
+          store,
+          ao: new AoCliAdapter({ projectRoot: options.projectRoot, dryRun: options.dryRun }),
+          pollIntervalMs: Number(options.pollIntervalMs)
         });
-    try {
-      const runner = new ContinuousExecutionRunner({
-        workflowId: options.workflowId,
-        store,
-        ao: new AoCliAdapter({ projectRoot: options.projectRoot, dryRun: options.dryRun }),
-        pollIntervalMs: Number(options.pollIntervalMs)
-      });
-      await runner.run();
-      console.log(JSON.stringify(await store.ensureState(options.workflowId), null, 2));
-    } finally {
-      await lock?.release();
+        await runner.run();
+        console.log(JSON.stringify(await store.ensureState(options.workflowId), null, 2));
+      } finally {
+        await lock?.release();
+      }
     }
-  });
+  );
 
 program
   .command("execution-retry")
   .requiredOption("--workflow-id <id>", "Workflow id")
   .requiredOption("--task-id <taskId>", "Task id")
-  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .option(
+    "--artifact-root <path>",
+    "Directory used to store generated workflow artifacts",
+    ".ao-control-plane"
+  )
   .description("Mark a blocked or failed task for retry")
   .action(async (options: { workflowId: string; taskId: string; artifactRoot: string }) => {
     const store = getExecutionStateStore(options.artifactRoot);
-    console.log(JSON.stringify(await retryExecutionTask({ store, workflowId: options.workflowId, taskId: options.taskId, actor: "cli" }), null, 2));
+    console.log(
+      JSON.stringify(
+        await retryExecutionTask({
+          store,
+          workflowId: options.workflowId,
+          taskId: options.taskId,
+          actor: "cli"
+        }),
+        null,
+        2
+      )
+    );
   });
+
+program
+  .command("migrate-plan-status")
+  .requiredOption("--workflow-id <id>", "Workflow id")
+  .option(
+    "--artifact-root <path>",
+    "Directory used to store generated workflow artifacts",
+    ".ao-control-plane"
+  )
+  .option(
+    "--tasks <taskIds>",
+    "Comma-separated task ids to move to blocked_for_human when required artifacts cannot be recovered"
+  )
+  .option("--project-root <path>", "AO project root used to resolve mirror artifact candidates")
+  .option("--apply", "Write the normalized active task plan and selected status changes")
+  .option("--yes", "Skip interactive confirmation; requires --tasks")
+  .description("Audit and migrate active task-plan artifact contracts")
+  .action(
+    async (options: {
+      workflowId: string;
+      artifactRoot: string;
+      tasks?: string;
+      projectRoot?: string;
+      apply?: boolean;
+      yes?: boolean;
+    }) => {
+      const store = getExecutionStateStore(options.artifactRoot);
+      const state = await store.ensureState(options.workflowId);
+      const plan = await store.readActiveTaskPlan(state);
+      const workflowDir = store.getWorkflowDir(options.workflowId);
+      const selectedTasks = new Set(
+        (options.tasks ?? "")
+          .split(",")
+          .map((item) => item.trim())
+          .filter(Boolean)
+      );
+      if (options.yes && selectedTasks.size === 0) {
+        throw new Error("--yes requires --tasks");
+      }
+      const sessions = normalizeAoSessions(await new AoCliAdapter({
+        projectRoot: options.projectRoot
+      }).listSessions().catch(() => []));
+      const audits = await Promise.all(
+        plan.tasks.map((task) =>
+          auditTaskArtifactContracts({
+            task,
+            state,
+            workflowId: options.workflowId,
+            artifactDir: workflowDir,
+            projectRoot: options.projectRoot,
+            sessions
+          })
+        )
+      );
+      const reportPath = join(
+        workflowDir,
+        `artifact-contract-migration-report-${await nextMigrationReportNumber(workflowDir)}.json`
+      );
+      const report = {
+        workflowId: options.workflowId,
+        generatedAt: new Date().toISOString(),
+        dryRun: !options.apply,
+        activePlanPath: getPlanPath(state.planVersion),
+        normalizedOutputArtifactTaskCount: plan.tasks.filter(
+          (task) => (task.outputArtifacts ?? []).length > 0
+        ).length,
+        selectedTasks: [...selectedTasks],
+        tasks: audits,
+        statusSuggestions: audits
+          .filter((audit) => audit.requiredMissing.length > 0 && audit.recoverableCandidates.length === 0)
+          .map((audit) => ({
+            taskId: audit.taskId,
+            suggestion: "blocked_for_human",
+            reason: "required canonical artifacts are missing and no candidate exists"
+          }))
+      };
+      await atomicWriteJson(reportPath, report);
+      if (options.apply) {
+        if (selectedTasks.size > 0 && !options.yes) {
+          throw new Error(
+            "Refusing status migration without --yes. Re-run with --tasks and --yes after reviewing dry-run output."
+          );
+        }
+        await atomicWriteJson(resolve(workflowDir, getPlanPath(state.planVersion)), plan);
+        if (selectedTasks.size > 0) {
+          const before = Object.fromEntries(
+            Object.entries(state.taskStates)
+              .filter(([taskId]) => selectedTasks.has(taskId))
+              .map(([taskId, taskState]) => [taskId, taskState.status])
+          );
+          await store.update(options.workflowId, (current) => ({
+            ...current,
+            taskStates: Object.fromEntries(
+              Object.entries(current.taskStates).map(([taskId, taskState]) => [
+                taskId,
+                selectedTasks.has(taskId)
+                  ? {
+                      ...taskState,
+                      status: "blocked_for_human" as const,
+                      failureReason: "migrate_plan_status_confirmed"
+                    }
+                  : taskState
+              ])
+            )
+          }));
+          const afterState = await store.readState(options.workflowId);
+          const after = Object.fromEntries(
+            Object.entries(afterState.taskStates)
+              .filter(([taskId]) => selectedTasks.has(taskId))
+              .map(([taskId, taskState]) => [taskId, taskState.status])
+          );
+          await store.appendLog(options.workflowId, {
+            type: "migrate_plan_status_confirmed",
+            attempt: 0,
+            actor: "cli",
+            operator: process.env.USERNAME ?? process.env.USER ?? "cli",
+            confirmedAt: new Date().toISOString(),
+            workflowId: options.workflowId,
+            tasks: [...selectedTasks],
+            statusBefore: before,
+            statusAfter: after,
+            confirmationMethod: options.yes ? "yes-flag" : "interactive",
+            reportPath
+          });
+        }
+      }
+      console.log(JSON.stringify({ ...report, reportPath }, null, 2));
+    }
+  );
 
 program
   .command("execution-mark-completed")
   .requiredOption("--workflow-id <id>", "Workflow id")
   .requiredOption("--task-id <taskId>", "Task id")
   .requiredOption("--rationale <text>", "Human completion rationale")
-  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .option(
+    "--artifact-root <path>",
+    "Directory used to store generated workflow artifacts",
+    ".ao-control-plane"
+  )
   .description("Mark a task completed after human verification")
-  .action(async (options: { workflowId: string; taskId: string; rationale: string; artifactRoot: string }) => {
-    const store = getExecutionStateStore(options.artifactRoot);
-    console.log(JSON.stringify(await markExecutionTaskCompleted({
-      store,
-      workflowId: options.workflowId,
-      taskId: options.taskId,
-      rationale: options.rationale,
-      actor: "cli"
-    }), null, 2));
-  });
+  .action(
+    async (options: {
+      workflowId: string;
+      taskId: string;
+      rationale: string;
+      artifactRoot: string;
+    }) => {
+      const store = getExecutionStateStore(options.artifactRoot);
+      console.log(
+        JSON.stringify(
+          await markExecutionTaskCompleted({
+            store,
+            workflowId: options.workflowId,
+            taskId: options.taskId,
+            rationale: options.rationale,
+            actor: "cli"
+          }),
+          null,
+          2
+        )
+      );
+    }
+  );
 
 program
   .command("execution-release-gate")
@@ -292,35 +521,42 @@ program
   .requiredOption("--task-id <taskId>", "Task id")
   .option("--decision <decision>", "approved, requires_replan, or blocked", "approved")
   .option("--rationale <text>", "Decision rationale", "CLI manual gate decision")
-  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .option(
+    "--artifact-root <path>",
+    "Directory used to store generated workflow artifacts",
+    ".ao-control-plane"
+  )
   .description("Submit a structured manual gate decision")
-  .action(async (options: {
-    workflowId: string;
-    taskId: string;
-    decision: "approved" | "requires_replan" | "blocked";
-    rationale: string;
-    artifactRoot: string;
-  }) => {
-    const store = getExecutionStateStore(options.artifactRoot);
-    const state = options.decision === "approved"
-      ? await approveManualGate({
-          store,
-          workflowId: options.workflowId,
-          taskId: options.taskId,
-          rationale: options.rationale,
-          actor: "cli",
-          recovery: true
-        })
-      : await decideManualGate({
-          store,
-          workflowId: options.workflowId,
-          taskId: options.taskId,
-          decision: options.decision,
-          rationale: options.rationale,
-          actor: "cli"
-        });
-    console.log(JSON.stringify(state, null, 2));
-  });
+  .action(
+    async (options: {
+      workflowId: string;
+      taskId: string;
+      decision: "approved" | "requires_replan" | "blocked";
+      rationale: string;
+      artifactRoot: string;
+    }) => {
+      const store = getExecutionStateStore(options.artifactRoot);
+      const state =
+        options.decision === "approved"
+          ? await approveManualGate({
+              store,
+              workflowId: options.workflowId,
+              taskId: options.taskId,
+              rationale: options.rationale,
+              actor: "cli",
+              recovery: true
+            })
+          : await decideManualGate({
+              store,
+              workflowId: options.workflowId,
+              taskId: options.taskId,
+              decision: options.decision,
+              rationale: options.rationale,
+              actor: "cli"
+            });
+      console.log(JSON.stringify(state, null, 2));
+    }
+  );
 
 program
   .command("collect-status")
@@ -385,7 +621,11 @@ program
   .command("serve")
   .option("--host <host>", "Host for the local web console", "127.0.0.1")
   .option("--port <port>", "Port for the local web console", "4317")
-  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .option(
+    "--artifact-root <path>",
+    "Directory used to store generated workflow artifacts",
+    ".ao-control-plane"
+  )
   .option("--project-root <path>", "AO project root used when executing task plans")
   .option("--allow-public-host", "Allow binding the web console to a public host")
   .description("Start the local web console for requirement governance")
@@ -439,7 +679,11 @@ program
   .command("restart-service")
   .option("--host <host>", "Host for the local web console", "127.0.0.1")
   .option("--port <port>", "Port for the local web console", "4317")
-  .option("--artifact-root <path>", "Directory used to store generated workflow artifacts", ".ao-control-plane")
+  .option(
+    "--artifact-root <path>",
+    "Directory used to store generated workflow artifacts",
+    ".ao-control-plane"
+  )
   .option("--project-root <path>", "AO project root used when executing task plans")
   .option("--allow-public-host", "Allow binding the web console to a public host")
   .description("Stop the local web console on the port and start it again")
@@ -488,7 +732,9 @@ async function activateCliPlanFile(input: {
   }
   const versionMatch = fileName.match(/^task-plan-v(\d+)\.json$/);
   if (fileName !== "task-plan.json" && !versionMatch) {
-    throw new Error("execute-plan-continuous only accepts task-plan.json or task-plan-v{N}.json as active plans");
+    throw new Error(
+      "execute-plan-continuous only accepts task-plan.json or task-plan-v{N}.json as active plans"
+    );
   }
   if (!versionMatch) {
     return;
@@ -503,10 +749,14 @@ async function activateCliPlanFile(input: {
 
 async function readTaskPlan(file: string) {
   const parsed = await readJson(file);
-  return parseTaskPlanWithNormalization(parsed, {
-    workflowId: inferWorkflowId(parsed),
-    source: TASK_PLAN_NORMALIZATION_SOURCE.cli
-  }, `Task plan file ${file} is invalid`);
+  return parseTaskPlanWithNormalization(
+    parsed,
+    {
+      workflowId: inferWorkflowId(parsed),
+      source: TASK_PLAN_NORMALIZATION_SOURCE.cli
+    },
+    `Task plan file ${file} is invalid`
+  );
 }
 
 async function readDesignReviews(file: string) {
@@ -522,8 +772,108 @@ async function readJson(file: string): Promise<unknown> {
   return JSON.parse(raw) as unknown;
 }
 
+async function auditTaskArtifactContracts(input: {
+  task: ExecutionTask;
+  state: ExecutionState;
+  workflowId: string;
+  artifactDir: string;
+  projectRoot?: string;
+  sessions: ReturnType<typeof normalizeAoSessions>;
+}): Promise<{
+  taskId: string;
+  status: string;
+  aoSessionId?: string;
+  outputArtifacts: Array<{
+    kind: string;
+    contractId?: string;
+    canonicalPath: string;
+    required: boolean;
+    canonicalExists: boolean;
+    contractResolved: boolean;
+    candidatePaths: Array<{ path: string; exists: boolean; source?: string; priority?: number }>;
+  }>;
+  requiredMissing: string[];
+  recoverableCandidates: string[];
+}> {
+  const registry = getArtifactContractRegistry();
+  const taskState = input.state.taskStates[input.task.taskId];
+  const session = taskState?.aoSessionId
+    ? input.sessions.find((item) => item.id === taskState.aoSessionId)
+    : undefined;
+  const outputArtifacts = await Promise.all(
+    (input.task.outputArtifacts ?? []).map(async (artifact) => {
+      const contract = registry.resolveContractForArtifact(artifact);
+      const canonicalPath = normalize(resolve(input.artifactDir, artifact.path));
+      const candidatePaths = contract
+        ? await Promise.all(
+            getCandidatePaths(contract, {
+              artifactDir: input.artifactDir,
+              projectRoot: input.projectRoot,
+              worktreePath: session?.worktreePath,
+              workflowId: input.workflowId
+            })
+              .filter((candidate) => candidate.relativeTo !== "artifactDir")
+              .map(async (candidate) => ({
+                path: candidate.absolutePath,
+                exists: await fileExists(candidate.absolutePath),
+                source: candidate.source,
+                priority: candidate.priority
+              }))
+          )
+        : [];
+      return {
+        kind: artifact.kind,
+        contractId: artifact.contractId ?? contract?.id,
+        canonicalPath,
+        required: artifact.required ?? artifact.requiredOnSuccess ?? artifact.requiredWhen === undefined,
+        canonicalExists: await fileExists(canonicalPath),
+        contractResolved: Boolean(contract),
+        candidatePaths
+      };
+    })
+  );
+  return {
+    taskId: input.task.taskId,
+    status: taskState?.status ?? input.task.status,
+    aoSessionId: taskState?.aoSessionId,
+    outputArtifacts,
+    requiredMissing: outputArtifacts
+      .filter((artifact) => artifact.required && !artifact.canonicalExists)
+      .map((artifact) => artifact.kind),
+    recoverableCandidates: outputArtifacts
+      .filter((artifact) => artifact.candidatePaths.some((candidate) => candidate.exists))
+      .map((artifact) => artifact.kind)
+  };
+}
+
+async function nextMigrationReportNumber(workflowDir: string): Promise<number> {
+  try {
+    const entries = await readdir(workflowDir);
+    const max = entries
+      .map((entry) => entry.match(/^artifact-contract-migration-report-(\d+)\.json$/)?.[1])
+      .filter((value): value is string => Boolean(value))
+      .map(Number)
+      .reduce((left, right) => Math.max(left, right), 0);
+    return max + 1;
+  } catch {
+    return 1;
+  }
+}
+
+async function fileExists(file: string): Promise<boolean> {
+  try {
+    await access(file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function inferWorkflowId(value: unknown): string | undefined {
-  return typeof value === "object" && value !== null && "workflowId" in value && typeof value.workflowId === "string"
+  return typeof value === "object" &&
+    value !== null &&
+    "workflowId" in value &&
+    typeof value.workflowId === "string"
     ? value.workflowId
     : undefined;
 }

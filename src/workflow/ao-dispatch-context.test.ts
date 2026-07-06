@@ -156,7 +156,12 @@ describe("ao dispatch context", () => {
       title: "冻结跨语言 IPC 核心字节布局契约",
       description: "冻结 IPC 布局。",
       aoPrompt: `[${workflowId} / TASK-005] freeze ipc.`,
-      acceptanceCriteria: ["冻结控制块字段。"]
+      acceptanceCriteria: ["冻结控制块字段。"],
+      outputArtifacts: [
+        { contractId: "ipc_byte_layout_freeze", kind: "ipc_byte_layout_freeze", path: "ipc_byte_layout_freeze.json", required: true },
+        { contractId: "ipc_byte_layout_freeze_markdown", kind: "ipc_byte_layout_freeze_markdown", path: "ipc_byte_layout_freeze.md", required: true },
+        { contractId: "ipc_byte_layout_qa_verdict", kind: "ipc_byte_layout_qa_verdict", path: "ipc_byte_layout_qa_verdict.json", required: true }
+      ]
     });
     const reviewer = createTask(workflowId, {
       taskId: "TASK-006",
@@ -165,7 +170,11 @@ describe("ao dispatch context", () => {
       dependencies: ["TASK-005"],
       dependencyCondition: "manual_gate",
       aoPrompt: `[${workflowId} / TASK-006] review ipc.`,
-      acceptanceCriteria: ["approved 时产出 ipc_contract_approved.flag。"]
+      acceptanceCriteria: ["approved 时产出 ipc_contract_approved.flag。"],
+      outputArtifacts: [
+        { contractId: "ipc_contract_review_gate_decision", kind: "ipc_contract_review_gate_decision", path: "ipc_contract_review_gate_decision.json", required: true },
+        { contractId: "ipc_contract_approved_flag", kind: "ipc_contract_approved_flag", path: "ipc_contract_approved.flag", requiredWhen: "decision=approved" }
+      ]
     });
     const plan = { workflowId, title: "Plan", tasks: [producer, reviewer] };
 
@@ -196,7 +205,12 @@ describe("ao dispatch context", () => {
       title: "冻结跨语言 IPC 核心字节布局契约",
       description: "冻结 IPC 布局。",
       aoPrompt: `[${workflowId} / TASK-005] freeze ipc.`,
-      acceptanceCriteria: ["冻结控制块字段。"]
+      acceptanceCriteria: ["冻结控制块字段。"],
+      outputArtifacts: [
+        { contractId: "ipc_byte_layout_freeze", kind: "ipc_byte_layout_freeze", path: "ipc_byte_layout_freeze.json", required: true },
+        { contractId: "ipc_byte_layout_freeze_markdown", kind: "ipc_byte_layout_freeze_markdown", path: "ipc_byte_layout_freeze.md", required: true },
+        { contractId: "ipc_byte_layout_qa_verdict", kind: "ipc_byte_layout_qa_verdict", path: "ipc_byte_layout_qa_verdict.json", required: true }
+      ]
     });
     const reviewer = createTask(workflowId, {
       taskId: "TASK-006",
@@ -205,7 +219,11 @@ describe("ao dispatch context", () => {
       dependencies: ["TASK-005"],
       dependencyCondition: "manual_gate",
       aoPrompt: `[${workflowId} / TASK-006] review ipc.`,
-      acceptanceCriteria: ["approved 时产出 ipc_contract_approved.flag。"]
+      acceptanceCriteria: ["approved 时产出 ipc_contract_approved.flag。"],
+      outputArtifacts: [
+        { contractId: "ipc_contract_review_gate_decision", kind: "ipc_contract_review_gate_decision", path: "ipc_contract_review_gate_decision.json", required: true },
+        { contractId: "ipc_contract_approved_flag", kind: "ipc_contract_approved_flag", path: "ipc_contract_approved.flag", requiredWhen: "decision=approved" }
+      ]
     });
     const plan = { workflowId, title: "Plan", tasks: [producer, reviewer] };
 

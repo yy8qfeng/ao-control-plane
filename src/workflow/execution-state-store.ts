@@ -1,6 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { access, appendFile, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  appendFile,
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  writeFile
+} from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import { taskPlanSchema, type TaskPlan } from "../schemas/task-plan.js";
@@ -22,12 +31,7 @@ export type ExecutionJobStatus =
   | "stopped";
 
 export type ExecutionTaskRuntimeStatus =
-  | "pending"
-  | "working"
-  | "completed"
-  | "blocked_for_human"
-  | "failed"
-  | "superseded";
+  "pending" | "working" | "completed" | "blocked_for_human" | "failed" | "superseded";
 
 export type ExecutionErrorKind =
   | "ao_spawn_failed"
@@ -41,6 +45,10 @@ export type ExecutionErrorKind =
   | "revision_failed"
   | "dependency_deadlock"
   | "artifact_context_missing"
+  | "artifact_contract_missing"
+  | "artifact_contract_violation"
+  | "artifact_input_conflict"
+  | "artifact_output_ambiguous"
   | "artifact_output_missing"
   | "artifact_output_conflict"
   | "artifact_output_reconcile_failed"
@@ -68,6 +76,14 @@ export interface AoStatusObservation {
 export const executionLogTypeSchema = z.enum([
   "ao_dispatch_context_created",
   "artifact_context_missing",
+  "artifact_contract_missing",
+  "artifact_contract_resolved",
+  "artifact_contract_violation",
+  "artifact_canonical_verified",
+  "artifact_candidate_found",
+  "artifact_candidate_rejected",
+  "artifact_input_conflict",
+  "artifact_output_ambiguous",
   "artifact_output_conflict",
   "artifact_output_missing",
   "artifact_output_normalized",
@@ -80,6 +96,7 @@ export const executionLogTypeSchema = z.enum([
   "manual_gate_artifact_write_failed",
   "manual_gate_decided",
   "manual_gate_review_dispatched",
+  "migrate_plan_status_confirmed",
   "manual_gate_waiting",
   "task_completed_from_ao_report",
   "task_dispatch_failed",
@@ -92,7 +109,8 @@ export const executionLogTypeSchema = z.enum([
   "task_skipped",
   "worktree_cleanup_candidate_detected",
   "worktree_cleanup_completed",
-  "worktree_cleanup_failed"
+  "worktree_cleanup_failed",
+  "worktree_path_discovered_via_fallback"
 ]);
 
 export type ExecutionLogType = z.infer<typeof executionLogTypeSchema>;
@@ -186,82 +204,119 @@ const executionStateSchema = z.object({
   workflowId: z.string().min(1),
   planVersion: planVersionSchema,
   planPath: z.string().min(1),
-  status: z.enum(["idle", "running", "waiting_manual_gate", "paused_for_replan", "failed", "completed", "stopped"]),
+  status: z.enum([
+    "idle",
+    "running",
+    "waiting_manual_gate",
+    "paused_for_replan",
+    "failed",
+    "completed",
+    "stopped"
+  ]),
   currentTaskId: z.string().min(1).nullable().optional(),
   startedAt: z.string().nullable().optional(),
   updatedAt: z.string().min(1),
   completedAt: z.string().nullable().optional(),
   stoppedAt: z.string().nullable().optional(),
-  failure: z.object({
-    taskId: z.string().min(1).optional(),
-    kind: z.enum([
-      "ao_spawn_failed",
-      "ao_status_failed",
-      "ao_task_failed",
-      "ao_task_stuck",
-      "ao_task_needs_input",
-      "manual_gate_blocked",
-      "manual_gate_requires_replan",
-      "revision_requested",
-      "revision_failed",
-      "dependency_deadlock",
-      "artifact_context_missing",
-      "artifact_output_missing",
-      "artifact_output_conflict",
-      "artifact_output_reconcile_failed",
-      "manual_gate_artifact_write_failed",
-      "plan_missing",
-      "plan_invalid",
-      "state_corrupted",
-      "dispatcher_stopped",
-      "worktree_cleanup_failed"
-    ]),
-    message: z.string().min(1),
-    occurredAt: z.string().min(1),
-    spawnCandidateSessionIds: z.array(z.string().min(1)).optional()
-  }).nullable().optional(),
-  taskStates: z.record(z.object({
-    taskId: z.string().min(1),
-    status: z.enum(["pending", "working", "completed", "blocked_for_human", "failed", "superseded"]),
-    aoRole: z.string().min(1),
-    aoSessionId: z.string().min(1).optional(),
-    attempt: z.number().int().nonnegative(),
-    maxAttempts: z.number().int().positive(),
-    startedAt: z.string().optional(),
-    completedAt: z.string().nullable().optional(),
-    failureReason: z.string().nullable().optional(),
-    statusObservations: z.array(z.object({
+  failure: z
+    .object({
+      taskId: z.string().min(1).optional(),
+      kind: z.enum([
+        "ao_spawn_failed",
+        "ao_status_failed",
+        "ao_task_failed",
+        "ao_task_stuck",
+        "ao_task_needs_input",
+        "manual_gate_blocked",
+        "manual_gate_requires_replan",
+        "revision_requested",
+        "revision_failed",
+        "dependency_deadlock",
+    "artifact_context_missing",
+    "artifact_contract_missing",
+    "artifact_contract_violation",
+    "artifact_input_conflict",
+    "artifact_output_ambiguous",
+    "artifact_output_missing",
+        "artifact_output_conflict",
+        "artifact_output_reconcile_failed",
+        "manual_gate_artifact_write_failed",
+        "plan_missing",
+        "plan_invalid",
+        "state_corrupted",
+        "dispatcher_stopped",
+        "worktree_cleanup_failed"
+      ]),
+      message: z.string().min(1),
+      occurredAt: z.string().min(1),
+      spawnCandidateSessionIds: z.array(z.string().min(1)).optional()
+    })
+    .nullable()
+    .optional(),
+  taskStates: z.record(
+    z.object({
+      taskId: z.string().min(1),
+      status: z.enum([
+        "pending",
+        "working",
+        "completed",
+        "blocked_for_human",
+        "failed",
+        "superseded"
+      ]),
+      aoRole: z.string().min(1),
+      aoSessionId: z.string().min(1).optional(),
       attempt: z.number().int().nonnegative(),
-      status: z.string().min(1),
-      observedAt: z.string().min(1)
-    })).optional(),
-    dispatchContextPath: z.string().min(1).optional(),
-    markedCompletedBy: z.object({
-      actor: z.enum(["user", "cli"]),
-      rationale: z.string().min(1),
-      at: z.string().min(1)
-    }).optional()
-  })),
-  manualGateReleases: z.array(z.object({
-    taskId: z.string().min(1),
-    decision: z.enum(["approved", "requires_replan", "blocked", "review_dispatched"]),
-    mode: z.enum(["manual_approve", "ao_review"]).optional(),
-    rationale: z.string().optional(),
-    releasedAt: z.string().optional(),
-    attempt: z.number().int().nonnegative().optional(),
-    generatedArtifacts: z.array(z.string().min(1)).optional(),
-    dispatchContextPath: z.string().min(1).optional(),
-    aoSessionId: z.string().min(1).optional(),
-    supersededAoSessionId: z.string().min(1).optional()
-  })).default([]),
-  pendingDispatch: z.object({
-    dispatchId: z.string().min(1),
-    taskId: z.string().min(1),
-    attempt: z.number().int().positive(),
-    createdAt: z.string().min(1),
-    dispatchContextPath: z.string().min(1).optional(),
-    spawnCandidateSessionIds: z.array(z.string().min(1)).optional()
-  }).nullable().optional(),
+      maxAttempts: z.number().int().positive(),
+      startedAt: z.string().optional(),
+      completedAt: z.string().nullable().optional(),
+      failureReason: z.string().nullable().optional(),
+      statusObservations: z
+        .array(
+          z.object({
+            attempt: z.number().int().nonnegative(),
+            status: z.string().min(1),
+            observedAt: z.string().min(1)
+          })
+        )
+        .optional(),
+      dispatchContextPath: z.string().min(1).optional(),
+      markedCompletedBy: z
+        .object({
+          actor: z.enum(["user", "cli"]),
+          rationale: z.string().min(1),
+          at: z.string().min(1)
+        })
+        .optional()
+    })
+  ),
+  manualGateReleases: z
+    .array(
+      z.object({
+        taskId: z.string().min(1),
+        decision: z.enum(["approved", "requires_replan", "blocked", "review_dispatched"]),
+        mode: z.enum(["manual_approve", "ao_review"]).optional(),
+        rationale: z.string().optional(),
+        releasedAt: z.string().optional(),
+        attempt: z.number().int().nonnegative().optional(),
+        generatedArtifacts: z.array(z.string().min(1)).optional(),
+        dispatchContextPath: z.string().min(1).optional(),
+        aoSessionId: z.string().min(1).optional(),
+        supersededAoSessionId: z.string().min(1).optional()
+      })
+    )
+    .default([]),
+  pendingDispatch: z
+    .object({
+      dispatchId: z.string().min(1),
+      taskId: z.string().min(1),
+      attempt: z.number().int().positive(),
+      createdAt: z.string().min(1),
+      dispatchContextPath: z.string().min(1).optional(),
+      spawnCandidateSessionIds: z.array(z.string().min(1)).optional()
+    })
+    .nullable()
+    .optional(),
   supersededSessions: z.array(z.string().min(1)).default([])
 });
 
@@ -300,7 +355,10 @@ export class ExecutionStateStore {
 
   async readLogs(workflowId: string, limit = 100): Promise<ExecutionLogEvent[]> {
     try {
-      const raw = await readFile(join(this.getWorkflowDir(workflowId), "execution-log.jsonl"), "utf8");
+      const raw = await readFile(
+        join(this.getWorkflowDir(workflowId), "execution-log.jsonl"),
+        "utf8"
+      );
       return raw
         .trim()
         .split(/\r?\n/)
@@ -317,7 +375,12 @@ export class ExecutionStateStore {
 
   async update<T>(
     workflowId: string,
-    mutator: (state: ExecutionState) => Promise<ExecutionState | { state: ExecutionState; value: T }> | ExecutionState | { state: ExecutionState; value: T }
+    mutator: (
+      state: ExecutionState
+    ) =>
+      | Promise<ExecutionState | { state: ExecutionState; value: T }>
+      | ExecutionState
+      | { state: ExecutionState; value: T }
   ): Promise<T | ExecutionState> {
     return this.enqueue(workflowId, async () => {
       const workflowDir = this.getWorkflowDir(workflowId);
@@ -337,7 +400,11 @@ export class ExecutionStateStore {
       const workflowDir = this.getWorkflowDir(workflowId);
       await mkdir(workflowDir, { recursive: true });
       const normalized = { ...event, at: event.at ?? new Date().toISOString() };
-      await appendFile(join(workflowDir, "execution-log.jsonl"), `${JSON.stringify(normalized)}\n`, "utf8");
+      await appendFile(
+        join(workflowDir, "execution-log.jsonl"),
+        `${JSON.stringify(normalized)}\n`,
+        "utf8"
+      );
     });
   }
 
@@ -364,10 +431,14 @@ export class ExecutionStateStore {
     }
 
     try {
-      return parseTaskPlanWithNormalization(JSON.parse(raw) as unknown, {
-        workflowId: state.workflowId,
-        source: TASK_PLAN_NORMALIZATION_SOURCE.artifact
-      }, `Workflow ${state.workflowId} active task plan is invalid`);
+      return parseTaskPlanWithNormalization(
+        JSON.parse(raw) as unknown,
+        {
+          workflowId: state.workflowId,
+          source: TASK_PLAN_NORMALIZATION_SOURCE.artifact
+        },
+        `Workflow ${state.workflowId} active task plan is invalid`
+      );
     } catch (error) {
       await this.failState(state.workflowId, {
         kind: "plan_invalid",
@@ -388,19 +459,34 @@ export class ExecutionStateStore {
   }): Promise<void> {
     const workflowDir = this.getWorkflowDir(input.workflowId);
     await mkdir(workflowDir, { recursive: true });
-    await atomicWriteJson(join(workflowDir, `task-plan-amendment-${input.revision}.json`), input.amendment);
+    await atomicWriteJson(
+      join(workflowDir, `task-plan-amendment-${input.revision}.json`),
+      input.amendment
+    );
     if (input.draftPlan) {
-      await atomicWriteJson(join(workflowDir, `task-plan-v${input.revision}-draft.json`), input.draftPlan);
+      await atomicWriteJson(
+        join(workflowDir, `task-plan-v${input.revision}-draft.json`),
+        input.draftPlan
+      );
     }
     for (const [index, review] of (input.reviews ?? []).entries()) {
-      await atomicWriteJson(join(workflowDir, `task-plan-review-v${input.revision}-${index + 1}.json`), review);
+      await atomicWriteJson(
+        join(workflowDir, `task-plan-review-v${input.revision}-${index + 1}.json`),
+        review
+      );
     }
     if (input.finalPlan) {
       taskPlanSchema.parse(input.finalPlan);
-      await atomicWriteJson(join(workflowDir, `task-plan-v${input.revision}.json`), input.finalPlan);
+      await atomicWriteJson(
+        join(workflowDir, `task-plan-v${input.revision}.json`),
+        input.finalPlan
+      );
     }
     if (input.rebaseReport) {
-      await atomicWriteJson(join(workflowDir, `execution-rebase-report-${input.revision}.json`), input.rebaseReport);
+      await atomicWriteJson(
+        join(workflowDir, `execution-rebase-report-${input.revision}.json`),
+        input.rebaseReport
+      );
     }
   }
 
@@ -415,7 +501,11 @@ export class ExecutionStateStore {
       throw error;
     }
     const max = entries
-      .map((entry) => entry.match(/^task-plan-amendment-(\d+)\.json$/)?.[1] ?? entry.match(/^task-plan-v(\d+)\.json$/)?.[1])
+      .map(
+        (entry) =>
+          entry.match(/^task-plan-amendment-(\d+)\.json$/)?.[1] ??
+          entry.match(/^task-plan-v(\d+)\.json$/)?.[1]
+      )
       .filter((value): value is string => Boolean(value))
       .map(Number)
       .filter((value) => Number.isInteger(value))
@@ -434,8 +524,12 @@ export class ExecutionStateStore {
       throw error;
     }
 
-    for (const entry of entries.filter((item) => /^task-plan-amendment-\d+\.json$/.test(item)).sort()) {
-      const amendment = JSON.parse(await readFile(join(this.getWorkflowDir(workflowId), entry), "utf8")) as RevisionAmendment;
+    for (const entry of entries
+      .filter((item) => /^task-plan-amendment-\d+\.json$/.test(item))
+      .sort()) {
+      const amendment = JSON.parse(
+        await readFile(join(this.getWorkflowDir(workflowId), entry), "utf8")
+      ) as RevisionAmendment;
       if (amendment.status === "pending") {
         return amendment;
       }
@@ -462,11 +556,13 @@ export class ExecutionStateStore {
       try {
         states.push(await this.readState(entry.name));
       } catch (error) {
-        states.push(createFailedState(
-          entry.name,
-          "state_corrupted",
-          `execution-state.json is corrupted: ${formatErrorMessage(error)}`
-        ));
+        states.push(
+          createFailedState(
+            entry.name,
+            "state_corrupted",
+            `execution-state.json is corrupted: ${formatErrorMessage(error)}`
+          )
+        );
       }
     }
     return states;
@@ -530,7 +626,10 @@ export class ExecutionStateStore {
     if (!revision) {
       return;
     }
-    const required = [`task-plan-amendment-${revision}.json`, `execution-rebase-report-${revision}.json`];
+    const required = [
+      `task-plan-amendment-${revision}.json`,
+      `execution-rebase-report-${revision}.json`
+    ];
     for (const file of required) {
       try {
         await access(join(workflowDir, file), constants.F_OK);
@@ -546,7 +645,10 @@ export class ExecutionStateStore {
   private async enqueue<T>(workflowId: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.queues.get(workflowId) ?? Promise.resolve();
     const next = previous.then(operation, operation);
-    this.queues.set(workflowId, next.catch(() => undefined));
+    this.queues.set(
+      workflowId,
+      next.catch(() => undefined)
+    );
     return next;
   }
 }
@@ -608,7 +710,10 @@ export function getPlanPath(planVersion: PlanVersion): string {
   return planVersion === "task-plan-current" ? "task-plan.json" : `${planVersion}.json`;
 }
 
-export function summarizeExecutionState(plan: TaskPlan, state: ExecutionState): {
+export function summarizeExecutionState(
+  plan: TaskPlan,
+  state: ExecutionState
+): {
   completed: number;
   working: number;
   pending: number;

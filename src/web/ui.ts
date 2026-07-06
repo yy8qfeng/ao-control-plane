@@ -212,6 +212,63 @@ export function renderIndexHtml(): string {
       letter-spacing: 0;
     }
 
+    .execution-view {
+      display: grid;
+      gap: 12px;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .execution-view[hidden] {
+      display: none;
+    }
+
+    .execution-block,
+    .execution-view details {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f4f6fa;
+    }
+
+    .execution-block {
+      padding: 12px;
+    }
+
+    .execution-view summary {
+      cursor: pointer;
+      font-weight: 700;
+      padding: 10px 12px;
+      list-style-position: inside;
+    }
+
+    .execution-view details > div {
+      padding: 0 12px 12px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .kv {
+      display: grid;
+      grid-template-columns: 120px minmax(0, 1fr);
+      gap: 6px 10px;
+    }
+
+    .kv span:nth-child(odd) {
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    .mono-block {
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    }
+
+    .artifact-row {
+      border-top: 1px solid var(--line);
+      padding-top: 8px;
+    }
+
     .status {
       min-height: 24px;
       font-size: 13px;
@@ -407,6 +464,7 @@ export function renderIndexHtml(): string {
       </div>
       <div class="content">
         <pre id="output">填写需求后点击生成。</pre>
+        <div id="executionDetails" class="execution-view" hidden></div>
       </div>
     </section>
   </main>
@@ -432,6 +490,7 @@ export function renderIndexHtml(): string {
   <script>
     const form = document.querySelector("#requirementForm");
     const output = document.querySelector("#output");
+    const executionDetails = document.querySelector("#executionDetails");
     const formStatus = document.querySelector("#formStatus");
     const draftStatus = document.querySelector("#draftStatus");
     const draftHistory = document.querySelector("#draftHistory");
@@ -1165,32 +1224,178 @@ export function renderIndexHtml(): string {
 
       if (!state.result && !state.job) {
         if (state.execution) {
-          output.textContent = formatExecutionTabContent();
+          renderExecutionTabContent();
           return;
         }
-        output.textContent = "填写需求后点击生成。";
+        renderTextContent("填写需求后点击生成。");
         return;
       }
 
       if (state.activeTab === "logs") {
         const timer = state.job ? ["当前步骤：" + state.job.currentStep, "已等待：" + state.job.elapsedSeconds + " 秒", ""].join("\\n") : "";
-        output.textContent = timer + ((state.job?.logs || []).join("\\n") || "等待流程开始。");
+        renderTextContent(timer + ((state.job?.logs || []).join("\\n") || "等待流程开始。"));
       } else if (state.activeTab === "design") {
-        output.textContent = state.job?.design?.content || state.result?.design || "";
+        renderTextContent(state.job?.design?.content || state.result?.design || "");
       } else if (state.activeTab === "reviews") {
         const reviews = state.job?.reviews || state.result?.reviews || [];
         if (state.job?.reviews?.length) {
-          output.textContent = JSON.stringify(reviews[reviews.length - 1] || null, null, 2);
+          renderTextContent(JSON.stringify(reviews[reviews.length - 1] || null, null, 2));
         } else {
-          output.textContent = JSON.stringify(reviews, null, 2);
+          renderTextContent(JSON.stringify(reviews, null, 2));
         }
       } else if (state.activeTab === "plan") {
-        output.textContent = formatPlanTabContent();
+        renderTextContent(formatPlanTabContent());
       } else if (state.activeTab === "planReview") {
-        output.textContent = formatPlanReviewTabContent();
+        renderTextContent(formatPlanReviewTabContent());
       } else {
-        output.textContent = formatExecutionTabContent();
+        renderExecutionTabContent();
       }
+    }
+
+    function renderTextContent(text) {
+      executionDetails.hidden = true;
+      executionDetails.replaceChildren();
+      output.hidden = false;
+      output.textContent = text;
+    }
+
+    function renderExecutionTabContent() {
+      if (!state.execution) {
+        renderTextContent(JSON.stringify({ message: "尚未启动连续执行。" }, null, 2));
+        return;
+      }
+      output.hidden = true;
+      output.textContent = "";
+      executionDetails.hidden = false;
+      executionDetails.replaceChildren();
+      executionDetails.appendChild(buildExecutionOverview(state.execution));
+      if (state.execution.artifactDiagnostics) {
+        executionDetails.appendChild(buildArtifactDiagnosticsDetails(state.execution.artifactDiagnostics, state.execution));
+      }
+      if (state.execution.manualGateContext) {
+        executionDetails.appendChild(buildTextDetails("门禁上下文", formatManualGateContext(state.execution.manualGateContext), state.execution.status === "waiting_manual_gate"));
+      }
+      executionDetails.appendChild(buildTextDetails("过程日志", formatExecutionLogs(state.execution), true));
+      executionDetails.appendChild(buildTextDetails("原始快照", JSON.stringify(state.execution, null, 2), false));
+    }
+
+    function buildExecutionOverview(execution) {
+      const summary = execution.summary || {};
+      const activeTask = execution.activeTask || {};
+      const block = document.createElement("div");
+      block.className = "execution-block";
+      const rows = [
+        ["连续执行状态", execution.status + (execution.readonly ? "（只读挂载）" : "")],
+        ["Workflow", execution.workflowId || "-"],
+        ["Job", execution.jobId || "-"],
+        ["任务统计", "完成 " + Number(summary.completed || 0) + "，执行中 " + Number(summary.working || 0) + "，待执行 " + Number(summary.pending || 0) + "，阻断 " + Number(summary.blocked || 0) + "，失败 " + Number(summary.failed || 0)]
+      ];
+      if (activeTask.taskId) {
+        rows.push(
+          ["当前任务", activeTask.taskId + " / " + (activeTask.title || "未命名任务")],
+          ["任务状态", activeTask.status || "-"],
+          ["AO 角色", activeTask.aoRole || "-"],
+          ["AO session", activeTask.aoSessionId || "尚未拿到 sessionId，正在按任务前缀从 AO 会话列表追踪"],
+          ["尝试次数", Number(activeTask.attempt || 0) + "（不限）"]
+        );
+        const latestObservation = (activeTask.statusObservations || []).at(-1);
+        if (latestObservation) {
+          rows.push(["最近 AO 状态", latestObservation.status + " / " + latestObservation.observedAt]);
+        }
+      } else {
+        rows.push(["当前任务", "暂无，调度器正在等待可执行任务或终态。"]);
+      }
+      if (execution.failure) {
+        rows.push(["失败信息", execution.failure.kind + " / " + execution.failure.message]);
+      }
+      block.appendChild(buildKeyValueRows(rows));
+      return block;
+    }
+
+    function buildArtifactDiagnosticsDetails(diagnostics, execution) {
+      const missingCount = (diagnostics.missingArtifacts || []).length;
+      const shouldOpen = execution.status === "failed" || missingCount > 0 || Boolean(diagnostics.latestReconcile);
+      const details = document.createElement("details");
+      details.open = shouldOpen;
+      const summary = document.createElement("summary");
+      summary.textContent = "产物诊断：" + (diagnostics.taskId || "-") + "，契约 " + (diagnostics.contracts || []).length + "，缺失 " + missingCount;
+      details.appendChild(summary);
+      const body = document.createElement("div");
+      const contracts = diagnostics.contracts || [];
+      if (contracts.length === 0) {
+        body.appendChild(textBlock("当前任务没有注册表控制面产物。"));
+      }
+      contracts.forEach((contract) => {
+        const contractDetails = document.createElement("details");
+        contractDetails.className = "artifact-row";
+        contractDetails.open = !contract.canonicalExists || missingCount > 0;
+        const contractSummary = document.createElement("summary");
+        contractSummary.textContent = contract.contractId + "：" + (contract.canonicalExists ? "canonical 已存在" : "canonical 缺失");
+        contractDetails.appendChild(contractSummary);
+        const contractBody = document.createElement("div");
+        contractBody.appendChild(buildKeyValueRows([
+          ["kind", contract.kind],
+          ["canonical", contract.canonicalPath],
+          ["required", contract.requiredWhen ? "requiredWhen=" + contract.requiredWhen : String(Boolean(contract.required))]
+        ]));
+        const candidates = (contract.candidatePaths || []).slice(0, 8);
+        if (candidates.length > 0) {
+          contractBody.appendChild(textBlock("候选路径：\\n" + candidates.map((candidate) =>
+            "- " + candidate.source + "/" + candidate.purpose + " priority=" + candidate.priority + "\\n  " + candidate.path
+          ).join("\\n")));
+        }
+        contractDetails.appendChild(contractBody);
+        body.appendChild(contractDetails);
+      });
+      if (missingCount > 0) {
+        body.appendChild(textBlock("缺失 required 产物：\\n" + diagnostics.missingArtifacts.map((artifact) => "- " + artifact.kind + "：" + artifact.path).join("\\n")));
+      }
+      if (diagnostics.latestReconcile) {
+        body.appendChild(buildTextDetails("最近归集事件", JSON.stringify(diagnostics.latestReconcile, null, 2), true));
+      }
+      details.appendChild(body);
+      return details;
+    }
+
+    function buildTextDetails(title, text, open) {
+      const details = document.createElement("details");
+      details.open = Boolean(open);
+      const summary = document.createElement("summary");
+      summary.textContent = title;
+      details.appendChild(summary);
+      const body = document.createElement("div");
+      body.appendChild(textBlock(text || "-"));
+      details.appendChild(body);
+      return details;
+    }
+
+    function buildKeyValueRows(rows) {
+      const container = document.createElement("div");
+      container.className = "kv";
+      rows.forEach(([key, value]) => {
+        const keyNode = document.createElement("span");
+        keyNode.textContent = key;
+        const valueNode = document.createElement("span");
+        valueNode.textContent = value ?? "-";
+        container.appendChild(keyNode);
+        container.appendChild(valueNode);
+      });
+      return container;
+    }
+
+    function textBlock(text) {
+      const node = document.createElement("div");
+      node.className = "mono-block";
+      node.textContent = text;
+      return node;
+    }
+
+    function formatExecutionLogs(execution) {
+      const logs = execution.logs || [];
+      if (logs.length === 0) {
+        return "暂无执行日志。";
+      }
+      return logs.slice(-20).map((event) => formatExecutionEvent(event)).join("\\n");
     }
 
     function formatExecutionTabContent() {
@@ -1235,6 +1440,9 @@ export function renderIndexHtml(): string {
       }
       if (execution.failure) {
         lines.push("", "失败信息：" + execution.failure.kind + " / " + execution.failure.message);
+      }
+      if (execution.artifactDiagnostics) {
+        lines.push("", formatArtifactDiagnostics(execution.artifactDiagnostics));
       }
       if (execution.manualGateContext) {
         lines.push("", formatManualGateContext(execution.manualGateContext));
@@ -1297,6 +1505,34 @@ export function renderIndexHtml(): string {
         details.push("missing=" + formatArtifactEventDetails(event.missing));
       }
       return parts.join(" | ") + (details.length ? " | " + details.join(" | ") : "");
+    }
+
+    function formatArtifactDiagnostics(diagnostics) {
+      const lines = ["产物诊断：" + (diagnostics.taskId || "-")];
+      const contracts = diagnostics.contracts || [];
+      if (contracts.length === 0) {
+        lines.push("- 当前任务没有注册表控制面产物。");
+      }
+      contracts.forEach((contract) => {
+        lines.push(
+          "- " + contract.contractId + "：" +
+          (contract.canonicalExists ? "canonical 已存在" : "canonical 缺失") +
+          "，路径 " + contract.canonicalPath
+        );
+        (contract.candidatePaths || []).slice(0, 5).forEach((candidate) => {
+          lines.push("  候选 " + candidate.source + "/" + candidate.purpose + "：" + candidate.path);
+        });
+      });
+      if ((diagnostics.missingArtifacts || []).length > 0) {
+        lines.push("缺失 required 产物：");
+        diagnostics.missingArtifacts.forEach((artifact) => {
+          lines.push("- " + artifact.kind + "：" + artifact.path);
+        });
+      }
+      if (diagnostics.latestReconcile) {
+        lines.push("最近归集事件：" + JSON.stringify(diagnostics.latestReconcile));
+      }
+      return lines.join("\\n");
     }
 
     function formatArtifactEventDetails(items) {
@@ -1926,7 +2162,10 @@ export function renderIndexHtml(): string {
       const selection = window.getSelection();
       if (!selection || selection.isCollapsed || selection.rangeCount === 0) return false;
       return Array.from({ length: selection.rangeCount }, (_, index) => selection.getRangeAt(index)).some((range) => {
-        return output.contains(range.commonAncestorContainer) || range.intersectsNode(output);
+        return output.contains(range.commonAncestorContainer) ||
+          range.intersectsNode(output) ||
+          executionDetails.contains(range.commonAncestorContainer) ||
+          range.intersectsNode(executionDetails);
       });
     }
   </script>

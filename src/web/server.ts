@@ -49,7 +49,9 @@ export async function startWebServer(options: WebServerOptions): Promise<{
     artifactRoot: defaultArtifactRoot,
     projectRoot: options.aoProjectRoot,
     createAo: () => new AoCliAdapter({ projectRoot: options.aoProjectRoot, dryRun: false }),
-    createCodex: () => options.createCodexAdapter?.(options.aoProjectRoot) ?? new CodexCliAdapter({ projectRoot: options.aoProjectRoot }),
+    createCodex: () =>
+      options.createCodexAdapter?.(options.aoProjectRoot) ??
+      new CodexCliAdapter({ projectRoot: options.aoProjectRoot }),
     createClaudeCode: () =>
       options.createClaudeCodeAdapter?.(options.aoProjectRoot) ??
       new ClaudeCodeCliAdapter({ projectRoot: options.aoProjectRoot })
@@ -118,7 +120,11 @@ async function routeRequest(input: {
   }
 
   if (method === "GET" && url.pathname === "/api/filesystem/browse") {
-    sendJson(input.response, 200, await browseDirectories(url.searchParams.get("path") ?? undefined));
+    sendJson(
+      input.response,
+      200,
+      await browseDirectories(url.searchParams.get("path") ?? undefined)
+    );
     return;
   }
 
@@ -173,7 +179,11 @@ async function routeRequest(input: {
 
   if (method === "POST" && url.pathname === "/api/governance/draft") {
     const body = (await readJsonBody(input.request)) as GovernanceRequest & ProjectScopedRequest;
-    sendJson(input.response, 200, await input.projectConfig.saveRequirementDraft(toRequirementDraft(body)));
+    sendJson(
+      input.response,
+      200,
+      await input.projectConfig.saveRequirementDraft(toRequirementDraft(body))
+    );
     return;
   }
 
@@ -213,7 +223,10 @@ async function routeRequest(input: {
   }
 
   if (method === "POST" && url.pathname === "/api/governance/plan") {
-    const body = (await readJsonBody(input.request)) as { workflowId?: string; maxDesignReviewRounds?: number } & ProjectScopedRequest;
+    const body = (await readJsonBody(input.request)) as {
+      workflowId?: string;
+      maxDesignReviewRounds?: number;
+    } & ProjectScopedRequest;
     if (!body.workflowId) {
       sendJson(input.response, 400, { error: "workflowId is required" });
       return;
@@ -224,20 +237,26 @@ async function routeRequest(input: {
       logs: ["已创建任务计划续审任务，准备调用 Codex 和 ClaudeCode。"]
     });
     void createTaskPlanStage({
-        workflowId: body.workflowId,
-        store: createRequestStore(body, input.defaultArtifactRoot),
-        maxTaskPlanReviewRounds: normalizeReviewRoundLimit(body.maxDesignReviewRounds),
-        codex: createCodexAdapterForRequest(input.createCodexAdapter, body, input.aoProjectRoot),
-        claudeCode: createClaudeCodeAdapterForRequest(input.createClaudeCodeAdapter, body, input.aoProjectRoot),
-        onEvent: (event) => recordTaskPlanStageEvent(input.workflowJobs, job.snapshot.jobId, event),
-        signal: job.controller.signal
-      }).then((result) => {
+      workflowId: body.workflowId,
+      store: createRequestStore(body, input.defaultArtifactRoot),
+      maxTaskPlanReviewRounds: normalizeReviewRoundLimit(body.maxDesignReviewRounds),
+      codex: createCodexAdapterForRequest(input.createCodexAdapter, body, input.aoProjectRoot),
+      claudeCode: createClaudeCodeAdapterForRequest(
+        input.createClaudeCodeAdapter,
+        body,
+        input.aoProjectRoot
+      ),
+      onEvent: (event) => recordTaskPlanStageEvent(input.workflowJobs, job.snapshot.jobId, event),
+      signal: job.controller.signal
+    })
+      .then((result) => {
         input.workflowJobs.recordLog(job.snapshot.jobId, {
           currentStep: "任务计划续审已完成",
           message: `任务计划续审已完成，产物目录：${result.artifactDir}`
         });
         input.workflowJobs.completeGovernanceResult(job.snapshot.jobId, result);
-      }).catch((error: unknown) => {
+      })
+      .catch((error: unknown) => {
         input.workflowJobs.failJob(job.snapshot.jobId, error);
       });
     sendJson(input.response, 202, job.snapshot);
@@ -249,28 +268,29 @@ async function routeRequest(input: {
     await rememberProjectRootIfPresent(body, input.projectConfig);
     const job = input.workflowJobs.createJob();
     void runRealGovernanceWorkflow({
-        request: normalizeGovernanceRequest(body),
-        defaultArtifactRoot: input.defaultArtifactRoot,
-        projectRoot: resolveProjectRoot(body, input.aoProjectRoot),
-        createCodexAdapter: input.createCodexAdapter,
-        createClaudeCodeAdapter: input.createClaudeCodeAdapter,
-        onEvent: async (event) => {
-          if (event.type === "workflow_completed") {
-            await input.projectConfig.saveRequirementDraft(
-              toRequirementDraft({ ...body, workflowId: event.result.workflow.workflowId })
-            );
-            input.workflowJobs.completeGovernanceResult(job.snapshot.jobId, event.result);
-            return;
-          }
-          input.workflowJobs.recordEvent(job.snapshot.jobId, event);
-          if (event.type === "workflow_started") {
-            await input.projectConfig.saveRequirementDraft(
-              toRequirementDraft({ ...body, workflowId: event.workflow.workflowId })
-            );
-          }
-        },
-        signal: job.controller.signal
-      }).catch((error: unknown) => {
+      request: normalizeGovernanceRequest(body),
+      defaultArtifactRoot: input.defaultArtifactRoot,
+      projectRoot: resolveProjectRoot(body, input.aoProjectRoot),
+      createCodexAdapter: input.createCodexAdapter,
+      createClaudeCodeAdapter: input.createClaudeCodeAdapter,
+      onEvent: async (event) => {
+        if (event.type === "workflow_completed") {
+          await input.projectConfig.saveRequirementDraft(
+            toRequirementDraft({ ...body, workflowId: event.result.workflow.workflowId })
+          );
+          input.workflowJobs.completeGovernanceResult(job.snapshot.jobId, event.result);
+          return;
+        }
+        input.workflowJobs.recordEvent(job.snapshot.jobId, event);
+        if (event.type === "workflow_started") {
+          await input.projectConfig.saveRequirementDraft(
+            toRequirementDraft({ ...body, workflowId: event.workflow.workflowId })
+          );
+        }
+      },
+      signal: job.controller.signal
+    })
+      .catch((error: unknown) => {
         if (error instanceof StructuredOutputError) {
           input.workflowJobs.recordEvent(job.snapshot.jobId, {
             type: "workflow_failed",
@@ -280,7 +300,8 @@ async function routeRequest(input: {
         }
 
         input.workflowJobs.failJob(job.snapshot.jobId, error);
-      }).catch((error: unknown) => {
+      })
+      .catch((error: unknown) => {
         input.workflowJobs.failJob(job.snapshot.jobId, error);
       });
     sendJson(input.response, 202, job.snapshot);
@@ -343,7 +364,10 @@ async function routeRequest(input: {
     return;
   }
 
-  if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/reconcile-artifacts$/)) {
+  if (
+    method === "POST" &&
+    url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/reconcile-artifacts$/)
+  ) {
     const jobId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
     const body = (await readJsonBody(input.request)) as ProjectScopedRequest;
     const manager = getExecutionManager(body, input);
@@ -351,7 +375,21 @@ async function routeRequest(input: {
     return;
   }
 
-  if (method === "GET" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/worktree-cleanup-candidates$/)) {
+  if (
+    method === "GET" &&
+    url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/artifact-diagnostics$/)
+  ) {
+    const jobId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+    const projectRoot = url.searchParams.get("projectRoot") ?? undefined;
+    const manager = getExecutionManager({ projectRoot }, input);
+    sendJson(input.response, 200, await manager.getArtifactDiagnostics(jobId));
+    return;
+  }
+
+  if (
+    method === "GET" &&
+    url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/worktree-cleanup-candidates$/)
+  ) {
     const jobId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
     const projectRoot = url.searchParams.get("projectRoot") ?? undefined;
     const dryRun = url.searchParams.get("dryRun") === "true" ? true : undefined;
@@ -360,23 +398,35 @@ async function routeRequest(input: {
     return;
   }
 
-  if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/worktree-cleanup$/)) {
+  if (
+    method === "POST" &&
+    url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/worktree-cleanup$/)
+  ) {
     const jobId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
-    const body = (await readJsonBody(input.request)) as { sessionIds?: string[]; dryRun?: boolean } & ProjectScopedRequest;
+    const body = (await readJsonBody(input.request)) as {
+      sessionIds?: string[];
+      dryRun?: boolean;
+    } & ProjectScopedRequest;
     if (!Array.isArray(body.sessionIds)) {
       sendJson(input.response, 400, { error: "sessionIds must be an array" });
       return;
     }
     const manager = getExecutionManager(body, input);
-    sendJson(input.response, 200, await manager.cleanupWorktrees(jobId, {
-      sessionIds: body.sessionIds,
-      dryRun: body.dryRun
-    }));
+    sendJson(
+      input.response,
+      200,
+      await manager.cleanupWorktrees(jobId, {
+        sessionIds: body.sessionIds,
+        dryRun: body.dryRun
+      })
+    );
     return;
   }
 
   if (method === "GET" && url.pathname.startsWith("/api/ao/execution-jobs/")) {
-    const jobId = decodeURIComponent(url.pathname.replace("/api/ao/execution-jobs/", "").split("/")[0] ?? "");
+    const jobId = decodeURIComponent(
+      url.pathname.replace("/api/ao/execution-jobs/", "").split("/")[0] ?? ""
+    );
     const projectRoot = url.searchParams.get("projectRoot") ?? undefined;
     const dryRun = url.searchParams.get("dryRun") === "true" ? true : undefined;
     const manager = getExecutionManager({ projectRoot, dryRun }, input);
@@ -394,13 +444,18 @@ async function routeRequest(input: {
 
   if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/resume$/)) {
     const jobId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
-    const body = (await readJsonBody(input.request)) as { pollIntervalMs?: number } & ProjectScopedRequest;
+    const body = (await readJsonBody(input.request)) as {
+      pollIntervalMs?: number;
+    } & ProjectScopedRequest;
     const manager = getExecutionManager(body, input);
     sendJson(input.response, 200, await manager.resume(jobId, body.pollIntervalMs));
     return;
   }
 
-  if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/tasks\/[^/]+\/retry$/)) {
+  if (
+    method === "POST" &&
+    url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/tasks\/[^/]+\/retry$/)
+  ) {
     const parts = url.pathname.split("/");
     const jobId = decodeURIComponent(parts[4] ?? "");
     const taskId = decodeURIComponent(parts[6] ?? "");
@@ -410,17 +465,25 @@ async function routeRequest(input: {
     return;
   }
 
-  if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/tasks\/[^/]+\/mark-completed$/)) {
+  if (
+    method === "POST" &&
+    url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/tasks\/[^/]+\/mark-completed$/)
+  ) {
     const parts = url.pathname.split("/");
     const jobId = decodeURIComponent(parts[4] ?? "");
     const taskId = decodeURIComponent(parts[6] ?? "");
-    const body = (await readJsonBody(input.request)) as { rationale?: string } & ProjectScopedRequest;
+    const body = (await readJsonBody(input.request)) as {
+      rationale?: string;
+    } & ProjectScopedRequest;
     const manager = getExecutionManager(body, input);
     sendJson(input.response, 200, await manager.markCompleted(jobId, taskId, body.rationale ?? ""));
     return;
   }
 
-  if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/manual-gates\/[^/]+\/decision$/)) {
+  if (
+    method === "POST" &&
+    url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/manual-gates\/[^/]+\/decision$/)
+  ) {
     const parts = url.pathname.split("/");
     const jobId = decodeURIComponent(parts[4] ?? "");
     const taskId = decodeURIComponent(parts[6] ?? "");
@@ -428,46 +491,73 @@ async function routeRequest(input: {
       decision?: "approved" | "requires_replan" | "blocked";
       rationale?: string;
     } & ProjectScopedRequest;
-    if (body.decision !== "approved" && body.decision !== "requires_replan" && body.decision !== "blocked") {
-      sendJson(input.response, 400, { error: "decision must be approved, requires_replan, or blocked" });
+    if (
+      body.decision !== "approved" &&
+      body.decision !== "requires_replan" &&
+      body.decision !== "blocked"
+    ) {
+      sendJson(input.response, 400, {
+        error: "decision must be approved, requires_replan, or blocked"
+      });
       return;
     }
     const manager = getExecutionManager(body, input);
-    sendJson(input.response, 200, await manager.decideManualGate(jobId, taskId, {
-      decision: body.decision,
-      rationale: body.rationale ?? ""
-    }));
+    sendJson(
+      input.response,
+      200,
+      await manager.decideManualGate(jobId, taskId, {
+        decision: body.decision,
+        rationale: body.rationale ?? ""
+      })
+    );
     return;
   }
 
-  if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/manual-gates\/[^/]+\/approve$/)) {
+  if (
+    method === "POST" &&
+    url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/manual-gates\/[^/]+\/approve$/)
+  ) {
     const parts = url.pathname.split("/");
     const jobId = decodeURIComponent(parts[4] ?? "");
     const taskId = decodeURIComponent(parts[6] ?? "");
-    const body = (await readJsonBody(input.request)) as { rationale?: string } & ProjectScopedRequest;
+    const body = (await readJsonBody(input.request)) as {
+      rationale?: string;
+    } & ProjectScopedRequest;
     const manager = getExecutionManager(body, input);
-    sendJson(input.response, 200, await manager.decideManualGate(jobId, taskId, {
-      decision: "approved",
-      rationale: body.rationale ?? "Web UI 门禁放行"
-    }));
+    sendJson(
+      input.response,
+      200,
+      await manager.decideManualGate(jobId, taskId, {
+        decision: "approved",
+        rationale: body.rationale ?? "Web UI 门禁放行"
+      })
+    );
     return;
   }
 
-  if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/manual-gates\/[^/]+\/dispatch-review$/)) {
+  if (
+    method === "POST" &&
+    url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/manual-gates\/[^/]+\/dispatch-review$/)
+  ) {
     const parts = url.pathname.split("/");
     const jobId = decodeURIComponent(parts[4] ?? "");
     const taskId = decodeURIComponent(parts[6] ?? "");
-    const body = (await readJsonBody(input.request)) as { rationale?: string } & ProjectScopedRequest;
+    const body = (await readJsonBody(input.request)) as {
+      rationale?: string;
+    } & ProjectScopedRequest;
     const manager = getExecutionManager(body, input);
-    sendJson(input.response, 200, await manager.dispatchManualGateReview(
-      jobId,
-      taskId,
-      body.rationale ?? "Web UI 派发门禁复核"
-    ));
+    sendJson(
+      input.response,
+      200,
+      await manager.dispatchManualGateReview(jobId, taskId, body.rationale ?? "Web UI 派发门禁复核")
+    );
     return;
   }
 
-  if (method === "POST" && url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/revision-requests$/)) {
+  if (
+    method === "POST" &&
+    url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/revision-requests$/)
+  ) {
     const jobId = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
     const body = (await readJsonBody(input.request)) as {
       workflowId?: string;
@@ -476,16 +566,22 @@ async function routeRequest(input: {
       rationale?: string;
     } & ProjectScopedRequest;
     if (!body.workflowId || !body.triggerTaskId || !body.reasonCategory) {
-      sendJson(input.response, 400, { error: "workflowId, triggerTaskId, and reasonCategory are required" });
+      sendJson(input.response, 400, {
+        error: "workflowId, triggerTaskId, and reasonCategory are required"
+      });
       return;
     }
     const manager = getExecutionManager(body, input);
-    sendJson(input.response, 200, await manager.requestRevision(jobId, {
-      workflowId: body.workflowId,
-      triggerTaskId: body.triggerTaskId,
-      reasonCategory: body.reasonCategory,
-      rationale: body.rationale ?? ""
-    }));
+    sendJson(
+      input.response,
+      200,
+      await manager.requestRevision(jobId, {
+        workflowId: body.workflowId,
+        triggerTaskId: body.triggerTaskId,
+        reasonCategory: body.reasonCategory,
+        rationale: body.rationale ?? ""
+      })
+    );
     return;
   }
 
@@ -541,8 +637,14 @@ function getExecutionManager(
       artifactRoot,
       projectRoot,
       createAo: () => new AoCliAdapter({ projectRoot, dryRun: request.dryRun ?? false }),
-      createCodex: () => createCodexAdapterForRequest(input.createCodexAdapter, request, input.aoProjectRoot),
-      createClaudeCode: () => createClaudeCodeAdapterForRequest(input.createClaudeCodeAdapter, request, input.aoProjectRoot)
+      createCodex: () =>
+        createCodexAdapterForRequest(input.createCodexAdapter, request, input.aoProjectRoot),
+      createClaudeCode: () =>
+        createClaudeCodeAdapterForRequest(
+          input.createClaudeCodeAdapter,
+          request,
+          input.aoProjectRoot
+        )
     });
     input.executionManagers.set(artifactRoot, manager);
     void manager.restoreFromDisk();
@@ -651,7 +753,9 @@ function normalizeReleasedManualGateTaskIds(
       return new Error(`releasedManualGateTaskIds contains unknown task id: ${release.taskId}`);
     }
     if (task.dependencyCondition !== "manual_gate") {
-      return new Error(`releasedManualGateTaskIds contains non-manual_gate task id: ${release.taskId}`);
+      return new Error(
+        `releasedManualGateTaskIds contains non-manual_gate task id: ${release.taskId}`
+      );
     }
     normalized.set(release.taskId, release);
   }
@@ -683,8 +787,14 @@ function normalizeManualGateReleaseItem(value: unknown): ManualGateRelease | Err
   return {
     taskId,
     decision,
-    rationale: typeof value.rationale === "string" && value.rationale.trim() ? value.rationale.trim() : undefined,
-    releasedAt: typeof value.releasedAt === "string" && value.releasedAt.trim() ? value.releasedAt.trim() : new Date().toISOString()
+    rationale:
+      typeof value.rationale === "string" && value.rationale.trim()
+        ? value.rationale.trim()
+        : undefined,
+    releasedAt:
+      typeof value.releasedAt === "string" && value.releasedAt.trim()
+        ? value.releasedAt.trim()
+        : new Date().toISOString()
   };
 }
 
@@ -697,7 +807,11 @@ async function deleteDraftArtifacts(
     return;
   }
 
-  const artifactRoots = collectCandidateArtifactRoots(draft, selectedProjectRoot, defaultArtifactRoot);
+  const artifactRoots = collectCandidateArtifactRoots(
+    draft,
+    selectedProjectRoot,
+    defaultArtifactRoot
+  );
   const workflowIds = new Set<string>();
   const workflowId = draft.workflowId?.trim();
   if (workflowId) {
@@ -736,7 +850,8 @@ async function deleteWorkflowDir(artifactRoot: string, workflowId: string): Prom
   const workflowDir = resolve(artifactRoot, workflowId);
   const normalizedRoot = resolve(artifactRoot);
   const rootPrefix = normalizedRoot.endsWith(sep) ? normalizedRoot : `${normalizedRoot}${sep}`;
-  const comparableWorkflowDir = process.platform === "win32" ? workflowDir.toLowerCase() : workflowDir;
+  const comparableWorkflowDir =
+    process.platform === "win32" ? workflowDir.toLowerCase() : workflowDir;
   const comparableRootPrefix = process.platform === "win32" ? rootPrefix.toLowerCase() : rootPrefix;
 
   if (workflowDir === normalizedRoot || !comparableWorkflowDir.startsWith(comparableRootPrefix)) {
@@ -874,7 +989,9 @@ async function runRealGovernanceWorkflow(input: {
   return runWorkflow({
     requirementFile,
     artifactRoot,
-    codex: input.createCodexAdapter?.(input.projectRoot) ?? new CodexCliAdapter({ projectRoot: input.projectRoot }),
+    codex:
+      input.createCodexAdapter?.(input.projectRoot) ??
+      new CodexCliAdapter({ projectRoot: input.projectRoot }),
     claudeCode:
       input.createClaudeCodeAdapter?.(input.projectRoot) ??
       new ClaudeCodeCliAdapter({ projectRoot: input.projectRoot }),
@@ -921,7 +1038,12 @@ function draftToGovernanceRequest(draft: RequirementDraft): GovernanceRequest {
 }
 
 function splitStoredLines(value: string | undefined): string[] {
-  return value?.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) ?? [];
+  return (
+    value
+      ?.split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean) ?? []
+  );
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
@@ -936,7 +1058,9 @@ function assertSafeHost(host: string, allowPublicHost: boolean): void {
   const normalized = host.trim().toLowerCase();
   const publicHosts = new Set(["0.0.0.0", "::", "[::]"]);
   if (!allowPublicHost && publicHosts.has(normalized)) {
-    throw new Error("Refusing to bind the web console to a public host without --allow-public-host");
+    throw new Error(
+      "Refusing to bind the web console to a public host without --allow-public-host"
+    );
   }
 }
 

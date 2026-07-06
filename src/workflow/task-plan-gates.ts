@@ -2,15 +2,22 @@ import type { DesignReview } from "../schemas/design-review.js";
 import { defaultExecutionPolicy } from "../schemas/execution-policy.js";
 import type { TaskPlanApprovalReport } from "../schemas/task-plan-approval-report.js";
 import type { TaskPlanReview } from "../schemas/task-plan-review.js";
-import {
-  taskPlanSchema,
-  type ExecutionTask,
-  type TaskPlan
-} from "../schemas/task-plan.js";
+import { taskPlanSchema, type ExecutionTask, type TaskPlan } from "../schemas/task-plan.js";
+import { getArtifactContractRegistry } from "./artifact-contract-registry.js";
 
 type DesignCoverageTrace = NonNullable<TaskPlan["designCoverageTrace"]>[number];
 
-const manualGateTerms = ["人工", "复核", "放行", "确认", "审批", "决策", "切换", "授权", "等待"] as const;
+const manualGateTerms = [
+  "人工",
+  "复核",
+  "放行",
+  "确认",
+  "审批",
+  "决策",
+  "切换",
+  "授权",
+  "等待"
+] as const;
 const platformTerms = ["Linux", "Windows", "macOS", "io_uring", "epoll", "IOCP", "kqueue"] as const;
 const g0GateTerms = [
   "G0",
@@ -69,7 +76,9 @@ export function validateTaskPlanApprovalGate(input: {
     findings.push({
       id: "TPG-SCHEMA-001",
       title: "task-plan 未通过结构化校验",
-      body: parsed.error.issues.map((issue) => `${issue.path.join(".") || "task-plan"}: ${issue.message}`).join("\n"),
+      body: parsed.error.issues
+        .map((issue) => `${issue.path.join(".") || "task-plan"}: ${issue.message}`)
+        .join("\n"),
       severity: "blocking",
       status: "unresolved",
       source: "local-gate"
@@ -92,6 +101,7 @@ export function validateTaskPlanApprovalGate(input: {
   findings.push(...validateExecutionPolicies(plan));
   findings.push(...validateAoPromptContext(plan));
   findings.push(...validateManualGate(plan));
+  findings.push(...validateArtifactContracts(plan));
   findings.push(...validateReadinessAndG0Gate(input.approvedDesign ?? "", plan));
   findings.push(...validateArtifactDeliverables(input.approvedDesign ?? "", plan));
   findings.push(...validateCrossPlatformPrerequisites(plan));
@@ -110,6 +120,70 @@ export function validateTaskPlanApprovalGate(input: {
       findings
     })
   };
+}
+
+function validateArtifactContracts(plan: TaskPlan): TaskPlanGateFinding[] {
+  const registry = getArtifactContractRegistry();
+  const findings: TaskPlanGateFinding[] = [];
+  const registryIssues = registry.validate(plan).filter((issue) => issue.severity === "blocking");
+  if (registryIssues.length > 0) {
+    findings.push({
+      id: "TPG-ARTIFACT-REGISTRY-001",
+      title: "控制面产物契约注册表自检失败",
+      body: registryIssues.map((issue) => `${issue.id}: ${issue.message}`).join("\n"),
+      severity: "blocking",
+      status: "unresolved",
+      source: "local-gate"
+    });
+  }
+
+  for (const task of plan.tasks) {
+    const matched = registry.findContractsForTask(task);
+    const outputs = task.outputArtifacts ?? [];
+    const missing = matched
+      .filter((contract) => contract.required || contract.requiredWhen)
+      .filter(
+        (contract) =>
+          !outputs.some(
+            (artifact) =>
+              artifact.contractId === contract.id ||
+              artifact.kind === contract.kind ||
+              artifact.path === contract.canonicalFile
+          )
+      );
+    if (missing.length > 0) {
+      findings.push({
+        id: `TPG-ARTIFACT-OUTPUT-${task.taskId}`,
+        title: `${task.taskId} 缺少控制面产物契约输出`,
+        body: `任务匹配到注册表契约，但 outputArtifacts 缺少：${missing.map((contract) => contract.id).join("、")}。`,
+        severity: "blocking",
+        status: "unresolved",
+        source: "local-gate"
+      });
+    }
+    if (task.dependencyCondition === "manual_gate" && matched.length > 0) {
+      const hasDecision = outputs.some(
+        (artifact) => artifact.kind.includes("decision") || artifact.kind.includes("verdict")
+      );
+      const hasFlagOrRework = outputs.some(
+        (artifact) =>
+          artifact.kind.includes("flag") ||
+          artifact.kind.includes("approved") ||
+          artifact.kind.includes("rework")
+      );
+      if (!hasDecision || !hasFlagOrRework) {
+        findings.push({
+          id: `TPG-ARTIFACT-GATE-${task.taskId}`,
+          title: `${task.taskId} manual_gate 缺少门禁产物`,
+          body: "manual_gate 任务必须显式产出 decision JSON，并至少包含 approved flag 或 rework request。",
+          severity: "blocking",
+          status: "unresolved",
+          source: "local-gate"
+        });
+      }
+    }
+  }
+  return findings;
 }
 
 export function createLocalGateReview(input: {
@@ -140,7 +214,9 @@ function validateExecutionPolicies(plan: TaskPlan): TaskPlanGateFinding[] {
   const findings: TaskPlanGateFinding[] = [];
   const serializedPolicies = plan.tasks.map((task) => JSON.stringify(task.executionPolicy));
   const allSamePolicy = new Set(serializedPolicies).size === 1;
-  const allDefaultPolicy = plan.tasks.every((task) => JSON.stringify(task.executionPolicy) === JSON.stringify(defaultExecutionPolicy));
+  const allDefaultPolicy = plan.tasks.every(
+    (task) => JSON.stringify(task.executionPolicy) === JSON.stringify(defaultExecutionPolicy)
+  );
 
   if (plan.tasks.length > 1 && (allSamePolicy || allDefaultPolicy)) {
     findings.push({
@@ -161,14 +237,24 @@ function validateAoPromptContext(plan: TaskPlan): TaskPlanGateFinding[] {
   const requiredPromptParts = [
     { label: "workflowId", test: (task: ExecutionTask) => task.aoPrompt.includes(task.workflowId) },
     { label: "taskId", test: (task: ExecutionTask) => task.aoPrompt.includes(task.taskId) },
-    { label: "任务名称", test: (task: ExecutionTask) => task.aoPrompt.includes("任务名称") || task.aoPrompt.includes(task.title) },
-    { label: "AO 角色", test: (task: ExecutionTask) => task.aoPrompt.includes("AO 角色") || task.aoPrompt.includes("aoRole") },
+    {
+      label: "任务名称",
+      test: (task: ExecutionTask) =>
+        task.aoPrompt.includes("任务名称") || task.aoPrompt.includes(task.title)
+    },
+    {
+      label: "AO 角色",
+      test: (task: ExecutionTask) =>
+        task.aoPrompt.includes("AO 角色") || task.aoPrompt.includes("aoRole")
+    },
     { label: "验收标准", test: (task: ExecutionTask) => task.aoPrompt.includes("验收标准") },
     { label: "上下文摘要", test: (task: ExecutionTask) => task.aoPrompt.includes("上下文摘要") }
   ];
 
   for (const task of plan.tasks) {
-    const missing = requiredPromptParts.filter((part) => !part.test(task)).map((part) => part.label);
+    const missing = requiredPromptParts
+      .filter((part) => !part.test(task))
+      .map((part) => part.label);
     if (missing.length > 0) {
       findings.push({
         id: `TPG-PROMPT-${task.taskId}`,
@@ -223,7 +309,9 @@ function hasG0ReadinessSignal(approvedDesign: string, plan: TaskPlan): boolean {
   return designRequiresG0 || planCarriesG0;
 }
 
-function validateG0ManualGateExists(manualGateTasks: ExecutionTask[]): TaskPlanGateFinding | undefined {
+function validateG0ManualGateExists(
+  manualGateTasks: ExecutionTask[]
+): TaskPlanGateFinding | undefined {
   if (manualGateTasks.length > 0) {
     return undefined;
   }
@@ -238,11 +326,17 @@ function validateG0ManualGateExists(manualGateTasks: ExecutionTask[]): TaskPlanG
   };
 }
 
-function validatePostG0TaskDependencies(manualGateTasks: ExecutionTask[], plan: TaskPlan): TaskPlanGateFinding[] {
+function validatePostG0TaskDependencies(
+  manualGateTasks: ExecutionTask[],
+  plan: TaskPlan
+): TaskPlanGateFinding[] {
   const manualGateIds = new Set(manualGateTasks.map((task) => task.taskId));
   const gatedTaskIds = new Set(
     plan.tasks
-      .filter((task) => !manualGateIds.has(task.taskId) && !isG0CalibrationTask(task) && requiresPostG0Gate(task))
+      .filter(
+        (task) =>
+          !manualGateIds.has(task.taskId) && !isG0CalibrationTask(task) && requiresPostG0Gate(task)
+      )
       .filter((task) => !dependsOnAny(task.taskId, manualGateIds, plan))
       .map((task) => task.taskId)
   );
@@ -261,7 +355,10 @@ function validatePostG0TaskDependencies(manualGateTasks: ExecutionTask[], plan: 
     : [];
 }
 
-function validateArtifactDeliverables(approvedDesign: string, plan: TaskPlan): TaskPlanGateFinding[] {
+function validateArtifactDeliverables(
+  approvedDesign: string,
+  plan: TaskPlan
+): TaskPlanGateFinding[] {
   if (!approvedDesign.trim()) {
     return [];
   }
@@ -342,9 +439,7 @@ function validateCrossPlatformPrerequisites(plan: TaskPlan): TaskPlanGateFinding
   }
 
   const prerequisiteTasks = plan.tasks.filter(
-    (task) =>
-      !isImplementationTask(task) &&
-      containsAny(taskText(task), prerequisiteTerms)
+    (task) => !isImplementationTask(task) && containsAny(taskText(task), prerequisiteTerms)
   );
 
   if (prerequisiteTasks.length === 0) {
@@ -361,7 +456,9 @@ function validateCrossPlatformPrerequisites(plan: TaskPlan): TaskPlanGateFinding
   }
 
   const prerequisiteIds = new Set(prerequisiteTasks.map((task) => task.taskId));
-  const uncovered = platformImplementationTasks.filter((task) => !task.dependencies.some((dependency) => prerequisiteIds.has(dependency)));
+  const uncovered = platformImplementationTasks.filter(
+    (task) => !task.dependencies.some((dependency) => prerequisiteIds.has(dependency))
+  );
   if (uncovered.length === 0) {
     return [];
   }
@@ -378,7 +475,10 @@ function validateCrossPlatformPrerequisites(plan: TaskPlan): TaskPlanGateFinding
   ];
 }
 
-function validateDeferredFindings(deferredFindings: DesignReview["findings"], plan: TaskPlan): TaskPlanGateFinding[] {
+function validateDeferredFindings(
+  deferredFindings: DesignReview["findings"],
+  plan: TaskPlan
+): TaskPlanGateFinding[] {
   return deferredFindings
     .filter((finding) => finding.severity === "blocking" || finding.severity === "major")
     .filter((finding) => !hasFindingEvidence(finding, plan))
@@ -393,7 +493,10 @@ function validateDeferredFindings(deferredFindings: DesignReview["findings"], pl
     }));
 }
 
-function validatePreviousUnresolvedFindings(previousReviews: TaskPlanReview[], plan: TaskPlan): TaskPlanGateFinding[] {
+function validatePreviousUnresolvedFindings(
+  previousReviews: TaskPlanReview[],
+  plan: TaskPlan
+): TaskPlanGateFinding[] {
   const unresolved = previousReviews.flatMap((review) =>
     review.findings.filter(
       (finding) =>
@@ -418,7 +521,10 @@ function validatePreviousUnresolvedFindings(previousReviews: TaskPlanReview[], p
     }));
 }
 
-function hasFindingEvidence(finding: { id: string; title: string; body: string }, plan: TaskPlan): boolean {
+function hasFindingEvidence(
+  finding: { id: string; title: string; body: string },
+  plan: TaskPlan
+): boolean {
   const searchablePlan = normalize(plan.tasks.map(taskText).join("\n"));
   if (searchablePlan.includes(normalize(finding.id))) {
     return true;
@@ -443,7 +549,9 @@ function createTaskPlanApprovalReport(input: {
   findings: TaskPlanGateFinding[];
 }): TaskPlanApprovalReport {
   const blockingFindingCount = input.findings.filter(
-    (finding) => finding.status === "unresolved" && (finding.severity === "blocking" || finding.severity === "major")
+    (finding) =>
+      finding.status === "unresolved" &&
+      (finding.severity === "blocking" || finding.severity === "major")
   ).length;
   const dispatchSummary = summarizeDispatchability(input.plan, blockingFindingCount);
   const planReadiness = inferPlanReadiness(input.approvedDesign, input.plan, input.findings);
@@ -471,7 +579,11 @@ function inferPlanReadiness(
 ): TaskPlanApprovalReport["planReadiness"] {
   const hasG0Finding = findings.some((finding) => finding.id.startsWith("TPG-G0"));
   const designRequiresG0 = containsAny(approvedDesign, g0GateTerms);
-  if (hasG0Finding || (designRequiresG0 && plan.tasks.every((task) => task.phase === "calibration" || task.type === "review"))) {
+  if (
+    hasG0Finding ||
+    (designRequiresG0 &&
+      plan.tasks.every((task) => task.phase === "calibration" || task.type === "review"))
+  ) {
     return "calibration_only";
   }
   if (designRequiresG0 || plan.tasks.some((task) => task.dependencyCondition === "manual_gate")) {
@@ -484,7 +596,9 @@ function summarizeDispatchability(
   plan: TaskPlan,
   blockingFindingCount: number
 ): TaskPlanApprovalReport["dispatchSummary"] {
-  const completed = new Set(plan.tasks.filter((task) => task.status === "completed").map((task) => task.taskId));
+  const completed = new Set(
+    plan.tasks.filter((task) => task.status === "completed").map((task) => task.taskId)
+  );
   let dispatchableTaskCount = 0;
   let waitingTaskCount = 0;
   let manualGateTaskCount = 0;
@@ -526,7 +640,9 @@ function buildDesignCoverageTrace(
   plan: TaskPlan,
   findings: TaskPlanGateFinding[]
 ): DesignCoverageTrace[] {
-  const existing = new Map((plan.designCoverageTrace ?? []).map((trace) => [trace.requirementId, trace]));
+  const existing = new Map(
+    (plan.designCoverageTrace ?? []).map((trace) => [trace.requirementId, trace])
+  );
   const findingIds = new Set(findings.map((finding) => finding.id));
   const entries: DesignCoverageTrace[] = [];
 
@@ -536,7 +652,11 @@ function buildDesignCoverageTrace(
     source: "approvedDesign",
     terms: g0GateTerms,
     missingFindingIds: ["TPG-G0-001", "TPG-G0-002"],
-    evidenceTaskIds: findEvidenceTaskIds(plan, (task) => containsAny(taskText(task), g0GateTerms) || task.dependencyCondition === "manual_gate"),
+    evidenceTaskIds: findEvidenceTaskIds(
+      plan,
+      (task) =>
+        containsAny(taskText(task), g0GateTerms) || task.dependencyCondition === "manual_gate"
+    ),
     findingIds
   });
   addTraceIfRequired(entries, existing, approvedDesign, {
@@ -554,7 +674,9 @@ function buildDesignCoverageTrace(
     source: "approvedDesign",
     terms: ["0700", "0600", "ACL", "/dev/shm", "ProgramData", "权限模型"],
     missingFindingIds: ["TPG-COVERAGE-PERMISSION"],
-    evidenceTaskIds: findEvidenceTaskIds(plan, (task) => hasSegmentPermissionEvidence(taskText(task))),
+    evidenceTaskIds: findEvidenceTaskIds(plan, (task) =>
+      hasSegmentPermissionEvidence(taskText(task))
+    ),
     findingIds
   });
   addTraceIfRequired(entries, existing, approvedDesign, {
@@ -563,7 +685,9 @@ function buildDesignCoverageTrace(
     source: "approvedDesign",
     terms: ["IPv4/IPv6", "IPv6"],
     missingFindingIds: ["TPG-COVERAGE-IPV6"],
-    evidenceTaskIds: findEvidenceTaskIds(plan, (task) => containsAny(taskText(task), ["IPv6", "ipv6"])),
+    evidenceTaskIds: findEvidenceTaskIds(plan, (task) =>
+      containsAny(taskText(task), ["IPv6", "ipv6"])
+    ),
     findingIds
   });
   addTraceIfRequired(entries, existing, approvedDesign, {
@@ -597,26 +721,36 @@ function addTraceIfRequired(
     return;
   }
   const existingTrace = existing.get(input.requirementId);
-  const hasMissingFinding = input.missingFindingIds.some((findingId) => input.findingIds.has(findingId));
+  const hasMissingFinding = input.missingFindingIds.some((findingId) =>
+    input.findingIds.has(findingId)
+  );
   entries.push({
     requirementId: input.requirementId,
     requirement: existingTrace?.requirement ?? input.requirement,
     source: existingTrace?.source ?? input.source,
-    status: hasMissingFinding ? "missing" : existingTrace?.status ?? "covered",
-    evidenceTaskIds: existingTrace?.evidenceTaskIds.length ? existingTrace.evidenceTaskIds : input.evidenceTaskIds,
+    status: hasMissingFinding ? "missing" : (existingTrace?.status ?? "covered"),
+    evidenceTaskIds: existingTrace?.evidenceTaskIds.length
+      ? existingTrace.evidenceTaskIds
+      : input.evidenceTaskIds,
     rationale: hasMissingFinding
       ? "本地门禁未找到足够任务证据。"
-      : existingTrace?.rationale ?? "本地门禁已找到任务证据。"
+      : (existingTrace?.rationale ?? "本地门禁已找到任务证据。")
   });
 }
 
-function findEvidenceTaskIds(plan: TaskPlan, predicate: (task: ExecutionTask) => boolean): string[] {
+function findEvidenceTaskIds(
+  plan: TaskPlan,
+  predicate: (task: ExecutionTask) => boolean
+): string[] {
   return plan.tasks.filter(predicate).map((task) => task.taskId);
 }
 
 function hasStructuredCoverage(plan: TaskPlan, requirementId: string): boolean {
   return (plan.designCoverageTrace ?? []).some(
-    (trace) => trace.requirementId === requirementId && trace.status === "covered" && trace.evidenceTaskIds.length > 0
+    (trace) =>
+      trace.requirementId === requirementId &&
+      trace.status === "covered" &&
+      trace.evidenceTaskIds.length > 0
   );
 }
 
@@ -678,7 +812,18 @@ function requiresPostG0Gate(task: ExecutionTask): boolean {
   return (
     task.type === "implementation" ||
     task.type === "refactor" ||
-    containsAny(text, ["重构", "发布", "release", "JAR", "Gradle", "Maven", "io_uring", "epoll", "IOCP", "kqueue"])
+    containsAny(text, [
+      "重构",
+      "发布",
+      "release",
+      "JAR",
+      "Gradle",
+      "Maven",
+      "io_uring",
+      "epoll",
+      "IOCP",
+      "kqueue"
+    ])
   );
 }
 
@@ -711,20 +856,31 @@ function dependsOnAny(taskId: string, dependencyIds: ReadonlySet<string>, plan: 
     if (!task) {
       return false;
     }
-    return task.dependencies.some((dependency) => dependencyIds.has(dependency) || visit(dependency));
+    return task.dependencies.some(
+      (dependency) => dependencyIds.has(dependency) || visit(dependency)
+    );
   };
 
   return visit(taskId);
 }
 
 function hasJarDeliveryEvidence(text: string): boolean {
-  return containsAny(text, ["JAR", "jar"]) && containsAny(text, ["Gradle", "Maven", "构建", "打包", "发布", "依赖验证", "示例依赖"]);
+  return (
+    containsAny(text, ["JAR", "jar"]) &&
+    containsAny(text, ["Gradle", "Maven", "构建", "打包", "发布", "依赖验证", "示例依赖"])
+  );
 }
 
 function hasSegmentPermissionEvidence(text: string): boolean {
-  return containsAny(text, ["权限", "访问控制", "ACL", "0700", "0600"]) && containsAny(text, ["共享段", "段路径", "段文件", "segment", "跨平台"]);
+  return (
+    containsAny(text, ["权限", "访问控制", "ACL", "0700", "0600"]) &&
+    containsAny(text, ["共享段", "段路径", "段文件", "segment", "跨平台"])
+  );
 }
 
 function hasOutboundEvidence(text: string): boolean {
-  return containsAny(text, ["OutboundTransport", "send", "发送接口", "发包能力", "接口兼容位"]) && containsAny(text, ["预留", "落位", "复核", "不做代码落位", "兼容位"]);
+  return (
+    containsAny(text, ["OutboundTransport", "send", "发送接口", "发包能力", "接口兼容位"]) &&
+    containsAny(text, ["预留", "落位", "复核", "不做代码落位", "兼容位"])
+  );
 }

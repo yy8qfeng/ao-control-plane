@@ -27,9 +27,17 @@ import {
   summarizeExecutionState
 } from "../workflow/execution-state-store.js";
 import { normalizeAoSessions } from "../workflow/ao-status.js";
-import { cleanupAoWorktrees, listWorktreeCleanupCandidates, type ArtifactReconcileResult } from "../workflow/ao-output-reconcile.js";
+import {
+  cleanupAoWorktrees,
+  listWorktreeCleanupCandidates,
+  type ArtifactReconcileResult
+} from "../workflow/ao-output-reconcile.js";
+import { getArtifactContractRegistry } from "../workflow/artifact-contract-registry.js";
 import { acquireExecutionLock, type ExecutionLockHandle } from "../workflow/execution-lock.js";
-import { requestTaskPlanRevision, type PlanRevisionRequest } from "../workflow/task-plan-revision-review-loop.js";
+import {
+  requestTaskPlanRevision,
+  type PlanRevisionRequest
+} from "../workflow/task-plan-revision-review-loop.js";
 
 type ExecutionAoAdapter = Pick<AoCliAdapter, "spawnTask" | "listSessions"> &
   Partial<Pick<AoCliAdapter, "validateDispatchPrerequisites">>;
@@ -48,6 +56,7 @@ export interface ExecutionJobSnapshot {
   readonly?: boolean;
   manualGateReleases?: ExecutionState["manualGateReleases"];
   manualGateContext?: ManualGateContextSnapshot;
+  artifactDiagnostics?: ArtifactDiagnosticsSnapshot;
 }
 
 export interface ManualGateContextSnapshot {
@@ -78,6 +87,26 @@ export interface ExecutionTaskSnapshot {
   statusObservations?: ExecutionTaskState["statusObservations"];
 }
 
+export interface ArtifactDiagnosticsSnapshot {
+  taskId?: string;
+  contracts: Array<{
+    contractId: string;
+    kind: string;
+    canonicalPath: string;
+    required: boolean;
+    requiredWhen?: string;
+    canonicalExists: boolean;
+    candidatePaths: Array<{
+      source: string;
+      purpose: string;
+      path: string;
+      priority: number;
+    }>;
+  }>;
+  missingArtifacts: MissingArtifact[];
+  latestReconcile?: unknown;
+}
+
 interface ManagedExecutionJob {
   jobId: string;
   workflowId: string;
@@ -89,14 +118,16 @@ interface ManagedExecutionJob {
 export class ExecutionJobManager {
   private readonly jobs = new Map<string, ManagedExecutionJob>();
 
-  constructor(private readonly input: {
-    store: ExecutionStateStore;
-    artifactRoot: string;
-    projectRoot?: string;
-    createAo: () => ExecutionAoAdapter;
-    createCodex?: () => CodexAdapter;
-    createClaudeCode?: () => ClaudeCodeAdapter;
-  }) {}
+  constructor(
+    private readonly input: {
+      store: ExecutionStateStore;
+      artifactRoot: string;
+      projectRoot?: string;
+      createAo: () => ExecutionAoAdapter;
+      createCodex?: () => CodexAdapter;
+      createClaudeCode?: () => ClaudeCodeAdapter;
+    }
+  ) {}
 
   async restoreFromDisk(): Promise<void> {
     const states = await this.input.store.scanStates();
@@ -122,7 +153,11 @@ export class ExecutionJobManager {
         } catch {
           this.jobs.set(jobId, { jobId, workflowId: state.workflowId, readonly: true });
         }
-      } else if (state.status === "stopped" || state.status === "paused_for_replan" || state.status === "failed") {
+      } else if (
+        state.status === "stopped" ||
+        state.status === "paused_for_replan" ||
+        state.status === "failed"
+      ) {
         this.jobs.set(jobId, { jobId, workflowId: state.workflowId, readonly: true });
       }
     }
@@ -140,14 +175,17 @@ export class ExecutionJobManager {
       throw httpError(409, "Workflow execution is already completed");
     }
     if (state.status === "failed") {
-      throw httpError(409, "Workflow execution is failed; please use retry, mark completed, or request revision from the AO execution panel first");
+      throw httpError(
+        409,
+        "Workflow execution is failed; please use retry, mark completed, or request revision from the AO execution panel first"
+      );
     }
     if (state.status === "paused_for_replan") {
       throw httpError(409, "Workflow execution is paused for replan");
     }
     if (state.status === "running") {
       const jobId = this.getJobId(input.workflowId);
-      const job = this.jobs.get(jobId) ?? await this.attachExistingJob(jobId);
+      const job = this.jobs.get(jobId) ?? (await this.attachExistingJob(jobId));
       if (job) {
         const snapshot = await this.getSnapshot(jobId);
         return { ...snapshot, mode: "attached" };
@@ -155,7 +193,8 @@ export class ExecutionJobManager {
       throw httpError(409, "Workflow execution already has an active job");
     }
 
-    const mode = state.status === "stopped" || state.status === "waiting_manual_gate" ? "resumed" : "created";
+    const mode =
+      state.status === "stopped" || state.status === "waiting_manual_gate" ? "resumed" : "created";
     const jobId = this.getJobId(input.workflowId);
     const ao = this.input.createAo();
     await this.ensureAoAvailable(ao);
@@ -180,7 +219,7 @@ export class ExecutionJobManager {
   }
 
   async getSnapshot(jobId: string): Promise<ExecutionJobSnapshot> {
-    const job = this.jobs.get(jobId) ?? await this.attachExistingJob(jobId);
+    const job = this.jobs.get(jobId) ?? (await this.attachExistingJob(jobId));
     if (!job) {
       throw httpError(404, "execution job not found");
     }
@@ -189,6 +228,7 @@ export class ExecutionJobManager {
     let tasks: ExecutionTaskSnapshot[] | undefined;
     let activeTask: ExecutionTaskSnapshot | undefined;
     let manualGateContext: ManualGateContextSnapshot | undefined;
+    let artifactDiagnostics: ArtifactDiagnosticsSnapshot | undefined;
     try {
       const plan = await this.input.store.readActiveTaskPlan(state);
       summary = summarizeExecutionState(plan, state);
@@ -209,10 +249,12 @@ export class ExecutionJobManager {
           statusObservations: runtime?.statusObservations
         };
       });
-      activeTask = tasks.find((task) => task.taskId === state.currentTaskId) ??
+      activeTask =
+        tasks.find((task) => task.taskId === state.currentTaskId) ??
         tasks.find((task) => task.status === "working") ??
         tasks.find((task) => task.status === "blocked_for_human");
       manualGateContext = await this.buildManualGateContext(plan, state);
+      artifactDiagnostics = await this.buildArtifactDiagnostics(plan, state);
     } catch {
       summary = undefined;
     }
@@ -228,8 +270,20 @@ export class ExecutionJobManager {
       logs: await this.input.store.readLogs(job.workflowId, 100),
       readonly: job.readonly,
       manualGateReleases: state.manualGateReleases,
-      manualGateContext
+      manualGateContext,
+      artifactDiagnostics
     };
+  }
+
+  async getArtifactDiagnostics(jobId: string): Promise<ArtifactDiagnosticsSnapshot> {
+    const job = this.requireJob(jobId);
+    const state = await this.input.store.ensureState(job.workflowId);
+    const plan = await this.input.store.readActiveTaskPlan(state);
+    const diagnostics = await this.buildArtifactDiagnostics(plan, state);
+    if (!diagnostics) {
+      throw httpError(404, "No task is available for artifact diagnostics");
+    }
+    return diagnostics;
   }
 
   async stop(jobId: string): Promise<ExecutionJobSnapshot> {
@@ -254,7 +308,12 @@ export class ExecutionJobManager {
     const job = this.requireJob(jobId);
     const ao = await this.prepareContinuation(job);
     try {
-      await retryExecutionTask({ store: this.input.store, workflowId: job.workflowId, taskId, actor: "user" });
+      await retryExecutionTask({
+        store: this.input.store,
+        workflowId: job.workflowId,
+        taskId,
+        actor: "user"
+      });
       this.startRunner(job, ao);
       return this.getSnapshot(jobId);
     } catch (error) {
@@ -263,7 +322,11 @@ export class ExecutionJobManager {
     }
   }
 
-  async markCompleted(jobId: string, taskId: string, rationale: string): Promise<ExecutionJobSnapshot> {
+  async markCompleted(
+    jobId: string,
+    taskId: string,
+    rationale: string
+  ): Promise<ExecutionJobSnapshot> {
     const job = this.requireJob(jobId);
     const ao = await this.prepareContinuation(job);
     try {
@@ -282,12 +345,19 @@ export class ExecutionJobManager {
     }
   }
 
-  async decideManualGate(jobId: string, taskId: string, input: {
-    decision: "approved" | "requires_replan" | "blocked";
-    rationale: string;
-  }): Promise<ExecutionJobSnapshot> {
+  async decideManualGate(
+    jobId: string,
+    taskId: string,
+    input: {
+      decision: "approved" | "requires_replan" | "blocked";
+      rationale: string;
+    }
+  ): Promise<ExecutionJobSnapshot> {
     const job = this.requireJob(jobId);
-    const ao = input.decision === "approved" ? await this.prepareContinuation(job, { skipAoCheck: true }) : undefined;
+    const ao =
+      input.decision === "approved"
+        ? await this.prepareContinuation(job, { skipAoCheck: true })
+        : undefined;
     try {
       if (input.decision === "approved") {
         const state = await this.input.store.ensureState(job.workflowId);
@@ -321,7 +391,11 @@ export class ExecutionJobManager {
     }
   }
 
-  async dispatchManualGateReview(jobId: string, taskId: string, rationale: string): Promise<ExecutionJobSnapshot> {
+  async dispatchManualGateReview(
+    jobId: string,
+    taskId: string,
+    rationale: string
+  ): Promise<ExecutionJobSnapshot> {
     const job = this.requireJob(jobId);
     const ao = await this.prepareContinuation(job);
     try {
@@ -348,19 +422,33 @@ export class ExecutionJobManager {
     aoSessionId?: string;
     reconcileResult?: ArtifactReconcileResult;
     completed: boolean;
-    failureKind?: "artifact_output_missing" | "artifact_output_conflict" | "artifact_output_reconcile_failed";
+    failureKind?:
+      | "artifact_output_missing"
+      | "artifact_output_conflict"
+      | "artifact_output_reconcile_failed"
+      | "artifact_output_ambiguous"
+      | "artifact_contract_violation";
   }> {
     const job = this.requireJob(jobId);
     const state = await this.input.store.ensureState(job.workflowId);
-    const taskId = state.failure?.taskId ?? state.currentTaskId ?? Object.values(state.taskStates).find((task) =>
-      task.status === "blocked_for_human" || task.status === "failed" || task.status === "pending"
-    )?.taskId;
+    const taskId =
+      state.failure?.taskId ??
+      state.currentTaskId ??
+      Object.values(state.taskStates).find(
+        (task) =>
+          task.status === "blocked_for_human" ||
+          task.status === "failed" ||
+          task.status === "pending"
+      )?.taskId;
     if (!taskId) {
       throw httpError(400, "No current task is available for artifact reconciliation");
     }
     const taskState = state.taskStates[taskId];
     if (taskState?.status === "working") {
-      throw httpError(409, `Task ${taskId} is still working; wait for AO terminal status before reconciling artifacts`);
+      throw httpError(
+        409,
+        `Task ${taskId} is still working; wait for AO terminal status before reconciling artifacts`
+      );
     }
     const sessions = await this.safeListSessions();
     const result = await reconcileExecutionTaskArtifacts({
@@ -406,7 +494,10 @@ export class ExecutionJobManager {
     return candidates;
   }
 
-  async cleanupWorktrees(jobId: string, input: { sessionIds: string[]; dryRun?: boolean }): Promise<unknown> {
+  async cleanupWorktrees(
+    jobId: string,
+    input: { sessionIds: string[]; dryRun?: boolean }
+  ): Promise<unknown> {
     const job = this.requireJob(jobId);
     const state = await this.input.store.ensureState(job.workflowId);
     const sessions = await this.safeListSessions();
@@ -427,7 +518,10 @@ export class ExecutionJobManager {
     return result;
   }
 
-  async requestRevision(jobId: string, request: PlanRevisionRequest): Promise<{
+  async requestRevision(
+    jobId: string,
+    request: PlanRevisionRequest
+  ): Promise<{
     job: ExecutionJobSnapshot;
     revision: unknown;
   }> {
@@ -435,7 +529,10 @@ export class ExecutionJobManager {
     if (!this.input.createCodex || !this.input.createClaudeCode) {
       throw httpError(500, "Task plan revision requires Codex and ClaudeCode adapters");
     }
-    const approvedDesign = await readFile(join(this.input.store.getWorkflowDir(job.workflowId), "design.md"), "utf8");
+    const approvedDesign = await readFile(
+      join(this.input.store.getWorkflowDir(job.workflowId), "design.md"),
+      "utf8"
+    );
     const revision = await requestTaskPlanRevision({
       store: this.input.store,
       codex: this.input.createCodex(),
@@ -525,10 +622,7 @@ export class ExecutionJobManager {
     job.readonly = true;
   }
 
-  private startRunner(
-    job: ManagedExecutionJob,
-    ao?: ExecutionAoAdapter
-  ): void {
+  private startRunner(job: ManagedExecutionJob, ao?: ExecutionAoAdapter): void {
     if (job.runner) {
       job.runner.start();
       return;
@@ -544,7 +638,8 @@ export class ExecutionJobManager {
   }
 
   private async ensureAoAvailable(
-    ao: Pick<AoCliAdapter, "listSessions"> & Partial<Pick<AoCliAdapter, "validateDispatchPrerequisites">>,
+    ao: Pick<AoCliAdapter, "listSessions"> &
+      Partial<Pick<AoCliAdapter, "validateDispatchPrerequisites">>,
     job?: Pick<ManagedExecutionJob, "jobId" | "workflowId">
   ): Promise<void> {
     try {
@@ -574,7 +669,9 @@ export class ExecutionJobManager {
     }
   }
 
-  private async recoverFailedTaskCompletedByAoReport(state: ExecutionState): Promise<ExecutionState> {
+  private async recoverFailedTaskCompletedByAoReport(
+    state: ExecutionState
+  ): Promise<ExecutionState> {
     const taskId = state.failure?.taskId ?? state.currentTaskId ?? undefined;
     if (state.status !== "failed" || !taskId) {
       return state;
@@ -615,7 +712,10 @@ export class ExecutionJobManager {
     plan: Awaited<ReturnType<ExecutionStateStore["readActiveTaskPlan"]>>,
     state: ExecutionState
   ): Promise<ManualGateContextSnapshot | undefined> {
-    if (!["waiting_manual_gate", "running", "failed"].includes(state.status) || !state.currentTaskId) {
+    if (
+      !["waiting_manual_gate", "running", "failed"].includes(state.status) ||
+      !state.currentTaskId
+    ) {
       return undefined;
     }
     const task = plan.tasks.find((item) => item.taskId === state.currentTaskId);
@@ -624,7 +724,9 @@ export class ExecutionJobManager {
     }
     const artifactDir = this.input.store.getWorkflowDir(state.workflowId);
     const inputArtifacts = resolveInputArtifacts(task, plan, artifactDir);
-    const release = state.manualGateReleases.find((item) => item.taskId === task.taskId && item.mode === "manual_approve");
+    const release = state.manualGateReleases.find(
+      (item) => item.taskId === task.taskId && item.mode === "manual_approve"
+    );
     return {
       taskId: task.taskId,
       title: task.title,
@@ -636,6 +738,79 @@ export class ExecutionJobManager {
       expectedOutputs: resolveOutputArtifacts(task, artifactDir),
       missingArtifacts: await findMissingRequiredArtifacts(inputArtifacts),
       generatedArtifacts: release?.generatedArtifacts
+    };
+  }
+
+  private async buildArtifactDiagnostics(
+    plan: Awaited<ReturnType<ExecutionStateStore["readActiveTaskPlan"]>>,
+    state: ExecutionState
+  ): Promise<ArtifactDiagnosticsSnapshot | undefined> {
+    const taskId =
+      state.failure?.taskId ??
+      state.currentTaskId ??
+      Object.values(state.taskStates).find(
+        (task) => task.status === "blocked_for_human" || task.status === "failed"
+      )?.taskId;
+    const task = taskId ? plan.tasks.find((item) => item.taskId === taskId) : undefined;
+    if (!task) {
+      return undefined;
+    }
+    const artifactDir = this.input.store.getWorkflowDir(state.workflowId);
+    const registry = getArtifactContractRegistry();
+    const expectedOutputs = resolveOutputArtifacts(task, artifactDir);
+    const logs = await this.input.store.readLogs(state.workflowId, 100);
+    const latestReconcile = [...logs]
+      .reverse()
+      .find(
+        (event) =>
+          event.taskId === task.taskId &&
+          (event.type === "artifact_output_reconcile_started" ||
+            event.type === "artifact_output_reconcile_failed" ||
+            event.type === "artifact_output_conflict" ||
+            event.type === "artifact_output_missing")
+      );
+    return {
+      taskId: task.taskId,
+      contracts: await Promise.all(
+        expectedOutputs
+          .flatMap((artifact) => {
+            const contract = registry.resolveContractForArtifact(artifact);
+            return contract
+              ? [
+                  {
+                    contractId: contract.id,
+                    kind: contract.kind,
+                    canonicalPath: artifact.path,
+                    required: artifact.required,
+                    requiredWhen: artifact.requiredWhen,
+                    canonicalExists: false,
+                    candidatePaths: contract.candidatePaths.map((candidate) => ({
+                      source: candidate.source,
+                      purpose: candidate.purpose,
+                      path: candidate.file,
+                      priority: candidate.priority
+                    }))
+                  }
+                ]
+              : [];
+          })
+          .map(async (item) => ({
+            ...item,
+            canonicalExists: !(
+              await findMissingRequiredArtifacts([
+                {
+                  kind: item.kind,
+                  path: item.canonicalPath,
+                  required: true
+                }
+              ])
+            ).length
+          }))
+      ),
+      missingArtifacts: await findMissingRequiredArtifacts(
+        expectedOutputs.filter((artifact) => artifact.required)
+      ),
+      latestReconcile
     };
   }
 }

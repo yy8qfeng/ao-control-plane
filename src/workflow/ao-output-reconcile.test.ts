@@ -92,7 +92,7 @@ describe("ao output reconciliation", () => {
 
     const result = await reconcileTaskOutputsFromAoWorktree(reconcileInput({ artifactDir, worktreePath, plan, task }));
 
-    expect(result.conflicts).toEqual([expect.objectContaining({ reason: "workflow_mismatch", expected: plan.workflowId, actual: "WF-OTHER" })]);
+    expect(result.contractViolations).toEqual([expect.objectContaining({ reason: "workflow_mismatch", expected: plan.workflowId, actual: "WF-OTHER" })]);
     await expect(access(join(artifactDir, "ipc_contract_review_gate_decision.json"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
@@ -108,7 +108,7 @@ describe("ao output reconciliation", () => {
 
     const result = await reconcileTaskOutputsFromAoWorktree(reconcileInput({ artifactDir, worktreePath, plan, task }));
 
-    expect(result.conflicts).toEqual([expect.objectContaining({ reason: "task_mismatch", expected: task.taskId, actual: "TASK-OTHER" })]);
+    expect(result.contractViolations).toEqual([expect.objectContaining({ reason: "task_mismatch", expected: task.taskId, actual: "TASK-OTHER" })]);
   });
 
   it("enters conflict when canonical exists with different content and does not overwrite it", async () => {
@@ -204,6 +204,81 @@ describe("ao output reconciliation", () => {
     expect(result.recovered).toEqual([expect.objectContaining({ to: join(artifactDir, "nested", "gate_decision.json") })]);
   });
 
+  it("recovers declared outputs from documented mirror files when AO writes outside .ao-control-plane", async () => {
+    const { artifactDir, worktreePath, plan, task } = await seedManualGateWorktree("WF-MIRROR-CANDIDATE", "TASK-008", "ft-7", [
+      { kind: "transport_contract_freeze", path: "transport_contract_freeze.json", required: true },
+      { kind: "transport_contract_freeze_markdown", path: "transport_contract_freeze.md", required: false }
+    ]);
+    await mkdir(join(worktreePath, "docs", "transport"), { recursive: true });
+    await writeFile(join(worktreePath, "docs", "transport", "transport-contract-freeze.json"), JSON.stringify({
+      workflowId: plan.workflowId,
+      taskId: task.taskId,
+      frozenBy: "ft-7"
+    }), "utf8");
+    await writeFile(join(worktreePath, "docs", "transport", "transport-contract-freeze.md"), "# Transport contract\n", "utf8");
+
+    const result = await reconcileTaskOutputsFromAoWorktree(reconcileInput({ artifactDir, worktreePath, plan, task }));
+
+    expect(result.failures).toEqual([]);
+    expect(result.conflicts).toEqual([]);
+    expect(result.recovered).toEqual([
+      expect.objectContaining({
+        from: join(worktreePath, "docs", "transport", "transport-contract-freeze.json"),
+        to: join(artifactDir, "transport_contract_freeze.json")
+      }),
+      expect.objectContaining({
+        from: join(worktreePath, "docs", "transport", "transport-contract-freeze.md"),
+        to: join(artifactDir, "transport_contract_freeze.md")
+      })
+    ]);
+  });
+
+  it("reports ambiguous candidates without also reporting conflicts", async () => {
+    const { artifactDir, worktreePath, plan, task } = await seedManualGateWorktree("WF-AMBIGUOUS-CANDIDATES", "TASK-008", "ft-7", [
+      { contractId: "transport_contract_freeze", kind: "transport_contract_freeze", path: "transport_contract_freeze.json", required: true }
+    ]);
+    const payload = {
+      workflowId: plan.workflowId,
+      taskId: task.taskId,
+      frozenBy: "ft-7"
+    };
+    await mkdir(join(worktreePath, "docs", "transport"), { recursive: true });
+    await writeFile(join(worktreePath, "docs", "transport", "transport-contract-freeze.json"), JSON.stringify(payload), "utf8");
+    await writeFile(join(worktreePath, "docs", "transport", "transport_contract_freeze.json"), JSON.stringify(payload), "utf8");
+
+    const result = await reconcileTaskOutputsFromAoWorktree(reconcileInput({ artifactDir, worktreePath, plan, task }));
+
+    expect(result.ambiguousCandidates).toHaveLength(2);
+    expect(result.conflicts).toEqual([]);
+    expect(result.recovered).toEqual([]);
+  });
+
+  it("matches documented mirror paths case-insensitively when the contract allows it", async () => {
+    const { artifactDir, worktreePath, plan, task } = await seedManualGateWorktree("WF-CASE-AWARE", "TASK-008", "ft-7", [
+      { contractId: "transport_contract_freeze", kind: "transport_contract_freeze", path: "transport_contract_freeze.json", required: true }
+    ]);
+    await mkdir(join(worktreePath, "Docs", "Transport"), { recursive: true });
+    await writeFile(join(worktreePath, "Docs", "Transport", "Transport-Contract-Freeze.json"), JSON.stringify({
+      workflowId: plan.workflowId,
+      taskId: task.taskId,
+      frozenBy: "ft-7"
+    }), "utf8");
+
+    const result = await reconcileTaskOutputsFromAoWorktree(reconcileInput({ artifactDir, worktreePath, plan, task }));
+
+    if (process.platform === "win32" || process.platform === "darwin") {
+      expect(result.recovered).toEqual([
+        expect.objectContaining({
+          from: join(worktreePath, "Docs", "Transport", "Transport-Contract-Freeze.json")
+        })
+      ]);
+    } else {
+      expect(result.missing).toEqual([
+        expect.objectContaining({ reason: "candidate_missing" })
+      ]);
+    }
+  });
+
   it("rejects expectedOutput paths outside artifactDir", async () => {
     const { artifactDir, worktreePath, plan, task } = await seedManualGateWorktree("WF-PATH-ESCAPE", "TASK-006", "ft-7");
     task.outputArtifacts = [
@@ -238,7 +313,7 @@ describe("ao output reconciliation", () => {
 
     const result = await reconcileTaskOutputsFromAoWorktree(reconcileInput({ artifactDir, worktreePath, plan, task }));
 
-    expect(result.conflicts).toEqual([expect.objectContaining({ reason: "source_proof_missing" })]);
+    expect(result.contractViolations).toEqual([expect.objectContaining({ reason: "source_proof_missing" })]);
   });
 
   it("allows reviewerSessionId and reviewerIndependence source proof", async () => {

@@ -10,8 +10,8 @@ import {
   taskTypeSchema,
   type TaskPlan
 } from "../schemas/task-plan.js";
+import { getArtifactContractRegistry } from "./artifact-contract-registry.js";
 import { hasConditionalSkipConvention } from "./conditional-task-conventions.js";
-import { manualGateTemplates, taskOutputTemplates } from "./task-artifact-templates.js";
 
 export type TaskPlanNormalizationSource = "codex" | "artifact" | "cli";
 export type TaskPlanNormalizationOutcome = "passed" | "raw_failed" | "strict_failed";
@@ -28,18 +28,20 @@ export const taskPlanNormalizationIssueSchema = z.object({
   path: z.string().min(1),
   message: z.string().min(1)
 });
-export const taskPlanNormalizationChangeSchema = z.object({
-  path: z.string().min(1),
-  reason: z.string().min(1)
-}).transform((change) => {
-  const record = change as Record<string, unknown>;
-  return {
-    path: change.path,
-    from: record.from,
-    to: record.to,
-    reason: change.reason
-  };
-});
+export const taskPlanNormalizationChangeSchema = z
+  .object({
+    path: z.string().min(1),
+    reason: z.string().min(1)
+  })
+  .transform((change) => {
+    const record = change as Record<string, unknown>;
+    return {
+      path: change.path,
+      from: record.from,
+      to: record.to,
+      reason: change.reason
+    };
+  });
 export const taskPlanNormalizationDroppedEntrySchema = z.object({
   path: z.string().min(1),
   reason: z.string().min(1),
@@ -50,32 +52,34 @@ export const taskPlanNormalizationSourceHistorySchema = z.object({
   source: taskPlanNormalizationSourceSchema,
   reason: z.string().min(1)
 });
-export const taskPlanNormalizationReportSchema = z.object({
-  workflowId: z.string().min(1),
-  round: z.number().int().nonnegative(),
-  generatedAt: z.string().min(1),
-  source: taskPlanNormalizationSourceSchema,
-  sourceHistory: z.array(taskPlanNormalizationSourceHistorySchema).optional(),
-  rawSchemaErrors: z.array(taskPlanNormalizationIssueSchema),
-  changes: z.array(taskPlanNormalizationChangeSchema),
-  droppedEntries: z.array(taskPlanNormalizationDroppedEntrySchema),
-  strictSchemaErrors: z.array(taskPlanNormalizationIssueSchema),
-  outcome: taskPlanNormalizationOutcomeSchema
-}).superRefine((report, context) => {
-  const reasonsByRoundAndSource = new Map<string, string>();
-  for (const [index, history] of (report.sourceHistory ?? []).entries()) {
-    const key = `${history.round}:${history.source}`;
-    const previousReason = reasonsByRoundAndSource.get(key);
-    if (previousReason !== undefined && previousReason !== history.reason) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["sourceHistory", index, "reason"],
-        message: "sourceHistory entries for the same round and source must use the same reason"
-      });
+export const taskPlanNormalizationReportSchema = z
+  .object({
+    workflowId: z.string().min(1),
+    round: z.number().int().nonnegative(),
+    generatedAt: z.string().min(1),
+    source: taskPlanNormalizationSourceSchema,
+    sourceHistory: z.array(taskPlanNormalizationSourceHistorySchema).optional(),
+    rawSchemaErrors: z.array(taskPlanNormalizationIssueSchema),
+    changes: z.array(taskPlanNormalizationChangeSchema),
+    droppedEntries: z.array(taskPlanNormalizationDroppedEntrySchema),
+    strictSchemaErrors: z.array(taskPlanNormalizationIssueSchema),
+    outcome: taskPlanNormalizationOutcomeSchema
+  })
+  .superRefine((report, context) => {
+    const reasonsByRoundAndSource = new Map<string, string>();
+    for (const [index, history] of (report.sourceHistory ?? []).entries()) {
+      const key = `${history.round}:${history.source}`;
+      const previousReason = reasonsByRoundAndSource.get(key);
+      if (previousReason !== undefined && previousReason !== history.reason) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["sourceHistory", index, "reason"],
+          message: "sourceHistory entries for the same round and source must use the same reason"
+        });
+      }
+      reasonsByRoundAndSource.set(key, history.reason);
     }
-    reasonsByRoundAndSource.set(key, history.reason);
-  }
-});
+  });
 
 export interface TaskPlanNormalizationIssue {
   path: string;
@@ -215,6 +219,10 @@ export function normalizeTaskPlanModelOutput(
     report.outcome = "strict_failed";
     return { report, rawValue: raw, normalizedValue };
   }
+  if (report.strictSchemaErrors.length > 0) {
+    report.outcome = "strict_failed";
+    return { report, rawValue: raw, normalizedValue };
+  }
 
   report.outcome = "passed";
   report.workflowId = strictResult.data.workflowId;
@@ -227,7 +235,9 @@ export function normalizeTaskPlanModelOutput(
   };
 }
 
-export function getTaskPlanNormalizationReport(plan: TaskPlan): TaskPlanNormalizationReport | undefined {
+export function getTaskPlanNormalizationReport(
+  plan: TaskPlan
+): TaskPlanNormalizationReport | undefined {
   return reportByPlan.get(plan);
 }
 
@@ -258,7 +268,11 @@ export function parseTaskPlanWithNormalization(
     return result.plan;
   }
 
-  throw new TaskPlanNormalizationError(errorMessage, result.report, result.normalizedValue ?? result.rawValue);
+  throw new TaskPlanNormalizationError(
+    errorMessage,
+    result.report,
+    result.normalizedValue ?? result.rawValue
+  );
 }
 
 export class TaskPlanNormalizationError extends Error {
@@ -267,7 +281,8 @@ export class TaskPlanNormalizationError extends Error {
     readonly report: TaskPlanNormalizationReport,
     readonly value: unknown
   ) {
-    const errors = report.outcome === "raw_failed" ? report.rawSchemaErrors : report.strictSchemaErrors;
+    const errors =
+      report.outcome === "raw_failed" ? report.rawSchemaErrors : report.strictSchemaErrors;
     super(`${message}: ${formatNormalizationErrors(errors)}`);
     this.name = "TaskPlanNormalizationError";
   }
@@ -283,11 +298,18 @@ function normalizeRawTaskPlan(
       .filter((taskId): taskId is string => typeof taskId === "string" && taskId.trim().length > 0)
   );
   const normalizedTasks = rawPlan.tasks.map((task, index) => normalizeTask(task, index, report));
-  const normalizedTrace = normalizeDesignCoverageTrace(rawPlan.designCoverageTrace, taskIds, report);
+  normalizeDependencyInputArtifacts(normalizedTasks, report);
+  const normalizedTrace = normalizeDesignCoverageTrace(
+    rawPlan.designCoverageTrace,
+    taskIds,
+    report
+  );
 
   return {
     ...rawPlan,
-    ...(normalizedTrace === undefined ? { designCoverageTrace: undefined } : { designCoverageTrace: normalizedTrace }),
+    ...(normalizedTrace === undefined
+      ? { designCoverageTrace: undefined }
+      : { designCoverageTrace: normalizedTrace }),
     tasks: normalizedTasks
   };
 }
@@ -298,20 +320,25 @@ function validateConditionalBranchConventions(plan: TaskPlan): TaskPlanNormaliza
     if (task.dependencyCondition !== "manual_gate") {
       return [];
     }
-    const dependsOnManualGate = task.dependencies.some((dependencyId) =>
-      tasksById.get(dependencyId)?.dependencyCondition === "manual_gate"
+    const dependsOnManualGate = task.dependencies.some(
+      (dependencyId) => tasksById.get(dependencyId)?.dependencyCondition === "manual_gate"
     );
     if (!dependsOnManualGate) {
       return [];
     }
-    const text = [task.title, task.description, task.aoPrompt, ...task.acceptanceCriteria].join("\n");
+    const text = [task.title, task.description, task.aoPrompt, ...task.acceptanceCriteria].join(
+      "\n"
+    );
     if (hasConditionalSkipConvention(text)) {
       return [];
     }
-    return [{
-      path: `tasks.${index}.description`,
-      message: "Conditional manual_gate branch tasks must declare when they run, for example: 仅在上游非 approved 时触发，approved 路径不派发；or pass 路径不派发"
-    }];
+    return [
+      {
+        path: `tasks.${index}.description`,
+        message:
+          "Conditional manual_gate branch tasks must declare when they run, for example: 仅在上游非 approved 时触发，approved 路径不派发；or pass 路径不派发"
+      }
+    ];
   });
 }
 
@@ -324,7 +351,13 @@ function normalizeTask(
   const taskRecord = { ...task };
   const typeResult = normalizeTaskType(task.type);
   if (typeResult.type !== task.type) {
-    addChange(report, path("type"), task.type, typeResult.type, "task type alias normalized to supported enum");
+    addChange(
+      report,
+      path("type"),
+      task.type,
+      typeResult.type,
+      "task type alias normalized to supported enum"
+    );
   }
   taskRecord.type = typeResult.type;
 
@@ -334,7 +367,12 @@ function normalizeTask(
   }
 
   taskRecord.aoRole = normalizeAoRole(task, taskRecord, index, report);
-  taskRecord.executionPolicy = normalizeExecutionPolicy(taskRecord.type, task.executionPolicy, report, path("executionPolicy"));
+  taskRecord.executionPolicy = normalizeExecutionPolicy(
+    taskRecord.type,
+    task.executionPolicy,
+    report,
+    path("executionPolicy")
+  );
   normalizeArtifactContracts(taskRecord, index, report);
   return taskRecord;
 }
@@ -344,118 +382,133 @@ function normalizeArtifactContracts(
   index: number,
   report: TaskPlanNormalizationReport
 ): void {
-  if (Array.isArray(task.inputArtifacts) || Array.isArray(task.outputArtifacts)) {
+  const registry = getArtifactContractRegistry();
+  const registryArtifacts = registry
+    .findContractsForTask(task as unknown as import("../schemas/task-plan.js").ExecutionTask)
+    .map((contract) => registry.toTaskArtifact(contract));
+  const explicitOutputs = Array.isArray(task.outputArtifacts)
+    ? task.outputArtifacts.filter(isArtifactRecord)
+    : [];
+  if (explicitOutputs.length > 0) {
+    const merged = [...explicitOutputs];
+    for (const inferred of registryArtifacts) {
+      const existing = explicitOutputs.find(
+        (artifact) =>
+          artifact.contractId === inferred.contractId ||
+          artifact.kind === inferred.kind ||
+          artifact.path === inferred.path
+      );
+      if (existing && (existing.kind !== inferred.kind || existing.path !== inferred.path)) {
+        report.strictSchemaErrors.push({
+          path: `tasks.${index}.outputArtifacts`,
+          message: `output artifact ${String(existing.kind)} conflicts with registered contract ${inferred.contractId}: expected ${inferred.path}`
+        });
+        continue;
+      }
+      if (!existing) {
+        merged.push(inferred);
+      }
+    }
+    if (JSON.stringify(merged) !== JSON.stringify(explicitOutputs)) {
+      task.outputArtifacts = merged;
+      addChange(
+        report,
+        `tasks.${index}.outputArtifacts`,
+        explicitOutputs,
+        merged,
+        "registered output artifacts merged into explicit outputs"
+      );
+    }
     return;
   }
-  const text = [task.title, task.description, task.aoPrompt, ...(Array.isArray(task.acceptanceCriteria) ? task.acceptanceCriteria : [])]
-    .filter((value): value is string => typeof value === "string")
-    .join("\n");
-  if (/G0|人工复核放行|仓库现实校准|复核失败回流/i.test(text)) {
-    if (/仓库现实校准/.test(text)) {
-      task.outputArtifacts = [
-        { kind: "g0_repo_reality_check", path: "g0_repo_reality_check.json", required: true }
-      ];
-      addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "G0 repository reality check output artifact inferred");
-      return;
-    }
-    if (/人工复核放行/.test(text)) {
-      const dependencyId = Array.isArray(task.dependencies) && typeof task.dependencies[0] === "string" ? task.dependencies[0] : undefined;
-      task.inputArtifacts = dependencyId
-        ? [{ taskId: dependencyId, kind: "g0_repo_reality_check", path: "g0_repo_reality_check.json", required: true }]
-        : [];
-      task.outputArtifacts = [
-        { kind: "g0_review_gate_decision", path: "g0_review_gate_decision.json", required: true },
-        { kind: "g0_approved_flag", path: "g0_approved.flag", requiredWhen: "decision=approved" }
-      ];
-      addChange(report, `tasks.${index}.inputArtifacts`, undefined, task.inputArtifacts, "G0 manual gate input artifact inferred");
-      addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "G0 manual gate output artifacts inferred");
-      return;
-    }
-    if (/复核失败回流/.test(text)) {
-      const dependencyId = Array.isArray(task.dependencies) && typeof task.dependencies[0] === "string" ? task.dependencies[0] : undefined;
-      task.inputArtifacts = dependencyId
-        ? [{ taskId: dependencyId, kind: "g0_review_gate_decision", path: "g0_review_gate_decision.json", required: true }]
-        : [];
-      task.outputArtifacts = [
-        { kind: "g0_replan_request", path: "g0_replan_request.json", required: true }
-      ];
-      addChange(report, `tasks.${index}.inputArtifacts`, undefined, task.inputArtifacts, "G0 replan input artifact inferred");
-      addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "G0 replan output artifact inferred");
-    }
+  if (registryArtifacts.length > 0) {
+    task.outputArtifacts = registryArtifacts;
+    addChange(
+      report,
+      `tasks.${index}.outputArtifacts`,
+      undefined,
+      task.outputArtifacts,
+      "registered output artifacts inferred"
+    );
     return;
   }
-  const manualGateTemplate = manualGateTemplates.find((template) => template.match.test(text));
-  if (manualGateTemplate) {
-    const dependencyId = Array.isArray(task.dependencies) && typeof task.dependencies[0] === "string" ? task.dependencies[0] : undefined;
-    if (manualGateTemplate.input && dependencyId) {
-      task.inputArtifacts = [{
+}
+
+function normalizeDependencyInputArtifacts(
+  tasks: Array<Record<string, unknown>>,
+  report: TaskPlanNormalizationReport
+): void {
+  const byId = new Map(
+    tasks.map((task) => [typeof task.taskId === "string" ? task.taskId : "", task])
+  );
+  for (const [index, task] of tasks.entries()) {
+    const dependencies = Array.isArray(task.dependencies)
+      ? task.dependencies.filter(
+          (dependency): dependency is string => typeof dependency === "string"
+        )
+      : [];
+    const dependencyArtifacts = dependencies.flatMap((dependencyId) => {
+      const dependency = byId.get(dependencyId);
+      if (!dependency || !Array.isArray(dependency.outputArtifacts)) {
+        return [];
+      }
+      return dependency.outputArtifacts.filter(isArtifactRecord).map((artifact) => ({
         taskId: dependencyId,
-        kind: manualGateTemplate.input.kind,
-        path: manualGateTemplate.input.file,
-        required: manualGateTemplate.input.required ?? true
-      }];
-    }
-    task.outputArtifacts = [
-      {
-        kind: manualGateTemplate.decision.kind,
-        path: manualGateTemplate.decision.file,
-        required: manualGateTemplate.decision.required ?? true
-      },
-      {
-        kind: manualGateTemplate.flag.kind,
-        path: manualGateTemplate.flag.file,
-        required: manualGateTemplate.flag.required,
-        requiredWhen: manualGateTemplate.flag.requiredWhen
-      },
-      ...(manualGateTemplate.rework
-        ? [
-          { kind: manualGateTemplate.rework.kind, path: manualGateTemplate.rework.file, requiredWhen: "decision=rework_required" },
-          { kind: `${manualGateTemplate.rework.kind}_rejected`, path: manualGateTemplate.rework.file, requiredWhen: "decision=rejected" }
-        ]
-        : [])
-    ];
-    addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "manual gate output artifacts inferred");
-    return;
-  }
-  for (const template of taskOutputTemplates) {
-    if (template.match.test(text)) {
-      task.outputArtifacts = template.artifacts.map((artifact) => ({
-        kind: artifact.kind,
-        path: artifact.file,
-        required: artifact.required,
-        requiredWhen: artifact.requiredWhen
+        contractId: typeof artifact.contractId === "string" ? artifact.contractId : undefined,
+        kind: String(artifact.kind),
+        path: String(artifact.path),
+        required: typeof artifact.required === "boolean" ? artifact.required : undefined,
+        requiredWhen: typeof artifact.requiredWhen === "string" ? artifact.requiredWhen : undefined
       }));
-      addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "domain output artifacts inferred");
-      return;
+    });
+    if (dependencyArtifacts.length === 0) {
+      continue;
+    }
+    const explicit = Array.isArray(task.inputArtifacts)
+      ? task.inputArtifacts.filter(isArtifactRecord)
+      : [];
+    const merged = [...explicit];
+    for (const artifact of dependencyArtifacts) {
+      const duplicate = merged.some(
+        (item) =>
+          item.taskId === artifact.taskId &&
+          item.kind === artifact.kind &&
+          item.path === artifact.path
+      );
+      const sameKindConflict = merged.some(
+        (item) =>
+          item.taskId === artifact.taskId &&
+          item.kind === artifact.kind &&
+          item.path !== artifact.path
+      );
+      if (sameKindConflict) {
+        report.strictSchemaErrors.push({
+          path: `tasks.${index}.inputArtifacts`,
+          message: `input artifact ${artifact.kind} from ${artifact.taskId} conflicts with dependency output path ${artifact.path}`
+        });
+        continue;
+      }
+      if (!duplicate) {
+        merged.push(artifact);
+      }
+    }
+    if (JSON.stringify(merged) !== JSON.stringify(explicit)) {
+      task.inputArtifacts = merged;
+      addChange(
+        report,
+        `tasks.${index}.inputArtifacts`,
+        explicit.length ? explicit : undefined,
+        merged,
+        "dependency output artifacts merged into task inputs"
+      );
     }
   }
-  if (/planning gate|task plan gate|任务计划.*门禁|计划.*审批/i.test(text)) {
-    task.outputArtifacts = [
-      { kind: "task_plan_approval_report", path: "task-plan-approval-report.json", required: true }
-    ];
-    addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "task-plan gate output artifact inferred");
-    return;
-  }
-  if (/contract freeze|契约冻结/i.test(text)) {
-    task.outputArtifacts = [
-      { kind: "contract_freeze_evidence", path: "contract-freeze-evidence.json", required: true }
-    ];
-    addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "contract freeze output artifact inferred");
-    return;
-  }
-  if (/(^|\n)(QA verdict|Write QA verdict)|产出\s*qa_verdict\.json|QA verdict.*裁决/i.test(text)) {
-    task.outputArtifacts = [
-      { kind: "qa_verdict", path: "qa_verdict.json", required: true }
-    ];
-    addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "QA verdict output artifact inferred");
-    return;
-  }
-  if (/release decision|发布.*决策文件/i.test(text)) {
-    task.outputArtifacts = [
-      { kind: "release_decision", path: "release_decision.json", required: true }
-    ];
-    addChange(report, `tasks.${index}.outputArtifacts`, undefined, task.outputArtifacts, "release decision output artifact inferred");
-  }
+}
+
+function isArtifactRecord(
+  value: unknown
+): value is Record<string, unknown> & { kind: string; path: string } {
+  return isRecord(value) && typeof value.kind === "string" && typeof value.path === "string";
 }
 
 function normalizeTaskType(value: unknown): { type: unknown; phase?: string } {
@@ -511,14 +564,26 @@ function normalizeAoRole(
     if (normalizedTask.phase === undefined || !isKnownTaskPhase(normalizedTask.phase)) {
       const previousPhase = normalizedTask.phase;
       normalizedTask.phase = normalized;
-      addChange(report, `tasks.${index}.phase`, previousPhase, normalized, "phase-like AO role moved to task phase");
+      addChange(
+        report,
+        `tasks.${index}.phase`,
+        previousPhase,
+        normalized,
+        "phase-like AO role moved to task phase"
+      );
     }
     const inferred = inferAoRoleFromTask({
       ...rawTask,
       ...normalizedTask,
       aoRole: rawRole
     });
-    addChange(report, path, rawRole, inferred, "phase-like AO role replaced with inferred execution role");
+    addChange(
+      report,
+      path,
+      rawRole,
+      inferred,
+      "phase-like AO role replaced with inferred execution role"
+    );
     return inferred;
   }
 
@@ -568,27 +633,44 @@ function normalizeDesignCoverageTrace(
       return [];
     }
     if (requirementId !== trace.requirementId) {
-      addChange(report, `designCoverageTrace.${index}.requirementId`, trace.requirementId, requirementId, "requirementId alias or text inference applied");
+      addChange(
+        report,
+        `designCoverageTrace.${index}.requirementId`,
+        trace.requirementId,
+        requirementId,
+        "requirementId alias or text inference applied"
+      );
     }
 
-    return [{
-      requirementId,
-      requirement: firstString(trace.requirement, trace.title, trace.description, requirementId) ?? requirementId,
-      source: firstString(trace.source, trace.sourceRef, trace.section, trace.quote, "approvedDesign") ?? "approvedDesign",
-      status: normalizeDesignCoverageStatus(trace.status),
-      evidenceTaskIds: normalizeEvidenceTaskIds(
-        taskIds,
-        report,
-        `designCoverageTrace.${index}.evidenceTaskIds`,
-        trace.evidenceTaskIds,
-        trace.taskIds,
-        trace.evidenceTasks,
-        trace.taskId
-      ),
-      ...(typeof trace.rationale === "string" && trace.rationale.trim()
-        ? { rationale: trace.rationale.trim() }
-        : {})
-    }];
+    return [
+      {
+        requirementId,
+        requirement:
+          firstString(trace.requirement, trace.title, trace.description, requirementId) ??
+          requirementId,
+        source:
+          firstString(
+            trace.source,
+            trace.sourceRef,
+            trace.section,
+            trace.quote,
+            "approvedDesign"
+          ) ?? "approvedDesign",
+        status: normalizeDesignCoverageStatus(trace.status),
+        evidenceTaskIds: normalizeEvidenceTaskIds(
+          taskIds,
+          report,
+          `designCoverageTrace.${index}.evidenceTaskIds`,
+          trace.evidenceTaskIds,
+          trace.taskIds,
+          trace.evidenceTasks,
+          trace.taskId
+        ),
+        ...(typeof trace.rationale === "string" && trace.rationale.trim()
+          ? { rationale: trace.rationale.trim() }
+          : {})
+      }
+    ];
   });
 
   return normalized.length > 0 ? normalized : undefined;
@@ -636,7 +718,13 @@ function normalizeExecutionPolicy(
 
   const fallback = getExecutionPolicyForTaskType(type);
   if (!isRecord(policy)) {
-    addChange(report, path, policy, fallback, "executionPolicy missing or invalid; task-type default applied");
+    addChange(
+      report,
+      path,
+      policy,
+      fallback,
+      "executionPolicy missing or invalid; task-type default applied"
+    );
     return { ...fallback };
   }
 
@@ -660,10 +748,19 @@ function normalizeExecutionPolicy(
   }
 
   const candidate: ExecutionPolicy = {
-    developerSelfTestRequired: normalizeBooleanPolicyField(normalized.developerSelfTestRequired, fallback.developerSelfTestRequired),
+    developerSelfTestRequired: normalizeBooleanPolicyField(
+      normalized.developerSelfTestRequired,
+      fallback.developerSelfTestRequired
+    ),
     qaRequired: normalizeBooleanPolicyField(normalized.qaRequired, fallback.qaRequired),
-    regressionRequired: normalizeBooleanPolicyField(normalized.regressionRequired, fallback.regressionRequired),
-    reviewerRequired: normalizeBooleanPolicyField(normalized.reviewerRequired, fallback.reviewerRequired),
+    regressionRequired: normalizeBooleanPolicyField(
+      normalized.regressionRequired,
+      fallback.regressionRequired
+    ),
+    reviewerRequired: normalizeBooleanPolicyField(
+      normalized.reviewerRequired,
+      fallback.reviewerRequired
+    ),
     maxQaRounds: normalizeRoundLimit(normalized.maxQaRounds, fallback.maxQaRounds),
     maxReviewRounds: normalizeRoundLimit(normalized.maxReviewRounds, fallback.maxReviewRounds),
     requirePrOrRp: normalizeBooleanPolicyField(normalized.requirePrOrRp, fallback.requirePrOrRp)
@@ -680,8 +777,13 @@ function normalizeBooleanPolicyField(value: unknown, fallback: boolean): boolean
   return typeof value === "boolean" ? value : fallback;
 }
 
-function normalizeRoundLimit(value: unknown, fallback: ExecutionPolicy["maxQaRounds"]): ExecutionPolicy["maxQaRounds"] {
-  return roundLimits.has(Number(value)) ? (Number(value) as ExecutionPolicy["maxQaRounds"]) : fallback;
+function normalizeRoundLimit(
+  value: unknown,
+  fallback: ExecutionPolicy["maxQaRounds"]
+): ExecutionPolicy["maxQaRounds"] {
+  return roundLimits.has(Number(value))
+    ? (Number(value) as ExecutionPolicy["maxQaRounds"])
+    : fallback;
 }
 
 function inferAoRoleFromTask(task: Record<string, unknown>): AoRole {
@@ -701,7 +803,10 @@ function inferAoRoleFromTask(task: Record<string, unknown>): AoRole {
     return "backend-senior";
   }
 
-  const text = [task.title, task.description, task.aoPrompt].filter((value): value is string => typeof value === "string").join("\n").toLowerCase();
+  const text = [task.title, task.description, task.aoPrompt]
+    .filter((value): value is string => typeof value === "string")
+    .join("\n")
+    .toLowerCase();
   if (/review|审核|复核|放行/.test(text)) {
     return "reviewer";
   }
@@ -722,7 +827,16 @@ function inferKnownRequirementId(...values: unknown[]): string | undefined {
   if (!text.trim()) {
     return undefined;
   }
-  if (containsAny(text, ["G0", "Repo Reality Check", "仓库现实", "仓库校准", "预实施冻结", "人工复核"])) {
+  if (
+    containsAny(text, [
+      "G0",
+      "Repo Reality Check",
+      "仓库现实",
+      "仓库校准",
+      "预实施冻结",
+      "人工复核"
+    ])
+  ) {
     return "g0-readiness-gate";
   }
   if (containsAny(text, ["JDK 21", "JAR", "依赖调用", "Gradle", "Maven"])) {
@@ -740,7 +854,10 @@ function inferKnownRequirementId(...values: unknown[]): string | undefined {
   return undefined;
 }
 
-function createBaseReport(raw: unknown, context: TaskPlanNormalizationContext): TaskPlanNormalizationReport {
+function createBaseReport(
+  raw: unknown,
+  context: TaskPlanNormalizationContext
+): TaskPlanNormalizationReport {
   return {
     workflowId: context.workflowId ?? inferWorkflowId(raw),
     round: context.round ?? 0,
@@ -786,7 +903,9 @@ function formatNormalizationErrors(errors: TaskPlanNormalizationIssue[]): string
 }
 
 function firstString(...values: unknown[]): string | undefined {
-  return values.find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim();
+  return values
+    .find((value): value is string => typeof value === "string" && value.trim().length > 0)
+    ?.trim();
 }
 
 function normalizeToken(value: unknown): string | undefined {
@@ -799,8 +918,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isKnownTaskType(type: unknown): type is Parameters<typeof getExecutionPolicyForTaskType>[0] {
-  return typeof type === "string" && knownTaskTypes.has(type as Parameters<typeof getExecutionPolicyForTaskType>[0]);
+function isKnownTaskType(
+  type: unknown
+): type is Parameters<typeof getExecutionPolicyForTaskType>[0] {
+  return (
+    typeof type === "string" &&
+    knownTaskTypes.has(type as Parameters<typeof getExecutionPolicyForTaskType>[0])
+  );
 }
 
 function isKnownTaskPhase(value: unknown): value is z.infer<typeof taskPhaseSchema> {

@@ -1,10 +1,23 @@
 import { access, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, normalize, resolve } from "node:path";
 import type { ExecutionTask, TaskArtifact, TaskPlan } from "../schemas/task-plan.js";
-import { manualGateTemplates, taskOutputTemplates, type ManualGateTemplate } from "./task-artifact-templates.js";
+import {
+  getCandidatePaths,
+  getCompletionChecks,
+  getArtifactContractRegistry,
+  getRequiredJsonFields,
+  serializeTaskMatcher,
+  type ArtifactCandidatePath,
+  type ArtifactContract,
+  type ArtifactCompletionCheck,
+  type ArtifactFlagOwnershipContract,
+  type ArtifactMarkdownOwnershipContract,
+  type ArtifactOwnershipContract
+} from "./artifact-contract-registry.js";
 import type { ExecutionState } from "./execution-state-store.js";
 
 export interface ResolvedArtifact {
+  contractId?: string;
   kind: string;
   path: string;
   taskId?: string;
@@ -16,7 +29,12 @@ export interface MissingArtifact {
   kind: string;
   path: string;
   taskId?: string;
-  reason?: "missing" | "decision_missing" | "decision_invalid" | "required_when_invalid" | "required_when_unmet";
+  reason?:
+    | "missing"
+    | "decision_missing"
+    | "decision_invalid"
+    | "required_when_invalid"
+    | "required_when_unmet";
 }
 
 export interface ConflictArtifact {
@@ -46,7 +64,29 @@ export interface DispatchContextManifest {
     artifacts: ResolvedArtifact[];
   }>;
   expectedOutputs: ResolvedArtifact[];
+  artifactContracts: DispatchArtifactContract[];
   instructions: string[];
+}
+
+export interface DispatchArtifactContract {
+  contractId: string;
+  kind: string;
+  canonicalPath: string;
+  contentType: string;
+  required: boolean;
+  requiredWhen?: string;
+  producer: {
+    taskMatcher: string;
+    taskType?: ArtifactContract["producer"]["taskType"];
+    dependencyCondition?: ArtifactContract["producer"]["dependencyCondition"];
+    expectedPlanVersion?: ArtifactContract["producer"]["expectedPlanVersion"];
+  };
+  ownership: ArtifactOwnershipContract;
+  markdownOwnership?: ArtifactMarkdownOwnershipContract;
+  flagOwnership?: ArtifactFlagOwnershipContract;
+  requiredJsonFields: string[];
+  completionChecks: ArtifactCompletionCheck[];
+  candidatePaths: Array<ArtifactCandidatePath & { absolutePath: string }>;
 }
 
 export interface BuiltDispatchContext {
@@ -84,10 +124,12 @@ const dispatchInstructions = [
   "Expected outputs are files you must create for this task; their absence before the task starts is normal.",
   "Do not treat a missing expected output as missing input.",
   "Write every required expected output to the exact absolute expectedOutputs.path shown in this prompt and manifest.",
+  "The artifactContracts section is machine-readable; canonicalPath is the required control-plane output and mirror paths are optional copies only.",
+  "If you write a mirror artifact under docs/, schemas/, or config/, also write the canonical artifact before reporting completed.",
   "Do not write control-plane outputs only under your AO worktree.",
   "Before reporting completed, verify every required expectedOutputs.path exists in the canonical artifactDir.",
   "If you accidentally wrote an output under your worktree .ao-control-plane, copy it to the exact expectedOutputs.path before reporting completed.",
-  "For AO review manual gates, gate decision JSON must use source=\"ao_review\" and include your AO session id as aoSessionId."
+  'For AO review manual gates, gate decision JSON must use source="ao_review" and include your AO session id as aoSessionId.'
 ] as const;
 
 export async function buildAoDispatchContext(input: {
@@ -121,7 +163,9 @@ export async function buildAoDispatchContext(input: {
     `dispatchContextManifest: ${contextPath}`,
     "",
     "coreInputs: control-plane inputs",
-    ...manifest.coreInputs.map((artifact, index) => `${index + 1}. INPUT ${formatArtifactForPrompt(artifact)}`),
+    ...manifest.coreInputs.map(
+      (artifact, index) => `${index + 1}. INPUT ${formatArtifactForPrompt(artifact)}`
+    ),
     "",
     "dependencyArtifacts: required task inputs; read before asking for user help",
     ...manifest.dependencyArtifacts.flatMap((dependency) => [
@@ -130,7 +174,23 @@ export async function buildAoDispatchContext(input: {
     ]),
     "",
     "expectedOutputs: task outputs to create; absence before task execution is normal",
-    ...manifest.expectedOutputs.map((artifact, index) => `${index + 1}. OUTPUT ${formatArtifactForPrompt(artifact)}`),
+    ...manifest.expectedOutputs.map(
+      (artifact, index) => `${index + 1}. OUTPUT ${formatArtifactForPrompt(artifact)}`
+    ),
+    "",
+    "artifactContracts: canonical output rules",
+    ...manifest.artifactContracts.flatMap((contract, index) => [
+      `${index + 1}. ${contract.contractId}: canonical=${contract.canonicalPath}, contentType=${contract.contentType}`,
+      `  - producer=${contract.producer.taskMatcher}, requiredJsonFields=${contract.requiredJsonFields.join(",") || "-"}`,
+      `  - ownership=${contract.ownership.requiredFields.join(",") || "-"}, sessionField=${contract.ownership.sessionField ?? "-"}`,
+      `  - completionChecks=${contract.completionChecks.join(",")}`,
+      ...contract.candidatePaths
+        .filter((candidate) => candidate.purpose !== "primary")
+        .map(
+          (candidate) =>
+            `  - allowed ${candidate.purpose}: ${candidate.relativeTo}:${candidate.file} => ${candidate.absolutePath}`
+        )
+    ]),
     "",
     "instructions:",
     ...dispatchInstructions.map((instruction, index) => `${index + 1}. ${instruction}`),
@@ -140,7 +200,11 @@ export async function buildAoDispatchContext(input: {
   return { prompt, manifest, contextPath, missingRequiredArtifacts };
 }
 
-export function getDispatchContextPath(artifactDir: string, taskId: string, attempt: number): string {
+export function getDispatchContextPath(
+  artifactDir: string,
+  taskId: string,
+  attempt: number
+): string {
   return join(
     artifactDir,
     "dispatch-context",
@@ -158,6 +222,42 @@ export function buildDispatchManifest(input: {
   const artifactDir = normalize(input.artifactDir);
   const inputArtifacts = resolveInputArtifacts(input.task, input.plan, artifactDir);
   const outputArtifacts = resolveOutputArtifacts(input.task, artifactDir);
+  const registry = getArtifactContractRegistry();
+  const artifactContracts = outputArtifacts.flatMap((artifact) => {
+    const contract = registry.resolveContractForArtifact({
+      contractId: artifact.contractId,
+      kind: artifact.kind,
+      path: artifact.path
+    });
+    return contract
+      ? [
+          {
+            contractId: contract.id,
+            kind: contract.kind,
+            canonicalPath: join(artifactDir, contract.canonicalFile),
+            contentType: contract.contentType,
+            required: contract.required,
+            requiredWhen: contract.requiredWhen,
+            producer: {
+              taskMatcher: serializeTaskMatcher(contract.producer.taskMatcher),
+              taskType: contract.producer.taskType,
+              dependencyCondition: contract.producer.dependencyCondition,
+              expectedPlanVersion: contract.producer.expectedPlanVersion
+            },
+            ownership: contract.ownership,
+            markdownOwnership: contract.markdownOwnership,
+            flagOwnership: contract.flagOwnership,
+            requiredJsonFields: getRequiredJsonFields(contract),
+            completionChecks: getCompletionChecks(contract),
+            candidatePaths: getCandidatePaths(contract, {
+              artifactDir,
+              projectRoot: input.projectRoot,
+              workflowId: input.plan.workflowId
+            })
+          }
+        ]
+      : [];
+  });
   return {
     workflowId: input.plan.workflowId,
     taskId: input.task.taskId,
@@ -178,6 +278,7 @@ export function buildDispatchManifest(input: {
       };
     }),
     expectedOutputs: outputArtifacts,
+    artifactContracts,
     instructions: [...dispatchInstructions]
   };
 }
@@ -193,11 +294,13 @@ export async function synthesizeManualGateArtifacts(input: {
   const artifactDir = normalize(input.artifactDir);
   const { decisionPath, flagPath } = getManualGateArtifactPaths(input.task, artifactDir);
   const now = new Date().toISOString();
-  const dependencyEvidence = resolveInputArtifacts(input.task, input.plan, artifactDir).map((artifact) => ({
-    taskId: artifact.taskId,
-    kind: artifact.kind,
-    path: artifact.path
-  }));
+  const dependencyEvidence = resolveInputArtifacts(input.task, input.plan, artifactDir).map(
+    (artifact) => ({
+      taskId: artifact.taskId,
+      kind: artifact.kind,
+      path: artifact.path
+    })
+  );
   const decision = {
     workflowId: input.plan.workflowId,
     taskId: input.task.taskId,
@@ -212,12 +315,15 @@ export async function synthesizeManualGateArtifacts(input: {
   try {
     await atomicWriteJson(decisionPath, decision);
     writtenPaths.push(decisionPath);
-    await atomicWriteText(flagPath, [
-      "approved",
-      `workflowId=${input.plan.workflowId}`,
-      `taskId=${input.task.taskId}`,
-      `decidedAt=${now}`
-    ].join("\n") + "\n");
+    await atomicWriteText(
+      flagPath,
+      [
+        "approved",
+        `workflowId=${input.plan.workflowId}`,
+        `taskId=${input.task.taskId}`,
+        `decidedAt=${now}`
+      ].join("\n") + "\n"
+    );
     writtenPaths.push(flagPath);
   } catch (error) {
     await cleanupFiles(writtenPaths);
@@ -250,7 +356,9 @@ export async function findExistingManualGateArtifacts(input: {
   try {
     decision = JSON.parse(await readFile(decisionPath, "utf8")) as Record<string, unknown>;
   } catch (error) {
-    throw new Error(`Existing manual gate decision is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(
+      `Existing manual gate decision is not valid JSON: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
   if (
     decision.workflowId !== input.plan.workflowId ||
@@ -258,7 +366,9 @@ export async function findExistingManualGateArtifacts(input: {
     decision.decision !== "approved" ||
     decision.source !== "control_plane_manual_gate"
   ) {
-    throw new Error(`Existing manual gate decision does not match ${input.plan.workflowId} / ${input.task.taskId}`);
+    throw new Error(
+      `Existing manual gate decision does not match ${input.plan.workflowId} / ${input.task.taskId}`
+    );
   }
   const writtenPaths = [decisionPath, ...(flagPath ? [flagPath] : [])];
   return {
@@ -274,7 +384,9 @@ export async function cleanupFiles(files: string[]): Promise<void> {
   await Promise.all(files.map((file) => rm(file, { force: true }).catch(() => undefined)));
 }
 
-export async function findMissingRequiredArtifacts(artifacts: ResolvedArtifact[]): Promise<MissingArtifact[]> {
+export async function findMissingRequiredArtifacts(
+  artifacts: ResolvedArtifact[]
+): Promise<MissingArtifact[]> {
   const missing: MissingArtifact[] = [];
   for (const artifact of artifacts) {
     if (!artifact.required) {
@@ -283,7 +395,12 @@ export async function findMissingRequiredArtifacts(artifacts: ResolvedArtifact[]
     try {
       await access(artifact.path);
     } catch {
-      missing.push({ kind: artifact.kind, path: artifact.path, taskId: artifact.taskId, reason: "missing" });
+      missing.push({
+        kind: artifact.kind,
+        path: artifact.path,
+        taskId: artifact.taskId,
+        reason: "missing"
+      });
     }
   }
   return missing;
@@ -296,17 +413,26 @@ export async function validateTaskOutputArtifacts(input: {
   aoSessionId?: string;
 }): Promise<ArtifactValidationResult> {
   const outputs = resolveOutputArtifacts(input.task, input.artifactDir);
-  const missing = await findMissingRequiredArtifacts(outputs.filter((artifact) => artifact.required));
+  const missing = await findMissingRequiredArtifacts(
+    outputs.filter((artifact) => artifact.required)
+  );
   const conflicts: ConflictArtifact[] = [];
   const conditionalOutputs = outputs.filter((artifact) => artifact.requiredWhen);
-  const decisionArtifact = outputs.find((artifact) => isDecisionArtifactKind(artifact.kind) || artifact.kind.includes("verdict"));
+  const decisionArtifact = outputs.find(
+    (artifact) => isDecisionArtifactKind(artifact.kind) || artifact.kind.includes("verdict")
+  );
   let decision: Record<string, unknown> | undefined;
 
   if (decisionArtifact) {
     try {
-      decision = JSON.parse(await readFile(decisionArtifact.path, "utf8")) as Record<string, unknown>;
+      decision = JSON.parse(await readFile(decisionArtifact.path, "utf8")) as Record<
+        string,
+        unknown
+      >;
     } catch (error) {
-      const alreadyMissingDecision = missing.some((artifact) => artifact.path === decisionArtifact.path);
+      const alreadyMissingDecision = missing.some(
+        (artifact) => artifact.path === decisionArtifact.path
+      );
       if (!alreadyMissingDecision) {
         missing.push({
           kind: decisionArtifact.kind,
@@ -317,21 +443,25 @@ export async function validateTaskOutputArtifacts(input: {
       }
     }
   } else if (conditionalOutputs.length > 0) {
-    missing.push(...conditionalOutputs.map((artifact) => ({
-      kind: artifact.kind,
-      path: artifact.path,
-      taskId: artifact.taskId,
-      reason: "decision_missing" as const
-    })));
+    missing.push(
+      ...conditionalOutputs.map((artifact) => ({
+        kind: artifact.kind,
+        path: artifact.path,
+        taskId: artifact.taskId,
+        reason: "decision_missing" as const
+      }))
+    );
   }
 
   if (decision && decisionArtifact) {
-    conflicts.push(...validateDecisionSource({
-      decision,
-      decisionArtifact,
-      manualGateMode: input.manualGateMode,
-      aoSessionId: input.aoSessionId
-    }));
+    conflicts.push(
+      ...validateDecisionSource({
+        decision,
+        decisionArtifact,
+        manualGateMode: input.manualGateMode,
+        aoSessionId: input.aoSessionId
+      })
+    );
   }
 
   if (!decision) {
@@ -342,7 +472,12 @@ export async function validateTaskOutputArtifacts(input: {
   for (const artifact of conditionalOutputs) {
     const evaluation = evaluateRequiredWhen(artifact.requiredWhen ?? "", decision);
     if (evaluation === "invalid") {
-      missing.push({ kind: artifact.kind, path: artifact.path, taskId: artifact.taskId, reason: "required_when_invalid" });
+      missing.push({
+        kind: artifact.kind,
+        path: artifact.path,
+        taskId: artifact.taskId,
+        reason: "required_when_invalid"
+      });
     } else if (evaluation) {
       requiredByCondition.push(artifact);
     }
@@ -350,7 +485,9 @@ export async function validateTaskOutputArtifacts(input: {
   return {
     missingArtifacts: [
       ...missing,
-      ...await findMissingRequiredArtifacts(requiredByCondition.map((artifact) => ({ ...artifact, required: true })))
+      ...(await findMissingRequiredArtifacts(
+        requiredByCondition.map((artifact) => ({ ...artifact, required: true }))
+      ))
     ],
     conflictArtifacts: conflicts
   };
@@ -361,12 +498,10 @@ export function resolveInputArtifacts(
   plan: TaskPlan,
   artifactDir: string
 ): ResolvedArtifact[] {
-  const explicit = (task.inputArtifacts ?? []).map((artifact) => resolveArtifact(artifact, artifactDir));
-  if (explicit.length > 0) {
-    return explicit;
-  }
-
-  return task.dependencies.flatMap((dependencyId) => {
+  const explicit = (task.inputArtifacts ?? []).map((artifact) =>
+    resolveArtifact(artifact, artifactDir)
+  );
+  const dependencyOutputs = task.dependencies.flatMap((dependencyId) => {
     const dependencyTask = plan.tasks.find((item) => item.taskId === dependencyId);
     if (!dependencyTask) {
       return [];
@@ -376,65 +511,47 @@ export function resolveInputArtifacts(
       taskId: dependencyId
     }));
   });
-}
-
-export function resolveOutputArtifacts(task: ExecutionTask, artifactDir: string): ResolvedArtifact[] {
-  const explicit = (task.outputArtifacts ?? []).map((artifact) => resolveArtifact(artifact, artifactDir));
-  if (explicit.length > 0) {
-    return explicit;
-  }
-
-  const text = taskText(task);
-  const manualGate = inferManualGateTemplate(text);
-  if (manualGate) {
-    return [
-      { kind: manualGate.decision.kind, path: join(artifactDir, manualGate.decision.file), required: manualGate.decision.required ?? true },
-      { kind: manualGate.flag.kind, path: join(artifactDir, manualGate.flag.file), required: manualGate.flag.required ?? false, requiredWhen: manualGate.flag.requiredWhen },
-      ...(manualGate.rework
-        ? [
-          { kind: manualGate.rework.kind, path: join(artifactDir, manualGate.rework.file), required: false, requiredWhen: "decision=rework_required" },
-          { kind: `${manualGate.rework.kind}_rejected`, path: join(artifactDir, manualGate.rework.file), required: false, requiredWhen: "decision=rejected" }
-        ]
-        : [])
-    ];
-  }
-  for (const template of taskOutputTemplates) {
-    if (template.match.test(text)) {
-      return template.artifacts.map((artifact) => ({
-        kind: artifact.kind,
-        path: join(artifactDir, artifact.file),
-        required: artifact.required ?? true,
-        requiredWhen: artifact.requiredWhen
-      }));
+  const merged = [...explicit];
+  for (const artifact of dependencyOutputs) {
+    if (
+      !merged.some(
+        (item) =>
+          item.taskId === artifact.taskId &&
+          item.kind === artifact.kind &&
+          item.path === artifact.path
+      )
+    ) {
+      merged.push(artifact);
     }
   }
-  if (/复核失败回流/.test(text)) {
-    return [{ kind: "g0_replan_request", path: join(artifactDir, "g0_replan_request.json"), required: true }];
-  }
-  if (/(^|\n)(QA verdict|Write QA verdict)|产出\s*qa_verdict\.json|QA verdict.*裁决/i.test(text)) {
-    return [{ kind: "qa_verdict", path: join(artifactDir, "qa_verdict.json"), required: true }];
-  }
-  if (/planning gate|task plan gate|任务计划.*门禁|计划.*审批/i.test(text)) {
-    return [{ kind: "task_plan_approval_report", path: join(artifactDir, "task-plan-approval-report.json"), required: true }];
-  }
-  if (/contract freeze|契约冻结/i.test(text)) {
-    return [{ kind: "contract_freeze_evidence", path: join(artifactDir, "contract-freeze-evidence.json"), required: true }];
-  }
-  if (/release decision|发布.*决策文件/i.test(text)) {
-    return [{ kind: "release_decision", path: join(artifactDir, "release_decision.json"), required: true }];
+  return merged;
+}
+
+export function resolveOutputArtifacts(
+  task: ExecutionTask,
+  artifactDir: string
+): ResolvedArtifact[] {
+  const explicit = (task.outputArtifacts ?? []).map((artifact) =>
+    resolveArtifact(artifact, artifactDir)
+  );
+  if (explicit.length > 0) {
+    return explicit;
   }
   return [];
 }
 
 function resolveArtifact(artifact: TaskArtifact, artifactDir: string): ResolvedArtifact {
-  const path = artifact.path.match(/^[a-zA-Z]:[\\/]/) || artifact.path.startsWith("/")
-    ? normalize(artifact.path)
-    : normalize(resolve(artifactDir, artifact.path));
+  const path =
+    artifact.path.match(/^[a-zA-Z]:[\\/]/) || artifact.path.startsWith("/")
+      ? normalize(artifact.path)
+      : normalize(resolve(artifactDir, artifact.path));
   return {
+    contractId: artifact.contractId,
     kind: artifact.kind,
     path,
     taskId: artifact.taskId,
-    required: artifact.required ?? artifact.requiredOnSuccess ?? artifact.requiredWhen === undefined,
+    required:
+      artifact.required ?? artifact.requiredOnSuccess ?? artifact.requiredWhen === undefined,
     requiredWhen: artifact.requiredWhen
   };
 }
@@ -446,12 +563,17 @@ function formatArtifactForPrompt(artifact: ResolvedArtifact): string {
   return `${artifact.kind}: ${artifact.path} (${requirement})`;
 }
 
-function getManualGateArtifactPaths(task: ExecutionTask, artifactDir: string): { decisionPath: string; flagPath: string } {
+function getManualGateArtifactPaths(
+  task: ExecutionTask,
+  artifactDir: string
+): { decisionPath: string; flagPath: string } {
   const outputs = resolveOutputArtifacts(task, artifactDir);
   return {
-    decisionPath: outputs.find((artifact) => isDecisionArtifactKind(artifact.kind))?.path ??
+    decisionPath:
+      outputs.find((artifact) => isDecisionArtifactKind(artifact.kind))?.path ??
       join(artifactDir, `${task.taskId.toLowerCase()}_gate_decision.json`),
-    flagPath: outputs.find((artifact) => isFlagArtifactKind(artifact.kind))?.path ??
+    flagPath:
+      outputs.find((artifact) => isFlagArtifactKind(artifact.kind))?.path ??
       join(artifactDir, `${task.taskId.toLowerCase()}_approved.flag`)
   };
 }
@@ -465,14 +587,22 @@ async function fileExists(file: string): Promise<boolean> {
   }
 }
 
-function evaluateRequiredWhen(expression: string, decision: Record<string, unknown>): boolean | "invalid" {
+function evaluateRequiredWhen(
+  expression: string,
+  decision: Record<string, unknown>
+): boolean | "invalid" {
   const parts = expression.split("&&").map((part) => part.trim());
   if (parts.length === 0 || parts.some((part) => part.length === 0)) {
     return "invalid";
   }
   for (const part of parts) {
     const [field, expected, ...rest] = part.split("=");
-    if (!field?.trim() || expected === undefined || expected.trim().length === 0 || rest.length > 0) {
+    if (
+      !field?.trim() ||
+      expected === undefined ||
+      expected.trim().length === 0 ||
+      rest.length > 0
+    ) {
       return "invalid";
     }
     if (String(decision[field.trim()] ?? "") !== expected.trim()) {
@@ -493,7 +623,8 @@ function validateDecisionSource(input: {
   }
   const conflicts: ConflictArtifact[] = [];
   const source = typeof input.decision.source === "string" ? input.decision.source : undefined;
-  const expectedSource = input.manualGateMode === "ao_review" ? "ao_review" : "control_plane_manual_gate";
+  const expectedSource =
+    input.manualGateMode === "ao_review" ? "ao_review" : "control_plane_manual_gate";
   if (source !== expectedSource) {
     conflicts.push({
       kind: input.decisionArtifact.kind,
@@ -505,7 +636,8 @@ function validateDecisionSource(input: {
     });
   }
   if (input.manualGateMode === "ao_review") {
-    const aoSessionId = typeof input.decision.aoSessionId === "string" ? input.decision.aoSessionId : undefined;
+    const aoSessionId =
+      typeof input.decision.aoSessionId === "string" ? input.decision.aoSessionId : undefined;
     if (aoSessionId !== input.aoSessionId) {
       conflicts.push({
         kind: input.decisionArtifact.kind,
@@ -521,23 +653,17 @@ function validateDecisionSource(input: {
 }
 
 function isDecisionArtifactKind(kind: string): boolean {
-  return /(^|_)(gate_)?decision$/.test(kind) ||
+  return (
+    /(^|_)(gate_)?decision$/.test(kind) ||
     kind.includes("decision") ||
     kind.includes("verdict") ||
     kind.includes("决策") ||
-    kind.includes("裁决");
+    kind.includes("裁决")
+  );
 }
 
 function isFlagArtifactKind(kind: string): boolean {
   return /(^|_)flag$/.test(kind) || kind.includes("flag") || kind.includes("标记");
-}
-
-function inferManualGateTemplate(text: string): ManualGateTemplate | undefined {
-  return manualGateTemplates.find((template) => template.match.test(text));
-}
-
-function taskText(task: ExecutionTask): string {
-  return [task.title, task.description, task.aoPrompt, ...task.acceptanceCriteria].join("\n");
 }
 
 async function atomicWriteJson(file: string, value: unknown): Promise<void> {

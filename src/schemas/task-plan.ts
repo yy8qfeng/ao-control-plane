@@ -57,6 +57,7 @@ export const designCoverageTraceSchema = z.object({
 
 export const taskArtifactSchema = z.object({
   taskId: z.string().min(1).optional(),
+  contractId: z.string().min(1).optional(),
   kind: z.string().min(1),
   path: z.string().min(1),
   required: z.boolean().optional(),
@@ -110,7 +111,8 @@ export const executionTaskSchema = z
       context.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["acceptanceCriteria"],
-        message: "Execution tasks should be fine-grained; split tasks with more than 7 acceptance criteria"
+        message:
+          "Execution tasks should be fine-grained; split tasks with more than 7 acceptance criteria"
       });
     }
 

@@ -60,7 +60,12 @@ type DispatchDecision =
   | { action: "waiting_manual_gate" | "failed" | "paused"; taskId?: string };
 
 interface OutputValidationFailure {
-  kind: "artifact_output_missing" | "artifact_output_conflict" | "artifact_output_reconcile_failed";
+  kind:
+    | "artifact_output_missing"
+    | "artifact_output_conflict"
+    | "artifact_output_reconcile_failed"
+    | "artifact_output_ambiguous"
+    | "artifact_contract_violation";
   missingArtifacts: MissingArtifact[];
   conflictArtifacts: ConflictArtifact[];
   reconcileResult?: ArtifactReconcileResult;
@@ -317,6 +322,20 @@ export class ContinuousExecutionRunner {
         actor: "runner",
         dispatchContextPath
       });
+      if (context.manifest.artifactContracts.length > 0) {
+        await this.options.store.appendLog(this.options.workflowId, {
+          type: "artifact_contract_resolved",
+          taskId: task.taskId,
+          attempt,
+          actor: "runner",
+          contracts: context.manifest.artifactContracts.map((contract) => ({
+            contractId: contract.contractId,
+            canonicalPath: contract.canonicalPath,
+            required: contract.required,
+            requiredWhen: contract.requiredWhen
+          }))
+        });
+      }
       if (context.missingRequiredArtifacts.length > 0) {
         throw new ArtifactContextMissingError(context.missingRequiredArtifacts);
       }
@@ -597,11 +616,7 @@ export class ContinuousExecutionRunner {
     }
     for (const [taskId, failure] of outputFailuresByTaskId.entries()) {
       await this.options.store.appendLog(this.options.workflowId, {
-        type: failure.kind === "artifact_output_conflict"
-          ? "artifact_output_conflict"
-          : failure.kind === "artifact_output_missing"
-            ? "artifact_output_missing"
-            : "artifact_output_reconcile_failed",
+        type: failure.kind,
         taskId,
         attempt: state.taskStates[taskId]?.attempt ?? 0,
         actor: "runner",
@@ -649,9 +664,11 @@ export class ContinuousExecutionRunner {
       projectRoot: this.options.projectRoot,
       aoSessionId: input.taskState.aoSessionId,
       manualGateMode: input.manualGateMode,
+      worktreePath: findWorktreePathForTaskState(input.taskState, input.sessions),
       sessions: input.sessions
     });
     await this.logReconcileResult(input.taskState, reconcileResult);
+    await this.logFallbackWorktreeResolution(input.taskState, reconcileResult);
 
     if (reconcileResult.failures.length > 0) {
       return {
@@ -660,6 +677,24 @@ export class ContinuousExecutionRunner {
         conflictArtifacts: validation.conflictArtifacts,
         reconcileResult,
         message: formatReconcileFailure(reconcileResult)
+      };
+    }
+    if ((reconcileResult.ambiguousCandidates?.length ?? 0) > 0) {
+      return {
+        kind: "artifact_output_ambiguous",
+        missingArtifacts: validation.missingArtifacts,
+        conflictArtifacts: validation.conflictArtifacts,
+        reconcileResult,
+        message: formatReconcileAmbiguous(reconcileResult)
+      };
+    }
+    if ((reconcileResult.contractViolations?.length ?? 0) > 0) {
+      return {
+        kind: "artifact_contract_violation",
+        missingArtifacts: validation.missingArtifacts,
+        conflictArtifacts: validation.conflictArtifacts,
+        reconcileResult,
+        message: formatReconcileContractViolations(reconcileResult)
       };
     }
     if (reconcileResult.conflicts.length > 0) {
@@ -717,6 +752,16 @@ export class ContinuousExecutionRunner {
   private async logReconcileResult(taskState: ExecutionTaskState, result: ArtifactReconcileResult): Promise<void> {
     for (const recovered of result.recovered) {
       await this.options.store.appendLog(this.options.workflowId, {
+        type: "artifact_candidate_found",
+        taskId: taskState.taskId,
+        attempt: taskState.attempt,
+        actor: "runner",
+        aoSessionId: taskState.aoSessionId,
+        candidatePath: recovered.from,
+        canonicalPath: recovered.to,
+        kind: recovered.kind
+      });
+      await this.options.store.appendLog(this.options.workflowId, {
         type: "artifact_output_recovered_from_worktree",
         taskId: taskState.taskId,
         attempt: taskState.attempt,
@@ -734,6 +779,15 @@ export class ContinuousExecutionRunner {
           recovered
         });
       }
+      await this.options.store.appendLog(this.options.workflowId, {
+        type: "artifact_canonical_verified",
+        taskId: taskState.taskId,
+        attempt: taskState.attempt,
+        actor: "runner",
+        aoSessionId: taskState.aoSessionId,
+        canonicalPath: recovered.to,
+        kind: recovered.kind
+      });
     }
     for (const skipped of result.skipped) {
       await this.options.store.appendLog(this.options.workflowId, {
@@ -755,6 +809,75 @@ export class ContinuousExecutionRunner {
         failures: result.failures
       });
     }
+    if ((result.ambiguousCandidates?.length ?? 0) > 0) {
+      for (const candidate of result.ambiguousCandidates ?? []) {
+        await this.options.store.appendLog(this.options.workflowId, {
+          type: "artifact_candidate_found",
+          taskId: taskState.taskId,
+          attempt: taskState.attempt,
+          actor: "runner",
+          aoSessionId: taskState.aoSessionId,
+          candidate
+        });
+      }
+      await this.options.store.appendLog(this.options.workflowId, {
+        type: "artifact_output_ambiguous",
+        taskId: taskState.taskId,
+        attempt: taskState.attempt,
+        actor: "runner",
+        aoSessionId: taskState.aoSessionId,
+        ambiguousCandidates: result.ambiguousCandidates
+      });
+    }
+    for (const conflict of result.conflicts) {
+      await this.options.store.appendLog(this.options.workflowId, {
+        type: "artifact_candidate_rejected",
+        taskId: taskState.taskId,
+        attempt: taskState.attempt,
+        actor: "runner",
+        aoSessionId: taskState.aoSessionId,
+        conflict
+      });
+    }
+    if ((result.contractViolations?.length ?? 0) > 0) {
+      for (const violation of result.contractViolations ?? []) {
+        await this.options.store.appendLog(this.options.workflowId, {
+          type: "artifact_candidate_rejected",
+          taskId: taskState.taskId,
+          attempt: taskState.attempt,
+          actor: "runner",
+          aoSessionId: taskState.aoSessionId,
+          violation
+        });
+      }
+      await this.options.store.appendLog(this.options.workflowId, {
+        type: "artifact_contract_violation",
+        taskId: taskState.taskId,
+        attempt: taskState.attempt,
+        actor: "runner",
+        aoSessionId: taskState.aoSessionId,
+        contractViolations: result.contractViolations
+      });
+    }
+  }
+
+  private async logFallbackWorktreeResolution(
+    taskState: ExecutionTaskState,
+    result: ArtifactReconcileResult
+  ): Promise<void> {
+    if (result.worktreeResolution?.discoveredVia !== "fallback") {
+      return;
+    }
+    await this.options.store.appendLog(this.options.workflowId, {
+      type: "worktree_path_discovered_via_fallback",
+      taskId: taskState.taskId,
+      attempt: taskState.attempt,
+      actor: "runner",
+      aoSessionId: taskState.aoSessionId,
+      projectRoot: this.options.projectRoot,
+      worktreePath: result.worktreeResolution.path,
+      discoveredVia: result.worktreeResolution.discoveredVia
+    });
   }
 
   private async finishIfTerminal(plan: TaskPlan): Promise<ContinuousExecutionTickResult | undefined> {
@@ -982,7 +1105,12 @@ export async function reconcileExecutionTaskArtifacts(input: {
   state: ExecutionState;
   reconcileResult?: ArtifactReconcileResult;
   completed: boolean;
-  failureKind?: "artifact_output_missing" | "artifact_output_conflict" | "artifact_output_reconcile_failed";
+  failureKind?:
+    | "artifact_output_missing"
+    | "artifact_output_conflict"
+    | "artifact_output_reconcile_failed"
+    | "artifact_output_ambiguous"
+    | "artifact_contract_violation";
 }> {
   const current = await input.store.readState(input.workflowId);
   const plan = await input.store.readActiveTaskPlan(current);
@@ -1026,9 +1154,17 @@ export async function reconcileExecutionTaskArtifacts(input: {
     projectRoot: input.projectRoot,
     aoSessionId: taskState.aoSessionId,
     manualGateMode: release?.mode,
+    worktreePath: findWorktreePathForTaskState(taskState, input.sessions ?? []),
     sessions: input.sessions
   });
   await logStandaloneReconcileResult({
+    store: input.store,
+    workflowId: input.workflowId,
+    taskState,
+    actor: input.actor ?? "web",
+    reconcileResult
+  });
+  await logFallbackWorktreeResolution({
     store: input.store,
     workflowId: input.workflowId,
     taskState,
@@ -1042,6 +1178,22 @@ export async function reconcileExecutionTaskArtifacts(input: {
       message: formatReconcileFailure(reconcileResult)
     });
     return { state, reconcileResult, completed: false, failureKind: "artifact_output_reconcile_failed" };
+  }
+  if ((reconcileResult.ambiguousCandidates?.length ?? 0) > 0) {
+    const state = await input.store.failState(input.workflowId, {
+      taskId: input.taskId,
+      kind: "artifact_output_ambiguous",
+      message: formatReconcileAmbiguous(reconcileResult)
+    });
+    return { state, reconcileResult, completed: false, failureKind: "artifact_output_ambiguous" };
+  }
+  if ((reconcileResult.contractViolations?.length ?? 0) > 0) {
+    const state = await input.store.failState(input.workflowId, {
+      taskId: input.taskId,
+      kind: "artifact_contract_violation",
+      message: formatReconcileContractViolations(reconcileResult)
+    });
+    return { state, reconcileResult, completed: false, failureKind: "artifact_contract_violation" };
   }
   if (reconcileResult.conflicts.length > 0) {
     const state = await input.store.failState(input.workflowId, {
@@ -1315,6 +1467,20 @@ export async function dispatchManualGateReview(input: {
     actor: input.actor ?? "user",
     dispatchContextPath: context.contextPath
   });
+  if (context.manifest.artifactContracts.length > 0) {
+    await input.store.appendLog(input.workflowId, {
+      type: "artifact_contract_resolved",
+      taskId: input.taskId,
+      attempt: pending.attempt,
+      actor: input.actor ?? "user",
+      contracts: context.manifest.artifactContracts.map((contract) => ({
+        contractId: contract.contractId,
+        canonicalPath: contract.canonicalPath,
+        required: contract.required,
+        requiredWhen: contract.requiredWhen
+      }))
+    });
+  }
   if (context.missingRequiredArtifacts.length > 0) {
     await cleanupFiles([context.contextPath]);
     const failed = await input.store.update(input.workflowId, (current) =>
@@ -1633,6 +1799,16 @@ async function logStandaloneReconcileResult(input: {
 }): Promise<void> {
   for (const recovered of input.reconcileResult.recovered) {
     await input.store.appendLog(input.workflowId, {
+      type: "artifact_candidate_found",
+      taskId: input.taskState.taskId,
+      attempt: input.taskState.attempt,
+      actor: input.actor,
+      aoSessionId: input.taskState.aoSessionId,
+      candidatePath: recovered.from,
+      canonicalPath: recovered.to,
+      kind: recovered.kind
+    });
+    await input.store.appendLog(input.workflowId, {
       type: "artifact_output_recovered_from_worktree",
       taskId: input.taskState.taskId,
       attempt: input.taskState.attempt,
@@ -1650,6 +1826,15 @@ async function logStandaloneReconcileResult(input: {
         recovered
       });
     }
+    await input.store.appendLog(input.workflowId, {
+      type: "artifact_canonical_verified",
+      taskId: input.taskState.taskId,
+      attempt: input.taskState.attempt,
+      actor: input.actor,
+      aoSessionId: input.taskState.aoSessionId,
+      canonicalPath: recovered.to,
+      kind: recovered.kind
+    });
   }
   for (const skipped of input.reconcileResult.skipped) {
     await input.store.appendLog(input.workflowId, {
@@ -1671,6 +1856,86 @@ async function logStandaloneReconcileResult(input: {
       failures: input.reconcileResult.failures
     });
   }
+  if ((input.reconcileResult.ambiguousCandidates?.length ?? 0) > 0) {
+    for (const candidate of input.reconcileResult.ambiguousCandidates ?? []) {
+      await input.store.appendLog(input.workflowId, {
+        type: "artifact_candidate_found",
+        taskId: input.taskState.taskId,
+        attempt: input.taskState.attempt,
+        actor: input.actor,
+        aoSessionId: input.taskState.aoSessionId,
+        candidate
+      });
+    }
+    await input.store.appendLog(input.workflowId, {
+      type: "artifact_output_ambiguous",
+      taskId: input.taskState.taskId,
+      attempt: input.taskState.attempt,
+      actor: input.actor,
+      aoSessionId: input.taskState.aoSessionId,
+      ambiguousCandidates: input.reconcileResult.ambiguousCandidates
+    });
+  }
+  for (const conflict of input.reconcileResult.conflicts) {
+    await input.store.appendLog(input.workflowId, {
+      type: "artifact_candidate_rejected",
+      taskId: input.taskState.taskId,
+      attempt: input.taskState.attempt,
+      actor: input.actor,
+      aoSessionId: input.taskState.aoSessionId,
+      conflict
+    });
+  }
+  if ((input.reconcileResult.contractViolations?.length ?? 0) > 0) {
+    for (const violation of input.reconcileResult.contractViolations ?? []) {
+      await input.store.appendLog(input.workflowId, {
+        type: "artifact_candidate_rejected",
+        taskId: input.taskState.taskId,
+        attempt: input.taskState.attempt,
+        actor: input.actor,
+        aoSessionId: input.taskState.aoSessionId,
+        violation
+      });
+    }
+    await input.store.appendLog(input.workflowId, {
+      type: "artifact_contract_violation",
+      taskId: input.taskState.taskId,
+      attempt: input.taskState.attempt,
+      actor: input.actor,
+      aoSessionId: input.taskState.aoSessionId,
+      contractViolations: input.reconcileResult.contractViolations
+    });
+  }
+}
+
+async function logFallbackWorktreeResolution(input: {
+  store: ExecutionStateStore;
+  workflowId: string;
+  taskState: ExecutionTaskState;
+  actor: "user" | "cli" | "web";
+  reconcileResult: ArtifactReconcileResult;
+}): Promise<void> {
+  if (input.reconcileResult.worktreeResolution?.discoveredVia !== "fallback") {
+    return;
+  }
+  await input.store.appendLog(input.workflowId, {
+    type: "worktree_path_discovered_via_fallback",
+    taskId: input.taskState.taskId,
+    attempt: input.taskState.attempt,
+    actor: input.actor,
+    aoSessionId: input.taskState.aoSessionId,
+    worktreePath: input.reconcileResult.worktreeResolution.path,
+    discoveredVia: input.reconcileResult.worktreeResolution.discoveredVia
+  });
+}
+
+function findWorktreePathForTaskState(
+  taskState: ExecutionTaskState,
+  sessions: AoSessionSnapshot[]
+): string | undefined {
+  return taskState.aoSessionId
+    ? sessions.find((session) => session.id === taskState.aoSessionId)?.worktreePath
+    : undefined;
 }
 
 function attachAoSessionId(state: ExecutionState, taskId: string, aoSessionId: string): ExecutionState {
@@ -1891,6 +2156,26 @@ function formatReconcileConflicts(result: ArtifactReconcileResult): string {
     "Control-plane output artifacts conflict with AO worktree candidates:",
     ...result.conflicts.map((artifact) =>
       `- ${artifact.kind}: ${artifact.path}${artifact.candidatePath ? `, candidate ${artifact.candidatePath}` : ""} (${artifact.reason}, expected=${artifact.expected ?? ""}, actual=${artifact.actual ?? ""})`
+    )
+  ].join("\n");
+}
+
+function formatReconcileAmbiguous(result: ArtifactReconcileResult): string {
+  return [
+    "Control-plane output artifacts have ambiguous AO worktree candidates:",
+    ...(result.ambiguousCandidates ?? []).map(
+      (artifact) =>
+        `- ${artifact.kind}: ${artifact.path}${artifact.candidatePath ? `, candidate ${artifact.candidatePath}` : ""} (${artifact.reason}, source=${artifact.candidateSource ?? ""}, priority=${artifact.priority ?? ""})`
+    )
+  ].join("\n");
+}
+
+function formatReconcileContractViolations(result: ArtifactReconcileResult): string {
+  return [
+    "Control-plane output artifacts violate registered contracts:",
+    ...(result.contractViolations ?? []).map(
+      (artifact) =>
+        `- ${artifact.kind}: ${artifact.path}${artifact.candidatePath ? `, candidate ${artifact.candidatePath}` : ""} (${artifact.reason}, expected=${artifact.expected ?? ""}, actual=${artifact.actual ?? ""})`
     )
   ].join("\n");
 }
