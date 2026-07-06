@@ -12,7 +12,8 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "test": "vitest run",
-    "release:commit": "node scripts/release-commit.mjs"
+    "release:commit": "node scripts/release-commit.mjs",
+    "ship": "node scripts/release-commit.mjs"
   },
   "bin": {
     "ao-control-plane": "dist/cli.js"

@@ -43,6 +43,7 @@ run("git", ["commit", "-m", options.message ?? `chore: release v${nextVersion}`]
 
 function parseArgs(args) {
   const parsed = { bump: "patch", message: undefined };
+  const positionalMessageParts = [];
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--major" || arg === "--minor" || arg === "--patch") {
@@ -58,7 +59,10 @@ function parseArgs(args) {
       index += 1;
       continue;
     }
-    throw new Error(`Unknown argument: ${arg}`);
+    positionalMessageParts.push(arg);
+  }
+  if (!parsed.message && positionalMessageParts.length > 0) {
+    parsed.message = positionalMessageParts.join(" ");
   }
   return parsed;
 }
