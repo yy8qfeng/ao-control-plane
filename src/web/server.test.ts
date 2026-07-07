@@ -1135,6 +1135,10 @@ describe("web server", () => {
     expect(html).toContain("连续执行状态：");
     expect(html).toContain("当前任务：");
     expect(html).toContain("AO session：");
+    expect(html).toContain("executionDetailOpenState");
+    expect(html).toContain("captureExecutionDetailsOpenState");
+    expect(html).toContain("restoreExecutionDetailsOpenState");
+    expect(html).toContain("data-detail-key");
     expect(html).toContain("已中断，需要人工处理");
     expect(html).toContain("submitExecutionRecovery");
     expect(html).toContain("/retry");

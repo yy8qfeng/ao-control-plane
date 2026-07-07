@@ -102,7 +102,7 @@ describe("ExecutionJobManager", () => {
     const { manager, store } = await seedManager(workflowId, "failed", true, false, 4, 3, [
       {
         name: "session-TASK-001",
-        status: "stuck",
+        status: "idle",
         reports: [
           {
             reportState: "completed",
@@ -237,6 +237,117 @@ describe("ExecutionJobManager", () => {
     await expect(access(join(tempDir ?? "", workflowId, "execution.lock")))
       .rejects.toMatchObject({ code: "ENOENT" });
   });
+
+  it("requests structured decisions with dependency artifact paths", async () => {
+    const workflowId = "WF-REQUEST-STRUCTURED";
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-execution-jobs-"));
+    const store = new ExecutionStateStore(tempDir);
+    const artifactDir = store.getWorkflowDir(workflowId);
+    await mkdir(artifactDir, { recursive: true });
+    await atomicWriteJson(join(artifactDir, "task-plan.json"), {
+      workflowId,
+      title: "Plan",
+      tasks: [
+        {
+          taskId: "TASK-001",
+          workflowId,
+          title: "Freeze contract",
+          description: "Freeze contract.",
+          type: "implementation",
+          dependencies: [],
+          dependencyCondition: "all_completed",
+          aoRole: "backend-senior",
+          acceptanceCriteria: ["Done"],
+          aoPrompt: `[${workflowId} / TASK-001] Freeze contract.`,
+          executionPolicy: defaultExecutionPolicy,
+          status: "completed",
+          outputArtifacts: [
+            { kind: "transport_contract_freeze", path: "transport_contract_freeze.json", required: true }
+          ]
+        },
+        {
+          taskId: "TASK-002",
+          workflowId,
+          title: "Review contract",
+          description: "Review contract.",
+          type: "review",
+          dependencies: ["TASK-001"],
+          dependencyCondition: "manual_gate",
+          aoRole: "reviewer",
+          acceptanceCriteria: ["Decision written"],
+          aoPrompt: `[${workflowId} / TASK-002] Review contract.`,
+          executionPolicy: defaultExecutionPolicy,
+          status: "pending",
+          outputArtifacts: [
+            { kind: "transport_contract_review_gate_decision", path: "transport_contract_review_gate_decision.json", required: true }
+          ]
+        }
+      ]
+    });
+    await atomicWriteJson(join(artifactDir, "execution-state.json"), {
+      workflowId,
+      planVersion: "task-plan-current",
+      planPath: "task-plan.json",
+      status: "failed",
+      currentTaskId: "TASK-002",
+      startedAt: null,
+      updatedAt: new Date().toISOString(),
+      completedAt: null,
+      stoppedAt: null,
+      failure: {
+        taskId: "TASK-002",
+        kind: "ao_task_needs_structured_decision",
+        message: "missing structured decision",
+        occurredAt: new Date().toISOString()
+      },
+      taskStates: {
+        "TASK-002": {
+          taskId: "TASK-002",
+          status: "blocked_for_human",
+          aoRole: "reviewer",
+          aoSessionId: "ft-review",
+          attempt: 1,
+          maxAttempts: 3,
+          dispatchContextPath: join(artifactDir, "dispatch-context", "ao-dispatch-context-TASK-002-attempt-1.json"),
+          failureReason: "ao_task_needs_structured_decision"
+        }
+      },
+      manualGateReleases: [],
+      pendingDispatch: null
+    });
+    let followUpInstruction = "";
+    const manager = new ExecutionJobManager({
+      store,
+      artifactRoot: tempDir,
+      createAo: () => ({
+        async spawnTask(task) {
+          return { sessionId: `session-${task.taskId}`, stdout: "", stderr: "" };
+        },
+        async listSessions() {
+          return { data: [] };
+        },
+        async sendFollowUpInstruction(_sessionId, instruction) {
+          followUpInstruction = instruction;
+          return { sessionId: "ft-review", stdout: "sent", stderr: "" };
+        }
+      })
+    });
+    await manager.restoreFromDisk();
+
+    await manager.requestStructuredDecision(`EXEC-${workflowId}`, "TASK-002");
+
+    expect(followUpInstruction).toContain(join(artifactDir, "transport_contract_freeze.json"));
+    expect(followUpInstruction).toContain(join(artifactDir, "transport_contract_review_gate_decision.json"));
+    await expect(store.readLogs(workflowId)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "ao_follow_up_instruction_sent",
+          taskId: "TASK-002",
+          dependencyArtifacts: [join(artifactDir, "transport_contract_freeze.json")]
+        })
+      ])
+    );
+  });
 });
 
 async function seedManager(
@@ -285,18 +396,25 @@ async function seedManager(
     manualGateReleases: [],
     pendingDispatch: null
   });
+  const sessions = [...aoSessions] as Array<Record<string, unknown>>;
   const manager = new ExecutionJobManager({
     store,
     artifactRoot: tempDir,
     createAo: () => ({
       async spawnTask(task) {
+        sessions.push({
+          id: `session-${task.taskId}`,
+          role: task.aoRole,
+          status: "completed",
+          prompt: task.aoPrompt
+        });
         return { sessionId: `session-${task.taskId}`, stdout: "", stderr: "" };
       },
       async listSessions() {
         if (aoUnavailable) {
           throw new Error("ao daemon is offline");
         }
-        return { data: aoSessions };
+        return { data: sessions };
       }
     })
   });

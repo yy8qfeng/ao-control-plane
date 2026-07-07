@@ -6,6 +6,7 @@ import { defaultExecutionPolicy } from "../schemas/execution-policy.js";
 import type { ExecutionTask } from "../schemas/task-plan.js";
 import {
   buildAoDispatchContext,
+  buildPromptSummary,
   resolveInputArtifacts,
   resolveOutputArtifacts,
   synthesizeManualGateArtifacts,
@@ -113,14 +114,49 @@ describe("ao dispatch context", () => {
       attempt: 1
     });
 
-    const manifest = JSON.parse(await readFile(context.contextPath, "utf8")) as { projectRoot: string };
+    const manifest = JSON.parse(await readFile(context.contextPath, "utf8")) as {
+      projectRoot: string;
+      deliveryToken: string;
+      originalAoPrompt: string;
+      requiredPromptMarkers: string[];
+    };
     expect(manifest.projectRoot).toBe("C:\\workspace\\fast transport\\中文项目");
+    expect(manifest.originalAoPrompt).toBe(task.aoPrompt);
+    expect(manifest.deliveryToken).toContain("WF-WINDOWS-PATHS:TASK-001:attempt-1");
+    expect(manifest.requiredPromptMarkers).toContain(context.contextPath);
+    expect(context.prompt).toContain("deliveryToken=");
+    expect(context.prompt).toContain("manifest.originalAoPrompt");
     expect(context.prompt).toContain("projectRoot: C:\\workspace\\fast transport\\中文项目");
     expect(context.prompt).toContain("artifactDir:");
     expect(context.prompt).toContain("coreInputs:");
     expect(context.prompt).toContain("task_plan:");
     expect(context.prompt).toContain("execution_state:");
     expect(context.prompt).toContain("expectedOutputs:");
+  });
+
+  it("normalizes dispatch prompt summaries before adding them as delivery markers", async () => {
+    const artifactDir = await createTempArtifactDir();
+    await writeFile(join(artifactDir, "task-plan.json"), "{}\n", "utf8");
+    await writeFile(join(artifactDir, "execution-state.json"), "{}\n", "utf8");
+    const workflowId = "WF-SUMMARY";
+    const task = createTask(workflowId, {
+      title: "Review transport contract",
+      aoPrompt: JSON.stringify({ task: "review", payload: "x".repeat(120) })
+    });
+    const plan = { workflowId, title: "Plan", tasks: [task] };
+
+    const context = await buildAoDispatchContext({
+      task,
+      plan,
+      state: createInitialState(workflowId),
+      artifactDir,
+      attempt: 1
+    });
+
+    const summary = buildPromptSummary(task, workflowId);
+    expect(summary).toBe("[WF-SUMMARY / TASK-001] Review transport contract");
+    expect(context.prompt.split(/\r?\n/)[0]).toBe(summary);
+    expect(context.manifest.requiredPromptMarkers).toContain(summary);
   });
 
   it("synthesizes manual gate artifacts with explicit decision and flag kinds", async () => {

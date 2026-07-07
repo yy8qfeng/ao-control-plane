@@ -85,7 +85,13 @@ describe("AoCliAdapter", () => {
       cwd: "C:\\workspace\\fast-transport",
       reject: false
     });
-    expect(execaMock).toHaveBeenNthCalledWith(2, "ao", buildSpawnArgs(baseTask), {
+    expect(execaMock).toHaveBeenNthCalledWith(2, "ao", [
+      "spawn",
+      "--role",
+      "backend-senior",
+      "--prompt-file",
+      expect.stringMatching(/prompt\.txt$/)
+    ], {
       cwd: "C:\\workspace\\fast-transport",
       reject: false
     });
@@ -145,6 +151,43 @@ describe("AoCliAdapter", () => {
       "full",
       "--project",
       "fast-transport_53d581ab27"
+    ], {
+      cwd: "C:\\workspace\\fast-transport",
+      reject: false
+    });
+  });
+
+  it("reads a single AO session from status output aliases", async () => {
+    execaMock.mockResolvedValueOnce({
+      exitCode: 0,
+      stdout: JSON.stringify({ data: [{ name: "ft-1", status: "idle" }] }),
+      stderr: ""
+    });
+
+    const adapter = new AoCliAdapter({ projectRoot: "C:\\workspace\\fast-transport" });
+
+    await expect(adapter.readSession("ft-1")).resolves.toEqual({ name: "ft-1", status: "idle" });
+  });
+
+  it("sends follow-up instructions through a prompt file", async () => {
+    execaMock.mockResolvedValueOnce({
+      exitCode: 0,
+      stdout: "sent",
+      stderr: ""
+    });
+
+    const adapter = new AoCliAdapter({ projectRoot: "C:\\workspace\\fast-transport" });
+
+    await expect(adapter.sendFollowUpInstruction("ft-1", "请写入结构化 decision。")).resolves.toMatchObject({
+      sessionId: "ft-1",
+      stdout: "sent"
+    });
+    expect(execaMock).toHaveBeenCalledWith("ao", [
+      "send",
+      "--session",
+      "ft-1",
+      "--prompt-file",
+      expect.stringMatching(/prompt\.txt$/)
     ], {
       cwd: "C:\\workspace\\fast-transport",
       reject: false

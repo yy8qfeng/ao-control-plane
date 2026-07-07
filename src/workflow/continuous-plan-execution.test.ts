@@ -11,6 +11,7 @@ import {
   decideManualGate,
   dispatchReworkTask,
   dispatchManualGateReview,
+  forceRedispatchTask,
   reconcileExecutionTaskArtifacts,
   pauseForManualGateRework,
   retryExecutionTask,
@@ -365,6 +366,55 @@ describe("ContinuousExecutionRunner", () => {
     })).rejects.toThrow("needs structured decision");
   });
 
+  it("force redispatch resets a structured-decision task and supersedes the old AO session", async () => {
+    const workflowId = "WF-FORCE-REDISPATCH";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", {
+        dependencyCondition: "manual_gate",
+        type: "review",
+        aoRole: "reviewer"
+      })
+    ]));
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "failed",
+      currentTaskId: "TASK-001",
+      failure: {
+        taskId: "TASK-001",
+        kind: "ao_task_needs_structured_decision",
+        message: "缺结构化决策",
+        occurredAt: new Date().toISOString()
+      },
+      taskStates: {
+        "TASK-001": {
+          taskId: "TASK-001",
+          status: "blocked_for_human",
+          aoRole: "reviewer",
+          aoSessionId: "ft-old",
+          attempt: 1,
+          maxAttempts: 3,
+          failureReason: "ao_task_needs_structured_decision"
+        }
+      }
+    }));
+
+    const state = await forceRedispatchTask({
+      store,
+      workflowId,
+      taskId: "TASK-001",
+      actor: "user"
+    });
+
+    expect(state.status).toBe("running");
+    expect(state.failure).toBeNull();
+    expect(state.supersededSessions).toContain("ft-old");
+    expect(state.taskStates["TASK-001"]).toMatchObject({
+      status: "pending",
+      aoSessionId: undefined,
+      failureReason: null
+    });
+  });
+
   it("skips replan-only manual gate branches after an approved upstream gate", async () => {
     const workflowId = "WF-SKIP-APPROVED-REPLAN";
     const { store } = await seedPlan(createPlan(workflowId, [
@@ -496,7 +546,7 @@ describe("ContinuousExecutionRunner", () => {
     expect(state.taskStates["TASK-095"]?.status).toBe("superseded");
   });
 
-  it("requires repeated same-attempt AO failure observations before failing", async () => {
+  it("resolves AO failure statuses without continuing to poll", async () => {
     const workflowId = "WF-FAILED";
     const { store } = await seedPlan(createPlan(workflowId, [
       createTask(workflowId, "TASK-001")
@@ -517,7 +567,7 @@ describe("ContinuousExecutionRunner", () => {
     expect(state.status).toBe("failed");
     expect(state.failure?.kind).toBe("ao_task_failed");
     expect(state.taskStates["TASK-001"]?.status).toBe("blocked_for_human");
-    expect(state.taskStates["TASK-001"]?.statusObservations).toHaveLength(2);
+    expect(state.taskStates["TASK-001"]?.statusObservations ?? []).toHaveLength(0);
   });
 
   it("completes a working task when AO reports completed while the session is idle", async () => {
@@ -576,6 +626,82 @@ describe("ContinuousExecutionRunner", () => {
     expect(state.status).toBe("completed");
     expect(state.taskStates["TASK-001"]?.status).toBe("completed");
     expect(state.taskStates["TASK-001"]?.statusObservations?.at(-1)?.status).toBe("completed");
+  });
+
+  it("turns idle top-level waiting reports into structured decision failures", async () => {
+    const workflowId = "WF-IDLE-REPORT-WAITING";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", { status: "completed" }),
+      createTask(workflowId, "TASK-002", {
+        title: "G0 人工复核放行",
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        type: "review",
+        aoRole: "reviewer",
+        outputArtifacts: [
+          {
+            contractId: "g0_review_gate_decision",
+            kind: "g0_review_gate_decision",
+            path: "g0_review_gate_decision.json",
+            required: true
+          }
+        ]
+      })
+    ]));
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "running",
+      currentTaskId: "TASK-002",
+      taskStates: {
+        "TASK-001": {
+          taskId: "TASK-001",
+          status: "completed",
+          aoRole: "backend-senior",
+          attempt: 1,
+          maxAttempts: 3
+        },
+        "TASK-002": {
+          taskId: "TASK-002",
+          status: "working",
+          aoRole: "reviewer",
+          aoSessionId: "ft-waiting",
+          attempt: 1,
+          maxAttempts: 3,
+          statusObservations: []
+        }
+      },
+      manualGateReleases: [{
+        taskId: "TASK-002",
+        decision: "review_dispatched",
+        mode: "ao_review",
+        aoSessionId: "ft-waiting"
+      }]
+    }));
+    const runner = new ContinuousExecutionRunner({
+      workflowId,
+      store,
+      ao: createListOnlyAo([{
+        id: "ft-waiting",
+        role: "reviewer",
+        status: "idle",
+        prompt: `[${workflowId} / TASK-002] gate`,
+        agentReportedState: "waiting",
+        agentReportedAt: new Date().toISOString(),
+        agentReportedNote: "只看到 README"
+      }]) as Pick<AoCliAdapter, "spawnTask" | "listSessions">,
+      pollIntervalMs: 1,
+      maxTicks: 1
+    });
+
+    await runner.run();
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("failed");
+    expect(state.failure).toMatchObject({
+      taskId: "TASK-002",
+      kind: "ao_task_needs_structured_decision"
+    });
+    expect(state.taskStates["TASK-002"]?.status).toBe("blocked_for_human");
   });
 
   it("records stopped state without polluting failure", async () => {
@@ -660,6 +786,94 @@ describe("ContinuousExecutionRunner", () => {
           taskId: "TASK-001"
         })
       ])
+    );
+  });
+
+  it("fails dispatch when the AO session prompt lacks dispatch context markers", async () => {
+    const workflowId = "WF-DISPATCH-CONTEXT-MISSING";
+    const { store } = await seedPlan(createPlan(workflowId, [createTask(workflowId, "TASK-001")]));
+    const runner = new ContinuousExecutionRunner({
+      workflowId,
+      store,
+      ao: {
+        async spawnTask(task) {
+          return { sessionId: `session-${task.taskId}`, stdout: "", stderr: "" };
+        },
+        async listSessions() {
+          return {
+            sessions: [
+              {
+                id: "session-TASK-001",
+                role: "backend-senior",
+                status: "working",
+                prompt: `[${workflowId} / TASK-001] old prompt without marker`
+              }
+            ]
+          };
+        }
+      },
+      pollIntervalMs: 1,
+      maxTicks: 1
+    });
+
+    await runner.run();
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("failed");
+    expect(state.failure?.kind).toBe("ao_dispatch_context_not_delivered");
+    expect(state.taskStates["TASK-001"]?.status).toBe("blocked_for_human");
+    await expect(store.readLogs(workflowId)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "ao_dispatch_context_delivery_failed",
+          taskId: "TASK-001"
+        })
+      ])
+    );
+  });
+
+  it("fails dispatch when the AO session prompt preserves markers but loses task identity", async () => {
+    const workflowId = "WF-DISPATCH-TASK-IDENTITY-MISSING";
+    const { store } = await seedPlan(createPlan(workflowId, [createTask(workflowId, "TASK-001")]));
+    let deliveredPrompt = "";
+    const runner = new ContinuousExecutionRunner({
+      workflowId,
+      store,
+      ao: {
+        async spawnTask(task) {
+          deliveredPrompt = task.aoPrompt;
+          return { sessionId: `session-${task.taskId}`, stdout: "", stderr: "" };
+        },
+        async listSessions() {
+          const contextPath = deliveredPrompt.match(/dispatchContextManifest: (.+)/)?.[1] ?? "";
+          const deliveryToken = deliveredPrompt.match(/deliveryToken=(.+)/)?.[1] ?? "";
+          return {
+            sessions: [
+              {
+                id: "session-TASK-001",
+                role: "backend-senior",
+                status: "working",
+                prompt: [
+                  "dispatchContextManifest:",
+                  contextPath,
+                  `deliveryToken=${deliveryToken}`
+                ].join("\n")
+              }
+            ]
+          };
+        }
+      },
+      pollIntervalMs: 1,
+      maxTicks: 1
+    });
+
+    await runner.run();
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("failed");
+    expect(state.failure?.kind).toBe("ao_dispatch_context_not_delivered");
+    expect(state.failure?.detail?.missingMarkers).toEqual(
+      expect.arrayContaining([`[${workflowId} / TASK-001] TASK-001`])
     );
   });
 
@@ -754,7 +968,12 @@ describe("ContinuousExecutionRunner", () => {
         dispatchId: "DISPATCH-test",
         taskId: "TASK-001",
         attempt: 1,
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
+        dispatchContextPath: join(
+          store.getWorkflowDir(workflowId),
+          "dispatch-context",
+          "ao-dispatch-context-TASK-001-attempt-1.json"
+        )
       }
     }));
     const ao = {
@@ -766,8 +985,9 @@ describe("ContinuousExecutionRunner", () => {
           sessions: [
             {
               id: "session-recovered",
+              role: "backend-senior",
               status: "completed",
-              prompt: `[${workflowId} / TASK-001] TASK-001.`
+              prompt: `[${workflowId} / TASK-001] TASK-001.\ndispatchContextManifest: ${join(store.getWorkflowDir(workflowId), "dispatch-context", "ao-dispatch-context-TASK-001-attempt-1.json")}`
             }
           ]
         };
@@ -787,6 +1007,47 @@ describe("ContinuousExecutionRunner", () => {
     expect(state.pendingDispatch).toBeNull();
     expect(state.taskStates["TASK-001"]?.aoSessionId).toBe("session-recovered");
     expect(state.status).toBe("completed");
+  });
+
+  it("fails pendingDispatch recovery when the matched AO session lacks dispatch context markers", async () => {
+    const workflowId = "WF-PENDING-RECOVER-MISSING-MARKER";
+    const { store } = await seedPlan(createPlan(workflowId, [createTask(workflowId, "TASK-001")]));
+    await seedPendingDispatch(store, workflowId, "TASK-001");
+    const runner = new ContinuousExecutionRunner({
+      workflowId,
+      store,
+      ao: createListOnlyAo([
+        {
+          id: "session-recovered",
+          role: "backend-senior",
+          status: "working",
+          prompt: `[${workflowId} / TASK-001] old prompt without manifest marker`
+        }
+      ]) as Pick<AoCliAdapter, "spawnTask" | "listSessions">,
+      pollIntervalMs: 1,
+      maxTicks: 1
+    });
+
+    await runner.run();
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("failed");
+    expect(state.pendingDispatch).toBeNull();
+    expect(state.failure).toMatchObject({
+      kind: "ao_dispatch_context_not_delivered",
+      taskId: "TASK-001"
+    });
+    expect(state.taskStates["TASK-001"]?.status).toBe("blocked_for_human");
+    expect(state.taskStates["TASK-001"]?.aoSessionId).toBe("session-recovered");
+    await expect(store.readLogs(workflowId)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "ao_dispatch_context_delivery_failed",
+          taskId: "TASK-001",
+          aoSessionId: "session-recovered"
+        })
+      ])
+    );
   });
 
   it("fails pendingDispatch recovery when multiple candidate sessions match", async () => {
@@ -839,6 +1100,22 @@ describe("ContinuousExecutionRunner", () => {
   it("fails after AO status query exceeds maxAoStatusFailures", async () => {
     const workflowId = "WF-AO-STATUS-FAILED";
     const { store } = await seedPlan(createPlan(workflowId, [createTask(workflowId, "TASK-001")]));
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "running",
+      currentTaskId: "TASK-001",
+      taskStates: {
+        "TASK-001": {
+          taskId: "TASK-001",
+          status: "working",
+          aoRole: "backend-senior",
+          aoSessionId: "session-TASK-001",
+          attempt: 1,
+          maxAttempts: 3,
+          statusObservations: []
+        }
+      }
+    }));
     const runner = new ContinuousExecutionRunner({
       workflowId,
       store,
@@ -1111,7 +1388,16 @@ describe("ContinuousExecutionRunner", () => {
           return { sessionId: "ft-review", stdout: "", stderr: "" };
         },
         async listSessions() {
-          return { sessions: [] };
+          return {
+            sessions: [
+              {
+                id: "ft-review",
+                role: "reviewer",
+                status: "working",
+                prompt: spawnedPrompts[0] ?? ""
+              }
+            ]
+          };
         }
       }
     });
@@ -1131,6 +1417,71 @@ describe("ContinuousExecutionRunner", () => {
     const manifest = JSON.parse(await readFile(contextPath, "utf8")) as { projectRoot: string; dependencyArtifacts: unknown[] };
     expect(manifest.projectRoot).toBe("C:\\workspace\\fast transport");
     expect(manifest.dependencyArtifacts).toHaveLength(1);
+  });
+
+  it("fails manual gate review dispatch when the AO session prompt lacks dispatch context markers", async () => {
+    const workflowId = "WF-MANUAL-REVIEW-MISSING-MARKER";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", {
+        title: "G0 仓库现实校准",
+        status: "completed"
+      }),
+      createTask(workflowId, "TASK-002", {
+        title: "G0 人工复核放行",
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        type: "verification",
+        aoRole: "reviewer"
+      })
+    ]));
+    await writeFile(join(store.getWorkflowDir(workflowId), "g0_repo_reality_check.json"), "{}\n", "utf8");
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "waiting_manual_gate",
+      currentTaskId: "TASK-002"
+    }));
+
+    const state = await dispatchManualGateReview({
+      store,
+      workflowId,
+      taskId: "TASK-002",
+      rationale: "需要 AO 独立复核",
+      actor: "user",
+      ao: {
+        async spawnTask() {
+          return { sessionId: "ft-review", stdout: "", stderr: "" };
+        },
+        async listSessions() {
+          return {
+            sessions: [
+              {
+                id: "ft-review",
+                role: "reviewer",
+                status: "working",
+                prompt: `[${workflowId} / TASK-002] old prompt without manifest marker`
+              }
+            ]
+          };
+        }
+      }
+    });
+
+    expect(state.status).toBe("failed");
+    expect(state.failure).toMatchObject({
+      kind: "ao_dispatch_context_not_delivered",
+      taskId: "TASK-002"
+    });
+    expect(state.taskStates["TASK-002"]?.status).toBe("blocked_for_human");
+    expect(state.taskStates["TASK-002"]?.aoSessionId).toBe("ft-review");
+    await expect(store.readLogs(workflowId)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "ao_dispatch_context_delivery_failed",
+          taskId: "TASK-002",
+          aoSessionId: "ft-review"
+        })
+      ])
+    );
   });
 
   it("rejects direct approved decisions so gate artifacts cannot be skipped", async () => {
@@ -1563,14 +1914,15 @@ async function seedPlan(plan: TaskPlan): Promise<{ store: ExecutionStateStore; w
 }
 
 function createFakeAo(statuses: string[]) {
-  const sessions: Array<{ id: string; status: string; prompt: string }> = [];
+  const sessions: Array<{ id: string; role: string; status: string; prompt: string }> = [];
   return {
     spawned: [] as string[],
-    async spawnTask(task: { taskId: string; aoPrompt: string }) {
+    async spawnTask(task: { taskId: string; aoPrompt: string; aoRole?: string }) {
       this.spawned.push(task.taskId);
       const status = statuses.shift() ?? "completed";
       const session = {
         id: `session-${task.taskId}`,
+        role: "aoRole" in task && typeof task.aoRole === "string" ? task.aoRole : "backend-senior",
         status,
         prompt: task.aoPrompt
       };
@@ -1583,7 +1935,16 @@ function createFakeAo(statuses: string[]) {
   };
 }
 
-function createListOnlyAo(sessions: Array<{ id: string; status: string; prompt: string; worktreePath?: string }>) {
+function createListOnlyAo(sessions: Array<{
+  id: string;
+  role?: string;
+  status: string;
+  prompt: string;
+  worktreePath?: string;
+  agentReportedState?: string;
+  agentReportedAt?: string;
+  agentReportedNote?: string;
+}>) {
   return {
     async spawnTask() {
       throw new Error("spawnTask should not be called");
@@ -1606,7 +1967,12 @@ async function seedPendingDispatch(
       dispatchId: "DISPATCH-test",
       taskId,
       attempt: 1,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      dispatchContextPath: join(
+        store.getWorkflowDir(workflowId),
+        "dispatch-context",
+        `ao-dispatch-context-${taskId}-attempt-1.json`
+      )
     }
   }));
 }

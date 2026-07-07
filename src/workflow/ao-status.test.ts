@@ -38,8 +38,11 @@ describe("AO status collector helpers", () => {
         "createdAt",
         "displayName",
         "id",
+        "lifecycleStatus",
         "prUrl",
         "prompt",
+        "reportedAt",
+        "reportedNote",
         "reportedState",
         "reviewStatus",
         "role",
@@ -91,16 +94,20 @@ describe("AO status collector helpers", () => {
     expect(sessions).toEqual([
       {
         id: "ft-1",
+        lifecycleStatus: "spawning",
         role: "worker",
         status: "spawning",
         branch: "session/ft-1",
         createdAt: undefined,
         displayName: undefined,
         prompt: undefined,
+        reportedAt: undefined,
+        reportedNote: undefined,
         reportedState: undefined,
         prUrl: undefined,
         ciStatus: undefined,
-        reviewStatus: undefined
+        reviewStatus: undefined,
+        worktreePath: undefined
       }
     ]);
   });
@@ -205,6 +212,83 @@ describe("AO status collector helpers", () => {
       id: "ft-1",
       status: "completed",
       reportedState: "completed"
+    });
+  });
+
+  it("accepts epoch millisecond report timestamps", () => {
+    const sessions = normalizeAoSessions({
+      data: [
+        {
+          name: "ft-1",
+          status: "idle",
+          createdAt: "2026-07-07T06:00:00.000Z",
+          reports: [
+            {
+              reportState: "waiting",
+              accepted: true,
+              timestamp: "1783404300000"
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(sessions[0]).toMatchObject({
+      id: "ft-1",
+      status: "waiting",
+      reportedState: "waiting"
+    });
+  });
+
+  it("keeps the latest nested accepted report when top-level report time is invalid", () => {
+    const sessions = normalizeAoSessions({
+      data: [
+        {
+          name: "ft-1",
+          status: "idle",
+          agentReportedState: "waiting",
+          agentReportedAt: "not-a-date",
+          reports: [
+            {
+              reportState: "completed",
+              accepted: true
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(sessions[0]).toMatchObject({
+      id: "ft-1",
+      status: "completed",
+      reportedState: "completed"
+    });
+  });
+
+  it("normalizes top-level AO report fields and prompt aliases", () => {
+    const sessions = normalizeAoSessions({
+      sessions: [
+        {
+          id: "ft-12",
+          workerRole: "reviewer",
+          status: "idle",
+          userPrompt: "[WF-001 / TASK-001] Review.",
+          agentReportedState: "waiting",
+          agentReportedAt: "2026-07-07T06:08:23.158Z",
+          agentReportedNote: "只看到 README"
+        }
+      ]
+    });
+
+    expect(sessions[0]).toMatchObject({
+      id: "ft-12",
+      role: "reviewer",
+      lifecycleStatus: "idle",
+      status: "waiting",
+      reportedState: "waiting",
+      reportedAt: "2026-07-07T06:08:23.158Z",
+      reportedNote: "只看到 README",
+      prompt: "[WF-001 / TASK-001] Review."
     });
   });
 

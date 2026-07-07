@@ -12,6 +12,7 @@ import {
   synthesizeManualGateArtifacts,
   validateTaskOutputArtifacts,
   type ConflictArtifact,
+  type DispatchContextManifest,
   type MissingArtifact
 } from "./ao-dispatch-context.js";
 import { normalizeAoSessions, type AoSessionSnapshot } from "./ao-status.js";
@@ -78,6 +79,14 @@ interface OutputValidationFailure {
 }
 
 const terminalSuccessStatuses = new Set(["completed", "mergeable", "merged", "done"]);
+const actionableAoStatuses = new Set([
+  ...terminalSuccessStatuses,
+  "waiting",
+  "needs_input",
+  "failed",
+  "stuck",
+  "ci_failed"
+]);
 const terminalFailureStatusKinds: Record<string, ExecutionErrorKind> = {
   failed: "ao_task_failed",
   stuck: "ao_task_stuck",
@@ -256,6 +265,21 @@ export class ContinuousExecutionRunner {
     const sessions = await this.listAoSessions();
     const candidates = sessions.filter((session) => sessionMatchesTask(session, task));
     if (candidates.length === 1) {
+      const deliveryFailure = validateDispatchContextDelivery({
+        task,
+        session: candidates[0]!,
+        dispatchContextPath: state.pendingDispatch.dispatchContextPath
+      });
+      if (deliveryFailure) {
+        await this.failDispatchContextDelivery({
+          task,
+          sessionId: candidates[0]?.id,
+          attempt: state.pendingDispatch.attempt,
+          dispatchContextPath: state.pendingDispatch.dispatchContextPath,
+          detail: deliveryFailure
+        });
+        return;
+      }
       await this.options.store.update(this.options.workflowId, (current) => ({
         ...current,
         currentTaskId: task.taskId,
@@ -305,6 +329,7 @@ export class ContinuousExecutionRunner {
   private async dispatchReservedTask(task: ExecutionTask, dispatchId: string): Promise<void> {
     let spawnResult: AoSpawnResult;
     let dispatchContextPath: string | undefined;
+    let dispatchManifest: DispatchContextManifest | undefined;
     try {
       const state = await this.options.store.readState(this.options.workflowId);
       const attempt = state.pendingDispatch?.attempt ?? state.taskStates[task.taskId]?.attempt ?? 1;
@@ -319,6 +344,7 @@ export class ContinuousExecutionRunner {
         dispatchId
       });
       dispatchContextPath = context.contextPath;
+      dispatchManifest = context.manifest;
       await this.options.store.appendLog(this.options.workflowId, {
         type: "ao_dispatch_context_created",
         taskId: task.taskId,
@@ -422,6 +448,41 @@ export class ContinuousExecutionRunner {
         actor: "runner",
         dispatchId,
         error: "AO spawn did not return a sessionId"
+      });
+      return;
+    }
+
+    const beforeDeliveryCommit = await this.options.store.readState(this.options.workflowId);
+    if (
+      beforeDeliveryCommit.pendingDispatch?.dispatchId !== dispatchId ||
+      beforeDeliveryCommit.pendingDispatch.taskId !== task.taskId ||
+      beforeDeliveryCommit.status !== "running"
+    ) {
+      await this.options.store.appendLog(this.options.workflowId, {
+        type: "task_dispatch_orphaned",
+        taskId: task.taskId,
+        attempt: 0,
+        actor: "runner",
+        aoSessionId: spawnResult.sessionId,
+        dispatchId
+      });
+      return;
+    }
+
+    const deliveryFailure = await this.checkSpawnedDispatchDelivery({
+      task,
+      sessionId: spawnResult.sessionId,
+      dispatchContextPath,
+      manifest: dispatchManifest
+    });
+    if (deliveryFailure) {
+      const attempt = (await this.options.store.readState(this.options.workflowId)).pendingDispatch?.attempt ?? 0;
+      await this.failDispatchContextDelivery({
+        task,
+        sessionId: spawnResult.sessionId,
+        attempt,
+        dispatchContextPath,
+        detail: deliveryFailure
       });
       return;
     }
@@ -565,7 +626,7 @@ export class ContinuousExecutionRunner {
       if (!status) {
         continue;
       }
-      if (terminalSuccessStatuses.has(status) || status === "needs_input") {
+      if (actionableAoStatuses.has(status)) {
         const latest = await this.options.store.readState(this.options.workflowId);
         const latestTaskState = latest.taskStates[taskState.taskId] ?? effectiveTaskState;
         const release = latest.manualGateReleases.find((item) => item.taskId === taskState.taskId);
@@ -805,10 +866,11 @@ export class ContinuousExecutionRunner {
       }
       case "blocked": {
         const message = outcome.reason;
+        const failureKind = outcome.failureKind ?? "manual_gate_blocked";
         await this.options.store.update(this.options.workflowId, (current) =>
-          failCurrentState(withTaskFailureReason(current, input.taskState.taskId, "manual_gate_blocked"), {
+          failCurrentState(withTaskFailureReason(current, input.taskState.taskId, failureKind), {
             taskId: input.taskState.taskId,
-            kind: "manual_gate_blocked",
+            kind: failureKind,
             message
           })
         );
@@ -1146,6 +1208,84 @@ export class ContinuousExecutionRunner {
     return normalizeAoSessions(await this.options.ao.listSessions());
   }
 
+  private async checkSpawnedDispatchDelivery(input: {
+    task: ExecutionTask;
+    sessionId: string;
+    dispatchContextPath?: string;
+    manifest?: DispatchContextManifest;
+  }): Promise<DispatchDeliveryFailureDetail | undefined> {
+    let sessions: AoSessionSnapshot[];
+    try {
+      sessions = await this.listAoSessions();
+    } catch (error) {
+      return {
+        taskId: input.task.taskId,
+        aoSessionId: input.sessionId,
+        dispatchContextPath: input.dispatchContextPath,
+        expectedMarkers: input.manifest?.requiredPromptMarkers ?? [],
+        actualPromptLength: 0,
+        actualPromptPreview: "",
+        reason: "session_read_failed",
+        message: error instanceof Error ? error.message : String(error),
+        suggestedAction: "Restart AO or upgrade AO CLI, then force redispatch the task."
+      };
+    }
+    const session = sessions.find((item) => item.id === input.sessionId);
+    return validateDispatchContextDelivery({
+      task: input.task,
+      session,
+      dispatchContextPath: input.dispatchContextPath,
+      manifest: input.manifest
+    });
+  }
+
+  private async failDispatchContextDelivery(input: {
+    task: ExecutionTask;
+    sessionId?: string;
+    attempt: number;
+    dispatchContextPath?: string;
+    detail: DispatchDeliveryFailureDetail;
+  }): Promise<void> {
+    const message =
+      "AO dispatch context was not delivered; execution is interrupted to prevent AO from judging only an empty worktree.";
+    await this.options.store.update(this.options.workflowId, (current) =>
+      failCurrentState({
+        ...current,
+        currentTaskId: input.task.taskId,
+        pendingDispatch: null,
+        taskStates: {
+          ...current.taskStates,
+          [input.task.taskId]: {
+            ...(current.taskStates[input.task.taskId] ?? createTaskState(input.task, input.attempt)),
+            status: "blocked_for_human",
+            aoRole: input.task.aoRole,
+            aoSessionId: input.sessionId,
+            attempt: input.attempt,
+            startedAt: current.taskStates[input.task.taskId]?.startedAt ?? new Date().toISOString(),
+            completedAt: null,
+            failureReason: "ao_dispatch_context_not_delivered",
+            dispatchContextPath: input.dispatchContextPath,
+            statusObservations: []
+          }
+        }
+      }, {
+        taskId: input.task.taskId,
+        kind: "ao_dispatch_context_not_delivered",
+        message,
+        detail: input.detail as unknown as Record<string, unknown>
+      })
+    );
+    await this.options.store.appendLog(this.options.workflowId, {
+      type: "ao_dispatch_context_delivery_failed",
+      taskId: input.task.taskId,
+      attempt: input.attempt,
+      actor: "runner",
+      aoSessionId: input.sessionId,
+      dispatchContextPath: input.dispatchContextPath,
+      detail: input.detail
+    });
+  }
+
   private async logDecision(action: string, taskId?: string): Promise<void> {
     if (action === "waiting_manual_gate") {
       await this.options.store.appendLog(this.options.workflowId, {
@@ -1262,6 +1402,9 @@ export async function retryExecutionTask(input: {
     if (current.failure?.taskId === input.taskId && current.failure.kind === "ao_task_needs_structured_decision") {
       throw new Error("Task needs structured decision; retry is disabled until a valid decision artifact is recorded or reconciled");
     }
+    if (current.failure?.taskId === input.taskId && current.failure.kind === "ao_dispatch_context_not_delivered") {
+      throw new Error("Task dispatch context was not delivered; use force redispatch to create a new AO session");
+    }
     if (!task || (task.status !== "blocked_for_human" && task.status !== "failed" && !retryableFailedDispatch)) {
       throw new Error(`Task ${input.taskId} is not retryable`);
     }
@@ -1287,6 +1430,58 @@ export async function retryExecutionTask(input: {
     taskId: input.taskId,
     attempt: state.taskStates[input.taskId]?.attempt ?? 0,
     actor: input.actor ?? "user"
+  });
+  return state;
+}
+
+export async function forceRedispatchTask(input: {
+  store: ExecutionStateStore;
+  workflowId: string;
+  taskId: string;
+  actor?: "user" | "cli" | "web";
+}): Promise<ExecutionState> {
+  const state = await input.store.update(input.workflowId, (current) => {
+    const task = current.taskStates[input.taskId];
+    if (!task) {
+      throw new Error(`Unknown task ${input.taskId}`);
+    }
+    const allowedKinds: ExecutionErrorKind[] = [
+      "ao_dispatch_context_not_delivered",
+      "ao_task_needs_structured_decision"
+    ];
+    if (
+      current.status !== "failed" ||
+      current.failure?.taskId !== input.taskId ||
+      !allowedKinds.includes(current.failure.kind)
+    ) {
+      throw new Error(`Task ${input.taskId} is not eligible for force redispatch`);
+    }
+    return {
+      ...current,
+      status: "running",
+      currentTaskId: null,
+      failure: null,
+      supersededSessions: task.aoSessionId
+        ? [...new Set([...(current.supersededSessions ?? []), task.aoSessionId])]
+        : current.supersededSessions,
+      taskStates: {
+        ...current.taskStates,
+        [input.taskId]: {
+          ...task,
+          status: "pending",
+          aoSessionId: undefined,
+          failureReason: null,
+          statusObservations: []
+        }
+      }
+    };
+  }) as ExecutionState;
+  await input.store.appendLog(input.workflowId, {
+    type: "task_retry_requested",
+    taskId: input.taskId,
+    attempt: state.taskStates[input.taskId]?.attempt ?? 0,
+    actor: input.actor ?? "user",
+    forceRedispatch: true
   });
   return state;
 }
@@ -1910,6 +2105,49 @@ export async function dispatchManualGateReview(input: {
     });
     return failed;
   }
+  const sessionsAfterSpawn = await normalizeAoSessions(await input.ao.listSessions());
+  const deliveryFailure = validateDispatchContextDelivery({
+    task,
+    session: sessionsAfterSpawn.find((session) => session.id === spawnResult.sessionId),
+    dispatchContextPath: context.contextPath,
+    manifest: context.manifest
+  });
+  if (deliveryFailure) {
+    const failed = await input.store.update(input.workflowId, (current) =>
+      failCurrentState({
+        ...current,
+        currentTaskId: input.taskId,
+        pendingDispatch: null,
+        taskStates: {
+          ...current.taskStates,
+          [input.taskId]: {
+            ...(current.taskStates[input.taskId] ?? createTaskState(task, pending.attempt)),
+            status: "blocked_for_human",
+            aoRole: task.aoRole,
+            aoSessionId: spawnResult.sessionId,
+            failureReason: "ao_dispatch_context_not_delivered",
+            dispatchContextPath: context.contextPath,
+            statusObservations: []
+          }
+        }
+      }, {
+        taskId: input.taskId,
+        kind: "ao_dispatch_context_not_delivered",
+        message: "AO dispatch context was not delivered; execution is interrupted to prevent AO from judging only an empty worktree.",
+        detail: deliveryFailure as unknown as Record<string, unknown>
+      })
+    ) as ExecutionState;
+    await input.store.appendLog(input.workflowId, {
+      type: "ao_dispatch_context_delivery_failed",
+      taskId: input.taskId,
+      attempt: pending.attempt,
+      actor: input.actor ?? "user",
+      aoSessionId: spawnResult.sessionId,
+      dispatchContextPath: context.contextPath,
+      detail: deliveryFailure
+    });
+    return failed;
+  }
   const updated = await input.store.update(input.workflowId, (current) => ({
     ...current,
     status: "running",
@@ -2318,6 +2556,112 @@ function getAutoReviewManualGateTaskIds(plan: TaskPlan): Set<string> {
       .filter((task) => task.dependencyCondition === "manual_gate")
       .map((task) => task.taskId)
   );
+}
+
+interface DispatchDeliveryFailureDetail {
+  taskId: string;
+  aoSessionId?: string;
+  dispatchContextPath?: string;
+  expectedMarkers: string[];
+  missingMarkers?: string[];
+  actualPromptLength: number;
+  actualPromptPreview: string;
+  reason: "session_missing" | "prompt_marker_missing" | "role_missing" | "role_mismatch" | "session_read_failed";
+  message?: string;
+  expectedRole?: string;
+  actualRole?: string;
+  suggestedAction: string;
+}
+
+function validateDispatchContextDelivery(input: {
+  task: ExecutionTask;
+  session?: AoSessionSnapshot;
+  dispatchContextPath?: string;
+  manifest?: DispatchContextManifest;
+}): DispatchDeliveryFailureDetail | undefined {
+  const expectedMarkers = [
+    ...(input.manifest?.requiredPromptMarkers ?? []),
+    "dispatchContextManifest",
+    ...(input.dispatchContextPath ? [input.dispatchContextPath] : []),
+    ...(input.manifest?.deliveryToken ? [input.manifest.deliveryToken] : [])
+  ].filter((value, index, values): value is string =>
+    typeof value === "string" && value.length > 0 && values.indexOf(value) === index
+  );
+  const suggestedAction = "Restart AO or upgrade AO CLI, then force redispatch the task.";
+  if (!input.session) {
+    return {
+      taskId: input.task.taskId,
+      dispatchContextPath: input.dispatchContextPath,
+      expectedMarkers,
+      actualPromptLength: 0,
+      actualPromptPreview: "",
+      reason: "session_missing",
+      suggestedAction
+    };
+  }
+
+  const prompt = input.session.prompt ?? "";
+  const missingMarkers = expectedMarkers.filter((marker) => !promptContainsMarker(prompt, marker));
+  const hasManifestMarker = promptContainsMarker(prompt, "dispatchContextManifest");
+  const hasPathOrToken = [
+    input.dispatchContextPath,
+    input.manifest?.deliveryToken
+  ].some((marker) => marker ? promptContainsMarker(prompt, marker) : false);
+  if (!hasManifestMarker || !hasPathOrToken || missingMarkers.length > 0) {
+    return {
+      taskId: input.task.taskId,
+      aoSessionId: input.session.id,
+      dispatchContextPath: input.dispatchContextPath,
+      expectedMarkers,
+      missingMarkers,
+      actualPromptLength: prompt.length,
+      actualPromptPreview: prompt.slice(0, 500),
+      reason: "prompt_marker_missing",
+      suggestedAction
+    };
+  }
+
+  if (!input.session.role) {
+    return {
+      taskId: input.task.taskId,
+      aoSessionId: input.session.id,
+      dispatchContextPath: input.dispatchContextPath,
+      expectedMarkers,
+      actualPromptLength: prompt.length,
+      actualPromptPreview: prompt.slice(0, 500),
+      reason: "role_missing",
+      expectedRole: input.task.aoRole,
+      suggestedAction
+    };
+  }
+  if (input.session.role !== input.task.aoRole) {
+    return {
+      taskId: input.task.taskId,
+      aoSessionId: input.session.id,
+      dispatchContextPath: input.dispatchContextPath,
+      expectedMarkers,
+      actualPromptLength: prompt.length,
+      actualPromptPreview: prompt.slice(0, 500),
+      reason: "role_mismatch",
+      expectedRole: input.task.aoRole,
+      actualRole: input.session.role,
+      suggestedAction
+    };
+  }
+  return undefined;
+}
+
+function promptContainsMarker(prompt: string, marker: string): boolean {
+  return buildPromptMarkerVariants(marker).some((variant) => prompt.includes(variant));
+}
+
+function buildPromptMarkerVariants(marker: string): string[] {
+  return [
+    marker,
+    marker.replaceAll("\\", "/"),
+    marker.replaceAll("/", "\\"),
+    marker.replaceAll("\\", "\\\\")
+  ].filter((value, index, values) => value.length > 0 && values.indexOf(value) === index);
 }
 
 function withAoReviewManualGateRelease(

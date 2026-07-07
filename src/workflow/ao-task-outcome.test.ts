@@ -34,6 +34,21 @@ describe("resolveAoTaskOutcome", () => {
     );
   });
 
+  it("does not resolve non-actionable AO statuses as completed", async () => {
+    const context = await createContext();
+    const outcome = await resolveAoTaskOutcome({
+      ...context,
+      session: { id: "ft-1", status: "idle" },
+      manualGateMode: "ao_review"
+    });
+
+    expect(outcome).toMatchObject({
+      kind: "needs_human",
+      failureKind: "ao_task_needs_input",
+      reason: "Unexpected non-actionable AO status reached outcome resolver: idle"
+    });
+  });
+
   it("returns rework_required from a canonical AO review decision artifact", async () => {
     const context = await createContext();
     await writeFile(

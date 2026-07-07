@@ -16,6 +16,7 @@ import {
   decideManualGate,
   dispatchReworkTask,
   dispatchManualGateReview,
+  forceRedispatchTask,
   markExecutionTaskCompleted,
   reconcileExecutionTaskArtifacts,
   retryExecutionTask,
@@ -42,7 +43,7 @@ import {
 } from "../workflow/task-plan-revision-review-loop.js";
 
 type ExecutionAoAdapter = Pick<AoCliAdapter, "spawnTask" | "listSessions"> &
-  Partial<Pick<AoCliAdapter, "validateDispatchPrerequisites">>;
+  Partial<Pick<AoCliAdapter, "validateDispatchPrerequisites" | "sendFollowUpInstruction">>;
 
 export interface ExecutionJobSnapshot {
   jobId: string;
@@ -97,6 +98,12 @@ export interface ExecutionTaskSnapshot {
   completedAt?: string | null;
   failureReason?: string | null;
   statusObservations?: ExecutionTaskState["statusObservations"];
+  dispatchContextPath?: string;
+  aoLifecycleStatus?: string;
+  aoReportedState?: string;
+  aoReportedAt?: string;
+  aoReportedNote?: string;
+  aoNormalizedStatus?: string;
 }
 
 export interface ArtifactDiagnosticsSnapshot {
@@ -250,8 +257,16 @@ export class ExecutionJobManager {
     try {
       const plan = await this.input.store.readActiveTaskPlan(state);
       summary = summarizeExecutionState(plan, state);
+      const sessions = await this.safeListSessions();
       tasks = plan.tasks.map((task) => {
         const runtime = state.taskStates[task.taskId];
+        const session = runtime?.aoSessionId
+          ? sessions.find((item) => item.id === runtime.aoSessionId)
+          : sessions.find((item) =>
+              [item.prompt, item.displayName, item.branch].some((value) =>
+                value?.startsWith(`[${task.workflowId} / ${task.taskId}]`)
+              )
+            );
         return {
           taskId: task.taskId,
           title: task.title,
@@ -264,7 +279,13 @@ export class ExecutionJobManager {
           startedAt: runtime?.startedAt,
           completedAt: runtime?.completedAt,
           failureReason: runtime?.failureReason,
-          statusObservations: runtime?.statusObservations
+          statusObservations: runtime?.statusObservations,
+          dispatchContextPath: runtime?.dispatchContextPath,
+          aoLifecycleStatus: session?.lifecycleStatus,
+          aoReportedState: session?.reportedState,
+          aoReportedAt: session?.reportedAt,
+          aoReportedNote: session?.reportedNote,
+          aoNormalizedStatus: session?.status
         };
       });
       activeTask =
@@ -347,6 +368,68 @@ export class ExecutionJobManager {
       await this.releasePreparedContinuation(job);
       throw error;
     }
+  }
+
+  async forceRedispatch(jobId: string, taskId: string): Promise<ExecutionJobSnapshot> {
+    const job = this.requireJob(jobId);
+    const ao = await this.prepareContinuation(job);
+    try {
+      await forceRedispatchTask({
+        store: this.input.store,
+        workflowId: job.workflowId,
+        taskId,
+        actor: "web"
+      });
+      this.startRunner(job, ao);
+      return this.getSnapshot(jobId);
+    } catch (error) {
+      await this.releasePreparedContinuation(job);
+      throw error;
+    }
+  }
+
+  async requestStructuredDecision(jobId: string, taskId: string): Promise<ExecutionJobSnapshot> {
+    const job = this.requireJob(jobId);
+    const state = await this.input.store.ensureState(job.workflowId);
+    const taskState = state.taskStates[taskId];
+    if (!taskState?.aoSessionId) {
+      throw httpError(400, `Task ${taskId} has no AO session for follow-up instruction`);
+    }
+    const ao = this.input.createAo();
+    if (!ao.sendFollowUpInstruction) {
+      throw httpError(500, "AO adapter does not support follow-up instructions");
+    }
+    const plan = await this.input.store.readActiveTaskPlan(state);
+    const task = plan.tasks.find((item) => item.taskId === taskId);
+    if (!task) {
+      throw httpError(404, `Unknown task ${taskId}`);
+    }
+    const artifactDir = this.input.store.getWorkflowDir(job.workflowId);
+    const dependencyArtifacts = resolveInputArtifacts(task, plan, artifactDir).map((artifact) => artifact.path);
+    const expectedOutputs = resolveOutputArtifacts(task, artifactDir).map((artifact) => artifact.path);
+    const instruction = [
+      `[${job.workflowId} / ${taskId}] 请补充结构化门禁决策。`,
+      `dispatchContextPath=${taskState.dispatchContextPath ?? ""}`,
+      "必须先读取 dispatch context，并基于 manifest.originalAoPrompt 与控制面产物作出结论。",
+      "必须读取以下 dependencyArtifacts 后再判断上游证据是否存在：",
+      ...(dependencyArtifacts.length > 0 ? dependencyArtifacts.map((path) => `- ${path}`) : ["- 无显式 dependencyArtifacts"]),
+      "请写入以下 expectedOutputs 中适用的结构化产物：",
+      ...expectedOutputs.map((path) => `- ${path}`),
+      'decision JSON 必须包含 source="ao_review" 和当前 aoSessionId。',
+      "完成后再 ao report completed；如果无法继续，请写 blocked decision JSON 后上报。"
+    ].join("\n");
+    await ao.sendFollowUpInstruction(taskState.aoSessionId, instruction);
+    await this.input.store.appendLog(job.workflowId, {
+      type: "ao_follow_up_instruction_sent",
+      taskId,
+      attempt: taskState.attempt,
+      actor: "web",
+      aoSessionId: taskState.aoSessionId,
+      dispatchContextPath: taskState.dispatchContextPath,
+      dependencyArtifacts,
+      expectedOutputs
+    });
+    return this.getSnapshot(jobId);
   }
 
   async markCompleted(

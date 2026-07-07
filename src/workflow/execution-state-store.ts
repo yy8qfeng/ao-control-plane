@@ -34,6 +34,7 @@ export type ExecutionTaskRuntimeStatus =
   "pending" | "working" | "completed" | "blocked_for_human" | "failed" | "superseded";
 
 export type ExecutionErrorKind =
+  | "ao_dispatch_context_not_delivered"
   | "ao_spawn_failed"
   | "ao_status_failed"
   | "ao_task_failed"
@@ -66,6 +67,7 @@ export interface ExecutionFailure {
   kind: ExecutionErrorKind;
   message: string;
   occurredAt: string;
+  detail?: Record<string, unknown>;
   spawnCandidateSessionIds?: string[];
 }
 
@@ -77,6 +79,8 @@ export interface AoStatusObservation {
 
 export const executionLogTypeSchema = z.enum([
   "ao_dispatch_context_created",
+  "ao_dispatch_context_delivery_failed",
+  "ao_follow_up_instruction_sent",
   "artifact_context_missing",
   "artifact_contract_missing",
   "artifact_contract_resolved",
@@ -230,6 +234,7 @@ const executionStateSchema = z.object({
     .object({
       taskId: z.string().min(1).optional(),
       kind: z.enum([
+        "ao_dispatch_context_not_delivered",
         "ao_spawn_failed",
         "ao_status_failed",
         "ao_task_failed",
@@ -259,6 +264,7 @@ const executionStateSchema = z.object({
       ]),
       message: z.string().min(1),
       occurredAt: z.string().min(1),
+      detail: z.record(z.unknown()).optional(),
       spawnCandidateSessionIds: z.array(z.string().min(1)).optional()
     })
     .nullable()

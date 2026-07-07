@@ -31,6 +31,7 @@ export type AoTaskOutcome =
   | {
       kind: "blocked";
       source: "artifact" | "report" | "ao_status";
+      failureKind?: "ao_task_failed" | "ao_task_stuck" | "manual_gate_blocked";
       reason: string;
       findings?: AoOutcomeFinding[];
     }
@@ -123,23 +124,27 @@ export async function resolveAoTaskOutcome(input: {
     return { kind: "completed", source: "ao_status", message: `AO session status is ${status}` };
   }
 
-  if (status === "needs_input" && isGateLike && expectsStructuredDecision) {
+  if ((status === "needs_input" || status === "waiting") && isGateLike && expectsStructuredDecision) {
     return {
       kind: "needs_structured_decision",
       source: "ao_status",
       failureKind: "ao_task_needs_structured_decision",
       requiredOutputs,
       reportSummary: input.session?.reportedState,
-      message: "AO requested input but did not write a structured decision artifact"
+      message: status === "waiting"
+        ? "AO reviewer reported waiting but did not write a structured decision artifact"
+        : "AO requested input but did not write a structured decision artifact"
     };
   }
 
-  if (status === "needs_input") {
+  if (status === "needs_input" || status === "waiting") {
     return {
       kind: "needs_human",
       source: "ao_status",
       failureKind: "ao_task_needs_input",
-      reason: "AO session requested input and no structured outcome artifact was found"
+      reason: status === "waiting"
+        ? "AO session reported waiting and no structured outcome artifact was found"
+        : "AO session requested input and no structured outcome artifact was found"
     };
   }
 
@@ -147,11 +152,19 @@ export async function resolveAoTaskOutcome(input: {
     return {
       kind: "blocked",
       source: "ao_status",
+      failureKind: status === "stuck" ? "ao_task_stuck" : "ao_task_failed",
       reason: `AO session reported terminal status: ${status}`
     };
   }
 
-  return { kind: "completed", source: "report", message: "No terminal AO outcome yet" };
+  return {
+    kind: "needs_human",
+    source: "ao_status",
+    failureKind: "ao_task_needs_input",
+    reason: status
+      ? `Unexpected non-actionable AO status reached outcome resolver: ${status}`
+      : "AO outcome resolver was called without a session status"
+  };
 }
 
 export function hasCanonicalReviewerSourceProof(

@@ -5,7 +5,10 @@ export interface AoSessionSnapshot {
   id: string;
   role?: string;
   status?: string;
+  lifecycleStatus?: string;
   reportedState?: string;
+  reportedAt?: string;
+  reportedNote?: string;
   prompt?: string;
   createdAt?: string;
   displayName?: string;
@@ -14,6 +17,12 @@ export interface AoSessionSnapshot {
   prUrl?: string;
   ciStatus?: string;
   reviewStatus?: string;
+  // Reserved for consumers that persist delivery diagnostics on session snapshots.
+  deliveryCheck?: {
+    status: "delivered" | "marker_missing" | "field_truncated" | "unknown";
+    checkedAt: string;
+    dispatchContextPath?: string;
+  };
 }
 
 export interface TaskSessionMapping {
@@ -34,7 +43,7 @@ export interface CompletionReport {
 }
 
 const terminalSuccessStatuses = new Set(["completed", "mergeable", "merged", "done"]);
-const terminalFailureStatuses = new Set(["failed", "stuck", "ci_failed", "needs_input"]);
+const terminalFailureStatuses = new Set(["failed", "stuck", "ci_failed"]);
 const identifierBoundaryPattern = /(?:\s|$)/;
 
 export function normalizeAoSessions(value: unknown): AoSessionSnapshot[] {
@@ -47,14 +56,20 @@ export function normalizeAoSessions(value: unknown): AoSessionSnapshot[] {
       : [];
 
   return rawSessions.filter(isRecord).map((session) => {
-    const reportedState = readLatestAcceptedReportState(session);
+    const report = readLatestAcceptedReport(session);
+    const lifecycleStatus = readString(session, ["status", "state"]);
+    const createdAt = readString(session, ["createdAt", "created_at"]);
+    const status = resolveNormalizedStatus({ lifecycleStatus, report, createdAt });
     return {
       id: readString(session, ["id", "sessionId", "name"]) ?? "",
-      role: readString(session, ["role"]),
-      status: reportedState === "completed" ? "completed" : readString(session, ["status", "state"]),
-      reportedState,
-      prompt: readString(session, ["prompt"]),
-      createdAt: readString(session, ["createdAt", "created_at"]),
+      role: readString(session, ["role", "workerRole", "worker_role", "agent_role"]),
+      status,
+      lifecycleStatus,
+      reportedState: report?.state,
+      reportedAt: report?.at,
+      reportedNote: report?.note,
+      prompt: readString(session, ["prompt", "userPrompt", "user_prompt", "inputPrompt", "input_prompt"]),
+      createdAt,
       displayName: readString(session, ["displayName", "display_name", "name"]),
       branch: readString(session, ["branch"]),
       worktreePath: readString(session, ["worktreePath", "worktree_path", "worktree", "workspacePath", "workspace_path", "workspace"]),
@@ -111,8 +126,11 @@ export function getAoSessionSnapshotKeys(): string[] {
     "createdAt",
     "displayName",
     "id",
+    "lifecycleStatus",
     "prUrl",
     "prompt",
+    "reportedAt",
+    "reportedNote",
     "reportedState",
     "reviewStatus",
     "role",
@@ -164,13 +182,62 @@ function readString(record: Record<string, unknown>, keys: string[]): string | u
   return undefined;
 }
 
-function readLatestAcceptedReportState(session: Record<string, unknown>): string | undefined {
+function readLatestAcceptedReport(session: Record<string, unknown>):
+  | { state: string; at?: string; note?: string }
+  | undefined {
   const reports = session.reports;
-  if (!Array.isArray(reports)) {
-    return undefined;
+  const latestAccepted = Array.isArray(reports) ? findLatestAcceptedReport(reports) : undefined;
+  const topLevelState = readString(session, ["agentReportedState", "agent_reported_state"]);
+  const topLevelAt = readString(session, ["agentReportedAt", "agent_reported_at"]);
+  const topLevelNote = readString(session, ["agentReportedNote", "agent_reported_note"]);
+  const topLevel = topLevelState
+    ? { state: topLevelState, at: topLevelAt, note: topLevelNote }
+    : undefined;
+  const nested = latestAccepted
+    ? {
+        state: readString(latestAccepted, ["reportState", "state", "agentReportedState"]) ?? "",
+        at: readString(latestAccepted, ["timestamp", "createdAt", "created_at", "updatedAt", "updated_at", "reportedAt", "reported_at"]),
+        note: readString(latestAccepted, ["note", "message", "summary", "agentReportedNote"])
+      }
+    : undefined;
+  if (nested && !nested.state) {
+    return topLevel;
   }
-  const latestAccepted = findLatestAcceptedReport(reports);
-  return latestAccepted ? readString(latestAccepted, ["reportState", "state"]) : undefined;
+  if (!nested || !topLevel) {
+    return nested ?? topLevel;
+  }
+  const topLevelTime = readReportTime(topLevel.at);
+  const nestedTime = readReportTime(nested.at);
+  if (topLevelTime === Number.NEGATIVE_INFINITY && nestedTime === Number.NEGATIVE_INFINITY) {
+    return nested;
+  }
+  return topLevelTime >= nestedTime ? topLevel : nested;
+}
+
+function resolveNormalizedStatus(input: {
+  lifecycleStatus?: string;
+  report?: { state: string; at?: string };
+  createdAt?: string;
+}): string | undefined {
+  if (input.lifecycleStatus && terminalFailureStatuses.has(input.lifecycleStatus)) {
+    return input.lifecycleStatus;
+  }
+  if (input.report && isReportCurrentEnough(input.report.at, input.createdAt)) {
+    return input.report.state;
+  }
+  return input.lifecycleStatus;
+}
+
+function isReportCurrentEnough(reportedAt: string | undefined, createdAt: string | undefined): boolean {
+  if (!createdAt || !reportedAt) {
+    return true;
+  }
+  const reportTime = readReportTime(reportedAt);
+  const createdTime = readReportTime(createdAt);
+  if (reportTime === Number.NEGATIVE_INFINITY || createdTime === Number.NEGATIVE_INFINITY) {
+    return true;
+  }
+  return reportTime >= createdTime;
 }
 
 function findLatestAcceptedReport(reports: unknown[]): Record<string, unknown> | undefined {
@@ -194,10 +261,20 @@ function findLatestAcceptedReport(reports: unknown[]): Record<string, unknown> |
 
 function readReportTimestamp(report: Record<string, unknown>): number {
   const timestamp = readString(report, ["timestamp", "createdAt", "created_at", "updatedAt", "updated_at"]);
+  return readReportTime(timestamp);
+}
+
+function readReportTime(timestamp: string | undefined): number {
   if (!timestamp) {
     return Number.NEGATIVE_INFINITY;
   }
 
+  if (/^\d+$/.test(timestamp)) {
+    const numeric = Number(timestamp);
+    if (Number.isFinite(numeric)) {
+      return numeric < 1_000_000_000_000 ? numeric * 1000 : numeric;
+    }
+  }
   const value = Date.parse(timestamp);
   return Number.isNaN(value) ? Number.NEGATIVE_INFINITY : value;
 }

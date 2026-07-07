@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { access, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, normalize, resolve } from "node:path";
 import type { ExecutionTask, TaskArtifact, TaskPlan } from "../schemas/task-plan.js";
@@ -55,6 +56,10 @@ export interface DispatchContextManifest {
   workflowId: string;
   taskId: string;
   attempt: number;
+  deliveryToken: string;
+  promptDigest: string;
+  requiredPromptMarkers: string[];
+  originalAoPrompt: string;
   projectRoot?: string;
   artifactDir: string;
   mustReadBeforeAskUser: ResolvedArtifact[];
@@ -147,8 +152,12 @@ export async function buildAoDispatchContext(input: {
   attempt: number;
   dispatchId?: string;
 }): Promise<BuiltDispatchContext> {
-  const manifest = buildDispatchManifest(input);
   const contextPath = getDispatchContextPath(input.artifactDir, input.task.taskId, input.attempt);
+  const manifest = buildDispatchManifest({
+    ...input,
+    dispatchContextPath: contextPath,
+    dispatchId: input.dispatchId
+  });
   const missingRequiredArtifacts = await findMissingRequiredArtifacts([
     ...manifest.coreInputs,
     ...manifest.dependencyArtifacts.flatMap((dependency) => dependency.artifacts)
@@ -156,20 +165,38 @@ export async function buildAoDispatchContext(input: {
 
   await atomicWriteJson(contextPath, manifest);
 
+  const prompt = buildAoDispatchPrompt({
+    task: input.task,
+    manifest,
+    contextPath
+  });
+
+  return { prompt, manifest, contextPath, missingRequiredArtifacts };
+}
+
+export function buildAoDispatchPrompt(input: {
+  task: ExecutionTask;
+  manifest: DispatchContextManifest;
+  contextPath: string;
+}): string {
+  const summary = buildPromptSummary(input.task, input.manifest.workflowId);
   const prompt = [
-    input.task.aoPrompt,
+    summary,
+    `workflowId=${input.manifest.workflowId}`,
+    `taskId=${input.manifest.taskId}`,
+    `任务名称=${input.task.title}`,
+    `AO 角色=${input.task.aoRole}`,
+    `deliveryToken=${input.manifest.deliveryToken}`,
     "",
-    "---",
     "AO Control Plane Context / AO 控制平面上下文",
+    `projectRoot: ${input.manifest.projectRoot ?? ""}`,
+    `artifactDir: ${input.manifest.artifactDir}`,
+    `dispatchContextManifest: ${input.contextPath}`,
     "",
-    `workflowId: ${manifest.workflowId}`,
-    `taskId: ${manifest.taskId}`,
-    `projectRoot: ${manifest.projectRoot ?? ""}`,
-    `artifactDir: ${manifest.artifactDir}`,
-    `dispatchContextManifest: ${contextPath}`,
-    "",
-    "MUST_READ_BEFORE_ASK_USER:",
-    ...formatMustReadArtifacts(manifest.mustReadBeforeAskUser),
+    "必须先读取调度器上下文文件，然后读取 manifest.originalAoPrompt 作为完整任务正文，再开始执行。",
+    input.contextPath,
+    "禁止只依据 AO worktree 判断上游产物缺失。",
+    "如果无法读取该 manifest，必须 ao report needs-input，并说明 manifest 路径读取失败。",
     "",
     "AskUserQuestion policy:",
     "1. Forbidden before reading every existing file in MUST_READ_BEFORE_ASK_USER.",
@@ -177,41 +204,37 @@ export async function buildAoDispatchContext(input: {
     "3. Allowed only after checking the absolute artifactDir paths above and listing exactly which required file is missing.",
     "",
     "coreInputs: control-plane inputs",
-    ...manifest.coreInputs.map(
+    ...input.manifest.coreInputs.map(
       (artifact, index) => `${index + 1}. INPUT ${formatArtifactForPrompt(artifact)}`
     ),
     "",
     "dependencyArtifacts: required task inputs; read before asking for user help",
-    ...manifest.dependencyArtifacts.flatMap((dependency) => [
+    ...input.manifest.dependencyArtifacts.flatMap((dependency) => [
       `- ${dependency.taskId} / ${dependency.title}`,
       ...dependency.artifacts.map((artifact) => `  - INPUT ${formatArtifactForPrompt(artifact)}`)
     ]),
     "",
     "expectedOutputs: task outputs to create; absence before task execution is normal",
-    ...manifest.expectedOutputs.map(
+    ...input.manifest.expectedOutputs.map(
       (artifact, index) => `${index + 1}. OUTPUT ${formatArtifactForPrompt(artifact)}`
     ),
     "",
-    "artifactContracts: canonical output rules",
-    ...manifest.artifactContracts.flatMap((contract, index) => [
-      `${index + 1}. ${contract.contractId}: canonical=${contract.canonicalPath}, contentType=${contract.contentType}`,
-      `  - producer=${contract.producer.taskMatcher}, requiredJsonFields=${contract.requiredJsonFields.join(",") || "-"}`,
-      `  - ownership=${contract.ownership.requiredFields.join(",") || "-"}, sessionField=${contract.ownership.sessionField ?? "-"}`,
-      `  - completionChecks=${contract.completionChecks.join(",")}`,
-      ...contract.candidatePaths
-        .filter((candidate) => candidate.purpose !== "primary")
-        .map(
-          (candidate) =>
-            `  - allowed ${candidate.purpose}: ${candidate.relativeTo}:${candidate.file} => ${candidate.absolutePath}`
-        )
-    ]),
+    "MUST_READ_BEFORE_ASK_USER:",
+    ...formatMustReadArtifacts(input.manifest.mustReadBeforeAskUser),
     "",
     "instructions:",
-    ...dispatchInstructions.map((instruction, index) => `${index + 1}. ${instruction}`),
-    "---"
+    ...dispatchInstructions.map((instruction, index) => `${index + 1}. ${instruction}`)
   ].join("\n");
+  return prompt;
+}
 
-  return { prompt, manifest, contextPath, missingRequiredArtifacts };
+export function buildPromptSummary(task: ExecutionTask, workflowId: string): string {
+  const fallback = `[${workflowId} / ${task.taskId}] ${task.title}`;
+  const firstLine = task.aoPrompt.split(/\r?\n/).find((line) => line.trim())?.trim();
+  if (!firstLine || firstLine.length > 100 || looksLikeStructuredContent(firstLine)) {
+    return fallback;
+  }
+  return firstLine.length > 80 ? `${firstLine.slice(0, 77)}...` : firstLine;
 }
 
 export function getDispatchContextPath(
@@ -232,8 +255,22 @@ export function buildDispatchManifest(input: {
   projectRoot?: string;
   artifactDir: string;
   attempt: number;
+  dispatchContextPath?: string;
+  dispatchId?: string;
 }): DispatchContextManifest {
   const artifactDir = normalize(input.artifactDir);
+  const deliveryToken = buildDeliveryToken({
+    workflowId: input.plan.workflowId,
+    taskId: input.task.taskId,
+    attempt: input.attempt,
+    dispatchId: input.dispatchId
+  });
+  const requiredPromptMarkers = [
+    "dispatchContextManifest",
+    deliveryToken,
+    buildPromptSummary(input.task, input.plan.workflowId),
+    ...(input.dispatchContextPath ? [normalize(input.dispatchContextPath)] : [])
+  ];
   const inputArtifacts = resolveInputArtifacts(input.task, input.plan, artifactDir);
   const outputArtifacts = resolveOutputArtifacts(input.task, artifactDir);
   const coreInputs = coreInputFiles.map((item) => ({
@@ -289,6 +326,10 @@ export function buildDispatchManifest(input: {
     workflowId: input.plan.workflowId,
     taskId: input.task.taskId,
     attempt: input.attempt,
+    deliveryToken,
+    promptDigest: sha256(input.task.aoPrompt),
+    requiredPromptMarkers,
+    originalAoPrompt: input.task.aoPrompt,
     projectRoot: input.projectRoot ? normalize(input.projectRoot) : undefined,
     artifactDir,
     mustReadBeforeAskUser: [
@@ -303,6 +344,23 @@ export function buildDispatchManifest(input: {
     artifactContracts,
     instructions: [...dispatchInstructions]
   };
+}
+
+function looksLikeStructuredContent(value: string): boolean {
+  return /^(?:\{|\[|```|<\?xml\b|<!doctype\b)/i.test(value.trim());
+}
+
+function buildDeliveryToken(input: {
+  workflowId: string;
+  taskId: string;
+  attempt: number;
+  dispatchId?: string;
+}): string {
+  return `ao-dispatch-context:${input.workflowId}:${input.taskId}:attempt-${input.attempt}:${input.dispatchId ?? "reserved"}`;
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 export async function synthesizeManualGateArtifacts(input: {

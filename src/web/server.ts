@@ -467,6 +467,32 @@ async function routeRequest(input: {
 
   if (
     method === "POST" &&
+    url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/tasks\/[^/]+\/force-redispatch$/)
+  ) {
+    const parts = url.pathname.split("/");
+    const jobId = decodeURIComponent(parts[4] ?? "");
+    const taskId = decodeURIComponent(parts[6] ?? "");
+    const body = (await readJsonBody(input.request)) as ProjectScopedRequest;
+    const manager = getExecutionManager(body, input);
+    sendJson(input.response, 200, await manager.forceRedispatch(jobId, taskId));
+    return;
+  }
+
+  if (
+    method === "POST" &&
+    url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/tasks\/[^/]+\/request-structured-decision$/)
+  ) {
+    const parts = url.pathname.split("/");
+    const jobId = decodeURIComponent(parts[4] ?? "");
+    const taskId = decodeURIComponent(parts[6] ?? "");
+    const body = (await readJsonBody(input.request)) as ProjectScopedRequest;
+    const manager = getExecutionManager(body, input);
+    sendJson(input.response, 200, await manager.requestStructuredDecision(jobId, taskId));
+    return;
+  }
+
+  if (
+    method === "POST" &&
     url.pathname.match(/^\/api\/ao\/execution-jobs\/[^/]+\/tasks\/[^/]+\/mark-completed$/)
   ) {
     const parts = url.pathname.split("/");
