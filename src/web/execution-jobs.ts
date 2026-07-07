@@ -14,6 +14,7 @@ import {
   approveManualGate,
   ContinuousExecutionRunner,
   decideManualGate,
+  dispatchReworkTask,
   dispatchManualGateReview,
   markExecutionTaskCompleted,
   reconcileExecutionTaskArtifacts,
@@ -22,6 +23,7 @@ import {
 } from "../workflow/continuous-plan-execution.js";
 import {
   type ExecutionState,
+  type ExecutionLogEvent,
   type ExecutionTaskState,
   type ExecutionStateStore,
   summarizeExecutionState
@@ -57,6 +59,16 @@ export interface ExecutionJobSnapshot {
   manualGateReleases?: ExecutionState["manualGateReleases"];
   manualGateContext?: ManualGateContextSnapshot;
   artifactDiagnostics?: ArtifactDiagnosticsSnapshot;
+  aoOutcome?: AoOutcomeSnapshot;
+}
+
+export interface AoOutcomeSnapshot {
+  taskId?: string;
+  latestOutcome?: ExecutionLogEvent;
+  latestStructuredDecision?: ExecutionLogEvent;
+  latestRework?: ExecutionLogEvent;
+  latestInvalid?: ExecutionLogEvent;
+  error?: string;
 }
 
 export interface ManualGateContextSnapshot {
@@ -181,7 +193,12 @@ export class ExecutionJobManager {
       );
     }
     if (state.status === "paused_for_replan") {
-      throw httpError(409, "Workflow execution is paused for replan");
+      throw httpError(
+        409,
+        state.failure?.kind === "manual_gate_rework_required"
+          ? "Workflow execution is paused waiting for upstream rework"
+          : "Workflow execution is paused for replan"
+      );
     }
     if (state.status === "running") {
       const jobId = this.getJobId(input.workflowId);
@@ -229,6 +246,7 @@ export class ExecutionJobManager {
     let activeTask: ExecutionTaskSnapshot | undefined;
     let manualGateContext: ManualGateContextSnapshot | undefined;
     let artifactDiagnostics: ArtifactDiagnosticsSnapshot | undefined;
+    let aoOutcome: AoOutcomeSnapshot | undefined;
     try {
       const plan = await this.input.store.readActiveTaskPlan(state);
       summary = summarizeExecutionState(plan, state);
@@ -258,6 +276,14 @@ export class ExecutionJobManager {
     } catch {
       summary = undefined;
     }
+    try {
+      aoOutcome = await this.buildAoOutcomeSnapshot(state);
+    } catch (error) {
+      aoOutcome = {
+        taskId: state.failure?.taskId ?? state.currentTaskId ?? undefined,
+        error: formatErrorMessage(error)
+      };
+    }
     return {
       jobId,
       workflowId: job.workflowId,
@@ -271,7 +297,8 @@ export class ExecutionJobManager {
       readonly: job.readonly,
       manualGateReleases: state.manualGateReleases,
       manualGateContext,
-      artifactDiagnostics
+      artifactDiagnostics,
+      aoOutcome
     };
   }
 
@@ -367,7 +394,8 @@ export class ExecutionJobManager {
           taskId,
           rationale: input.rationale,
           actor: "user",
-          recovery: state.status === "running"
+          recovery: state.status === "running" ||
+            state.failure?.kind === "ao_task_needs_structured_decision"
         });
       } else {
         await decideManualGate({
@@ -547,6 +575,29 @@ export class ExecutionJobManager {
     return { job: await this.getSnapshot(jobId), revision };
   }
 
+  async dispatchReworkTask(
+    jobId: string,
+    input: { gateTaskId: string; targetTaskId: string; rationale: string }
+  ): Promise<ExecutionJobSnapshot> {
+    const job = this.requireJob(jobId);
+    const ao = await this.prepareContinuation(job);
+    try {
+      await dispatchReworkTask({
+        store: this.input.store,
+        workflowId: job.workflowId,
+        gateTaskId: input.gateTaskId,
+        targetTaskId: input.targetTaskId,
+        rationale: input.rationale,
+        actor: "web"
+      });
+      this.startRunner(job, ao);
+      return this.getSnapshot(jobId);
+    } catch (error) {
+      await this.releasePreparedContinuation(job);
+      throw error;
+    }
+  }
+
   getJobId(workflowId: string): string {
     return `EXEC-${workflowId}`;
   }
@@ -713,7 +764,7 @@ export class ExecutionJobManager {
     state: ExecutionState
   ): Promise<ManualGateContextSnapshot | undefined> {
     if (
-      !["waiting_manual_gate", "running", "failed"].includes(state.status) ||
+      !["waiting_manual_gate", "running", "failed", "paused_for_replan"].includes(state.status) ||
       !state.currentTaskId
     ) {
       return undefined;
@@ -811,6 +862,33 @@ export class ExecutionJobManager {
         expectedOutputs.filter((artifact) => artifact.required)
       ),
       latestReconcile
+    };
+  }
+
+  private async buildAoOutcomeSnapshot(state: ExecutionState): Promise<AoOutcomeSnapshot | undefined> {
+    const taskId = state.failure?.taskId ?? state.currentTaskId ?? undefined;
+    const logs = await this.input.store.readLogs(state.workflowId, 100);
+    const latestOutcome = [...logs]
+      .reverse()
+      .find((event) => event.type === "ao_task_outcome_resolved" && (!taskId || event.taskId === taskId));
+    const latestStructuredDecision = [...logs]
+      .reverse()
+      .find((event) => event.type === "ao_task_needs_structured_decision" && (!taskId || event.taskId === taskId));
+    const latestRework = [...logs]
+      .reverse()
+      .find((event) => event.type === "manual_gate_rework_required" && (!taskId || event.taskId === taskId));
+    const latestInvalid = [...logs]
+      .reverse()
+      .find((event) => event.type === "ao_task_outcome_invalid" && (!taskId || event.taskId === taskId));
+    if (!latestOutcome && !latestStructuredDecision && !latestRework && !latestInvalid) {
+      return undefined;
+    }
+    return {
+      taskId,
+      latestOutcome,
+      latestStructuredDecision,
+      latestRework,
+      latestInvalid
     };
   }
 }

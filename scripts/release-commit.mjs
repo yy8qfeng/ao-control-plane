@@ -14,7 +14,7 @@ const excludedReportPathspecs = [
 
 const options = parseArgs(process.argv.slice(2));
 const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
-const nextVersion = bumpVersion(packageJson.version, options.bump);
+const nextVersion = resolveNextVersion(packageJson.version, options.bump);
 packageJson.version = nextVersion;
 writeFileSync(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`);
 
@@ -84,15 +84,37 @@ function bumpVersion(version, bump) {
   return `${major}.${minor}.${patch + 1}`;
 }
 
+function resolveNextVersion(currentVersion, bump) {
+  const headVersion = readHeadPackageVersion();
+  if (headVersion) {
+    const expectedPendingVersion = bumpVersion(headVersion, bump);
+    if (currentVersion === expectedPendingVersion) {
+      return currentVersion;
+    }
+  }
+  return bumpVersion(currentVersion, bump);
+}
+
+function readHeadPackageVersion() {
+  try {
+    const source = readCommand("git", ["show", "HEAD:package.json"]);
+    const packageJsonAtHead = JSON.parse(source);
+    return typeof packageJsonAtHead.version === "string" ? packageJsonAtHead.version : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function syncAppVersion(version) {
   const source = readFileSync(appVersionPath, "utf8");
-  const updated = source.replace(
-    /export const appVersion = "([^"]+)";/,
-    `export const appVersion = "${version}";`
-  );
-  if (updated === source) {
+  const versionPattern = /export const appVersion = "([^"]+)";/;
+  if (!versionPattern.test(source)) {
     throw new Error(`Unable to update ${appVersionPath}.`);
   }
+  const updated = source.replace(
+    versionPattern,
+    `export const appVersion = "${version}";`
+  );
   writeFileSync(appVersionPath, updated);
 }
 
@@ -106,16 +128,22 @@ function isReportFile(file) {
 }
 
 function readCommand(command, args) {
-  const result = spawnSync(command, args, { encoding: "utf8", shell: process.platform === "win32" });
+  const result = spawnSync(command, args, { encoding: "utf8", shell: shouldUseShell(command) });
   if (result.status !== 0) {
-    throw new Error(result.stderr || `${command} ${args.join(" ")} failed.`);
+    throw new Error(result.stderr || result.error?.message || `${command} ${args.join(" ")} failed.`);
   }
   return result.stdout;
 }
 
 function run(command, args) {
-  const result = spawnSync(command, args, { stdio: "inherit", shell: process.platform === "win32" });
+  const result = spawnSync(command, args, { stdio: "inherit", shell: shouldUseShell(command) });
   if (result.status !== 0) {
-    throw new Error(`${command} ${args.join(" ")} failed with exit code ${result.status}.`);
+    throw new Error(
+      result.error?.message || `${command} ${args.join(" ")} failed with exit code ${result.status}.`
+    );
   }
+}
+
+function shouldUseShell(command) {
+  return process.platform === "win32" && command === "pnpm";
 }

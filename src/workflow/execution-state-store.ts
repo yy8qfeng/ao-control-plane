@@ -39,8 +39,10 @@ export type ExecutionErrorKind =
   | "ao_task_failed"
   | "ao_task_stuck"
   | "ao_task_needs_input"
+  | "ao_task_needs_structured_decision"
   | "manual_gate_blocked"
   | "manual_gate_requires_replan"
+  | "manual_gate_rework_required"
   | "revision_requested"
   | "revision_failed"
   | "dependency_deadlock"
@@ -91,10 +93,16 @@ export const executionLogTypeSchema = z.enum([
   "artifact_output_reconcile_skipped",
   "artifact_output_reconcile_started",
   "artifact_output_recovered_from_worktree",
+  "ao_task_needs_structured_decision",
+  "ao_task_needs_input",
+  "ao_task_outcome_invalid",
+  "ao_task_outcome_resolved",
   "dispatcher_stopped",
   "manual_gate_approved",
   "manual_gate_artifact_write_failed",
+  "manual_gate_decision_invalid",
   "manual_gate_decided",
+  "manual_gate_rework_required",
   "manual_gate_review_dispatched",
   "migrate_plan_status_confirmed",
   "manual_gate_waiting",
@@ -227,8 +235,10 @@ const executionStateSchema = z.object({
         "ao_task_failed",
         "ao_task_stuck",
         "ao_task_needs_input",
+        "ao_task_needs_structured_decision",
         "manual_gate_blocked",
         "manual_gate_requires_replan",
+        "manual_gate_rework_required",
         "revision_requested",
         "revision_failed",
         "dependency_deadlock",

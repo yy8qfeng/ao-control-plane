@@ -55,4 +55,37 @@ describe("ExecutionStateStore", () => {
     expect(state.failure?.kind).toBe("plan_missing");
     expect(state.failure?.message).toContain("missing task-plan-v2.json");
   });
+
+  it("accepts AO outcome execution log types", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "ao-control-plane-state-"));
+    const workflowId = "WF-AO-OUTCOME-LOGS";
+    const store = new ExecutionStateStore(tempDir);
+    await mkdir(store.getWorkflowDir(workflowId), { recursive: true });
+
+    for (const type of [
+      "ao_task_outcome_resolved",
+      "ao_task_needs_structured_decision",
+      "ao_task_needs_input",
+      "ao_task_outcome_invalid",
+      "manual_gate_decision_invalid",
+      "manual_gate_rework_required"
+    ] as const) {
+      await store.appendLog(workflowId, {
+        type,
+        taskId: "TASK-001",
+        attempt: 1,
+        actor: "runner"
+      });
+    }
+
+    const logs = await store.readLogs(workflowId);
+    expect(logs.map((event) => event.type)).toEqual([
+      "ao_task_outcome_resolved",
+      "ao_task_needs_structured_decision",
+      "ao_task_needs_input",
+      "ao_task_outcome_invalid",
+      "manual_gate_decision_invalid",
+      "manual_gate_rework_required"
+    ]);
+  });
 });

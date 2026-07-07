@@ -57,6 +57,7 @@ export interface DispatchContextManifest {
   attempt: number;
   projectRoot?: string;
   artifactDir: string;
+  mustReadBeforeAskUser: ResolvedArtifact[];
   coreInputs: ResolvedArtifact[];
   dependencyArtifacts: Array<{
     taskId: string;
@@ -118,9 +119,11 @@ const coreInputFiles = [
 const dispatchInstructions = [
   "Do not rely only on the AO worktree.",
   "An empty AO worktree is not evidence that control-plane artifacts are missing.",
+  "Do not call AskUserQuestion before reading every required artifact listed in mustReadBeforeAskUser.",
   "Read the dispatchContextManifest for machine-readable context before reporting missing inputs.",
   "Treat artifactDir as the authoritative control-plane evidence and output directory.",
   "Dependency artifacts are required inputs; read every required dependency artifact from artifactDir before asking for user help.",
+  "Only ask the user for missing upstream input after checking mustReadBeforeAskUser absolute paths and confirming those files do not exist.",
   "Expected outputs are files you must create for this task; their absence before the task starts is normal.",
   "Do not treat a missing expected output as missing input.",
   "Write every required expected output to the exact absolute expectedOutputs.path shown in this prompt and manifest.",
@@ -129,7 +132,10 @@ const dispatchInstructions = [
   "Do not write control-plane outputs only under your AO worktree.",
   "Before reporting completed, verify every required expectedOutputs.path exists in the canonical artifactDir.",
   "If you accidentally wrote an output under your worktree .ao-control-plane, copy it to the exact expectedOutputs.path before reporting completed.",
-  'For AO review manual gates, gate decision JSON must use source="ao_review" and include your AO session id as aoSessionId.'
+  'For AO review manual gates, gate decision JSON must use source="ao_review" and include your AO session id as aoSessionId.',
+  'For review/manual_gate tasks, write exactly one structured decision JSON with decision="approved", "rework_required", or "blocked" before reporting.',
+  'If decision="rework_required", include targetTaskIds and findings[].targetTaskId/findings[].requiredAction so the scheduler can dispatch upstream rework.',
+  "Do not report needs-input for a review finding that can be expressed as a structured decision artifact."
 ] as const;
 
 export async function buildAoDispatchContext(input: {
@@ -161,6 +167,14 @@ export async function buildAoDispatchContext(input: {
     `projectRoot: ${manifest.projectRoot ?? ""}`,
     `artifactDir: ${manifest.artifactDir}`,
     `dispatchContextManifest: ${contextPath}`,
+    "",
+    "MUST_READ_BEFORE_ASK_USER:",
+    ...formatMustReadArtifacts(manifest.mustReadBeforeAskUser),
+    "",
+    "AskUserQuestion policy:",
+    "1. Forbidden before reading every existing file in MUST_READ_BEFORE_ASK_USER.",
+    "2. Forbidden when the only evidence is an empty AO worktree.",
+    "3. Allowed only after checking the absolute artifactDir paths above and listing exactly which required file is missing.",
     "",
     "coreInputs: control-plane inputs",
     ...manifest.coreInputs.map(
@@ -222,6 +236,19 @@ export function buildDispatchManifest(input: {
   const artifactDir = normalize(input.artifactDir);
   const inputArtifacts = resolveInputArtifacts(input.task, input.plan, artifactDir);
   const outputArtifacts = resolveOutputArtifacts(input.task, artifactDir);
+  const coreInputs = coreInputFiles.map((item) => ({
+    kind: item.kind,
+    path: join(artifactDir, item.file),
+    required: item.required
+  }));
+  const dependencyArtifacts = input.task.dependencies.map((dependencyId) => {
+    const dependencyTask = input.plan.tasks.find((task) => task.taskId === dependencyId);
+    return {
+      taskId: dependencyId,
+      title: dependencyTask?.title ?? dependencyId,
+      artifacts: inputArtifacts.filter((artifact) => artifact.taskId === dependencyId)
+    };
+  });
   const registry = getArtifactContractRegistry();
   const artifactContracts = outputArtifacts.flatMap((artifact) => {
     const contract = registry.resolveContractForArtifact({
@@ -264,19 +291,14 @@ export function buildDispatchManifest(input: {
     attempt: input.attempt,
     projectRoot: input.projectRoot ? normalize(input.projectRoot) : undefined,
     artifactDir,
-    coreInputs: coreInputFiles.map((item) => ({
-      kind: item.kind,
-      path: join(artifactDir, item.file),
-      required: item.required
-    })),
-    dependencyArtifacts: input.task.dependencies.map((dependencyId) => {
-      const dependencyTask = input.plan.tasks.find((task) => task.taskId === dependencyId);
-      return {
-        taskId: dependencyId,
-        title: dependencyTask?.title ?? dependencyId,
-        artifacts: inputArtifacts.filter((artifact) => artifact.taskId === dependencyId)
-      };
-    }),
+    mustReadBeforeAskUser: [
+      ...coreInputs.filter((artifact) => artifact.required),
+      ...dependencyArtifacts.flatMap((dependency) =>
+        dependency.artifacts.filter((artifact) => artifact.required)
+      )
+    ],
+    coreInputs,
+    dependencyArtifacts,
     expectedOutputs: outputArtifacts,
     artifactContracts,
     instructions: [...dispatchInstructions]
@@ -561,6 +583,16 @@ function formatArtifactForPrompt(artifact: ResolvedArtifact): string {
     ? `requiredWhen=${artifact.requiredWhen}`
     : `required=${artifact.required}`;
   return `${artifact.kind}: ${artifact.path} (${requirement})`;
+}
+
+function formatMustReadArtifacts(artifacts: ResolvedArtifact[]): string[] {
+  if (artifacts.length === 0) {
+    return ["- No required upstream input artifacts."];
+  }
+  return artifacts.map(
+    (artifact, index) =>
+      `${index + 1}. READ_FIRST ${artifact.taskId ? `${artifact.taskId} / ` : ""}${artifact.kind}: ${artifact.path}`
+  );
 }
 
 function getManualGateArtifactPaths(

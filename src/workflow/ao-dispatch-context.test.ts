@@ -237,16 +237,29 @@ describe("ao dispatch context", () => {
     });
 
     expect(context.prompt).toContain("Dependency artifacts are required inputs");
+    expect(context.prompt).toContain("MUST_READ_BEFORE_ASK_USER");
+    expect(context.prompt).toContain("Forbidden before reading every existing file in MUST_READ_BEFORE_ASK_USER");
+    expect(context.prompt).toContain("Do not call AskUserQuestion before reading every required artifact listed in mustReadBeforeAskUser");
     expect(context.prompt).toContain("Expected outputs are files you must create");
     expect(context.prompt).toContain("Do not treat a missing expected output as missing input");
     expect(context.prompt).toContain("An empty AO worktree is not evidence that control-plane artifacts are missing");
     expect(context.prompt).toContain("Write every required expected output to the exact absolute expectedOutputs.path");
     expect(context.prompt).toContain("source=\"ao_review\"");
     expect(context.prompt).toContain("INPUT ipc_byte_layout_freeze");
+    expect(context.prompt).toContain("READ_FIRST TASK-005 / ipc_byte_layout_freeze");
     expect(context.prompt).toContain("OUTPUT ipc_contract_approved_flag");
+    expect(context.manifest.mustReadBeforeAskUser).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "task_plan", required: true }),
+        expect.objectContaining({ kind: "execution_state", required: true }),
+        expect.objectContaining({ taskId: "TASK-005", kind: "ipc_byte_layout_freeze", required: true })
+      ])
+    );
     expect(context.manifest.instructions).toEqual(
       expect.arrayContaining([
+        "Do not call AskUserQuestion before reading every required artifact listed in mustReadBeforeAskUser.",
         "Dependency artifacts are required inputs; read every required dependency artifact from artifactDir before asking for user help.",
+        "Only ask the user for missing upstream input after checking mustReadBeforeAskUser absolute paths and confirming those files do not exist.",
         "Expected outputs are files you must create for this task; their absence before the task starts is normal.",
         "Do not treat a missing expected output as missing input."
       ])

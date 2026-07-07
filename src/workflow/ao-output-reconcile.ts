@@ -9,6 +9,7 @@ import {
   validateTaskOutputArtifacts,
   type ConflictArtifact
 } from "./ao-dispatch-context.js";
+import { readReviewerSourceFields } from "./ao-review-source-proof.js";
 import {
   buildCandidatePathVariants,
   getArtifactContractRegistry,
@@ -132,7 +133,7 @@ type PreparedCandidateResult =
 
 const flagSizeLimitBytes = 64 * 1024;
 const jsonSizeLimitBytes = 1024 * 1024;
-const allowedDecisions = new Set(["approved", "rework_required", "rejected"]);
+const allowedDecisions = new Set(["approved", "rework_required", "blocked", "rejected"]);
 
 export async function reconcileTaskOutputsFromAoWorktree(input: {
   task: ExecutionTask;
@@ -1016,27 +1017,20 @@ function isPathInside(pathValue: string, rootValue: string): boolean {
 }
 
 function hasAoReviewSourceProof(json: Record<string, unknown>, aoSessionId: string): boolean {
-  const source = typeof json.source === "string" ? json.source : undefined;
-  const ownSession = typeof json.aoSessionId === "string" ? json.aoSessionId : undefined;
-  if (source === "ao_review") {
-    return !ownSession || ownSession === aoSessionId;
+  const fields = readReviewerSourceFields(json);
+  if (fields.source === "ao_review") {
+    return !fields.aoSessionId || fields.aoSessionId === aoSessionId;
   }
-  if (source !== "control_plane_manual_gate") {
+  if (fields.source !== "control_plane_manual_gate") {
     return false;
   }
-  const decidedBy = typeof json.decidedBy === "string" ? json.decidedBy : undefined;
-  if (decidedBy?.includes(aoSessionId)) {
+  if (fields.decidedBy?.includes(aoSessionId)) {
     return true;
   }
-  const reviewerSessionId =
-    typeof json.reviewerSessionId === "string" ? json.reviewerSessionId : undefined;
-  if (reviewerSessionId === aoSessionId) {
+  if (fields.reviewerSessionId === aoSessionId) {
     return true;
   }
-  const reviewerIndependence = isRecord(json.reviewerIndependence)
-    ? json.reviewerIndependence
-    : undefined;
-  return reviewerIndependence?.reviewerSessionId === aoSessionId;
+  return fields.reviewerIndependence?.reviewerSessionId === aoSessionId;
 }
 
 function isDecisionArtifactKind(kind: string): boolean {
@@ -1073,10 +1067,6 @@ function createEmptyResult(): ArtifactReconcileResult {
     missing: [],
     failures: []
   };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function formatErrorMessage(error: unknown): string {

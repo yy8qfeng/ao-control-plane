@@ -20,6 +20,11 @@ import {
   rollbackRecoveredArtifacts,
   type ArtifactReconcileResult
 } from "./ao-output-reconcile.js";
+import {
+  resolveAoTaskOutcome,
+  type AoOutcomeFinding,
+  type AoTaskOutcome
+} from "./ao-task-outcome.js";
 import { isConditionalReworkTaskText, skipsOnApprovedPath, skipsOnPassPath } from "./conditional-task-conventions.js";
 import {
   type ExecutionErrorKind,
@@ -29,7 +34,7 @@ import {
   type ExecutionTaskState,
   summarizeExecutionState
 } from "./execution-state-store.js";
-import { findNextReadyTask, getCompletedTaskIds } from "./task-readiness.js";
+import { findNextReadyTask, getCompletedTaskIds, type ManualGateRelease } from "./task-readiness.js";
 import type { ExecutionTask, TaskPlan } from "../schemas/task-plan.js";
 
 export interface ContinuousExecutionRunnerOptions {
@@ -76,8 +81,7 @@ const terminalSuccessStatuses = new Set(["completed", "mergeable", "merged", "do
 const terminalFailureStatusKinds: Record<string, ExecutionErrorKind> = {
   failed: "ao_task_failed",
   stuck: "ao_task_stuck",
-  ci_failed: "ao_task_failed",
-  needs_input: "ao_task_needs_input"
+  ci_failed: "ao_task_failed"
 };
 
 export class ContinuousExecutionRunner {
@@ -514,50 +518,19 @@ export class ContinuousExecutionRunner {
       return;
     }
 
-    const missingSessionTaskIds: string[] = [];
-    const outputFailuresByTaskId = new Map<string, OutputValidationFailure>();
     for (const taskState of working) {
       const planTask = plan.tasks.find((task) => task.taskId === taskState.taskId);
       if (!planTask || taskState.aoSessionId && state.supersededSessions?.includes(taskState.aoSessionId)) {
         continue;
       }
       const session = findSessionForTaskState(taskState, planTask, sessions);
-      if (session?.status && terminalSuccessStatuses.has(session.status)) {
-        const manualGateRelease = state.manualGateReleases.find((release) => release.taskId === taskState.taskId);
-        const failure = await this.validateOrReconcileOutputs({
-          task: planTask,
-          taskState: {
-            ...taskState,
-            aoSessionId: taskState.aoSessionId ?? session.id
-          },
-          state,
-          plan,
-          sessions,
-          manualGateMode: manualGateRelease?.mode
-        });
-        if (failure) {
-          outputFailuresByTaskId.set(taskState.taskId, failure);
-        }
-      }
-    }
-    await this.options.store.update(this.options.workflowId, (current) => {
-      let next = current;
-      for (const taskState of working) {
-        if (taskState.aoSessionId && current.supersededSessions?.includes(taskState.aoSessionId)) {
-          continue;
-        }
-        const planTask = plan.tasks.find((task) => task.taskId === taskState.taskId);
-        if (!planTask) {
-          continue;
-        }
-        const session = findSessionForTaskState(taskState, planTask, sessions);
-        if (!session && !taskState.aoSessionId) {
-          missingSessionTaskIds.push(taskState.taskId);
-          next = failCurrentState({
-            ...next,
+      if (!session && !taskState.aoSessionId) {
+        await this.options.store.update(this.options.workflowId, (current) =>
+          failCurrentState({
+            ...current,
             currentTaskId: taskState.taskId,
             taskStates: {
-              ...next.taskStates,
+              ...current.taskStates,
               [taskState.taskId]: {
                 ...taskState,
                 status: "blocked_for_human",
@@ -568,63 +541,331 @@ export class ContinuousExecutionRunner {
             kind: "ao_spawn_failed",
             taskId: taskState.taskId,
             message: `Working task ${taskState.taskId} has no aoSessionId and no matching AO session; execution is interrupted for manual recovery`
-          });
-          break;
-        }
-        if (session?.id && !taskState.aoSessionId) {
-          next = attachAoSessionId(next, taskState.taskId, session.id);
-        }
-        const effectiveTaskState = {
-          ...taskState,
-          aoSessionId: taskState.aoSessionId ?? session?.id
-        };
-        const status = session?.status;
-        if (!status) {
-          continue;
-        }
-        const outputFailure = outputFailuresByTaskId.get(taskState.taskId);
-        if (outputFailure) {
-          next = failCurrentState({
-            ...next,
-            taskStates: {
-              ...next.taskStates,
-              [taskState.taskId]: {
-                ...effectiveTaskState,
-                status: "blocked_for_human",
-                failureReason: outputFailure.kind
-              }
-            }
-          }, {
-            taskId: taskState.taskId,
-            kind: outputFailure.kind,
-            message: outputFailure.message
-          });
-          break;
-        }
-        next = applyAoStatusObservation(next, taskState.taskId, status, this.options.failureConfirmationCount ?? 2);
+          })
+        );
+        await this.options.store.appendLog(this.options.workflowId, {
+          type: "task_execution_missing_session",
+          taskId: taskState.taskId,
+          attempt: taskState.attempt,
+          actor: "runner",
+          error: "Working task has no aoSessionId and no matching AO session"
+        });
+        return;
       }
-      return next;
+      if (session?.id && !taskState.aoSessionId) {
+        await this.options.store.update(this.options.workflowId, (current) =>
+          attachAoSessionId(current, taskState.taskId, session.id)
+        );
+      }
+      const effectiveTaskState = {
+        ...taskState,
+        aoSessionId: taskState.aoSessionId ?? session?.id
+      };
+      const status = session?.status;
+      if (!status) {
+        continue;
+      }
+      if (terminalSuccessStatuses.has(status) || status === "needs_input") {
+        const latest = await this.options.store.readState(this.options.workflowId);
+        const latestTaskState = latest.taskStates[taskState.taskId] ?? effectiveTaskState;
+        const release = latest.manualGateReleases.find((item) => item.taskId === taskState.taskId);
+        const reconcileFailure = await this.reconcileOutputsForOutcome({
+          task: planTask,
+          taskState: latestTaskState,
+          state: latest,
+          plan,
+          sessions,
+          manualGateMode: release?.mode
+        });
+        if (reconcileFailure) {
+          await this.failTaskWithOutputFailure(latestTaskState, reconcileFailure);
+          return;
+        }
+        const afterReconcile = await this.options.store.readState(this.options.workflowId);
+        const afterReconcileTaskState = afterReconcile.taskStates[taskState.taskId] ?? latestTaskState;
+        const outcome = await resolveAoTaskOutcome({
+          plan,
+          task: planTask,
+          taskState: afterReconcileTaskState,
+          state: afterReconcile,
+          session,
+          artifactDir: this.options.store.getWorkflowDir(this.options.workflowId),
+          manualGateMode: release?.mode
+        });
+        await this.options.store.appendLog(this.options.workflowId, {
+          type: "ao_task_outcome_resolved",
+          taskId: taskState.taskId,
+          attempt: afterReconcileTaskState.attempt,
+          actor: "runner",
+          aoSessionId: afterReconcileTaskState.aoSessionId,
+          outcome
+        });
+        if (await this.applyAoTaskOutcome({
+          task: planTask,
+          taskState: afterReconcileTaskState,
+          state: afterReconcile,
+          plan,
+          sessions,
+          outcome,
+          manualGateMode: release?.mode
+        })) {
+          return;
+        }
+        continue;
+      }
+      await this.options.store.update(this.options.workflowId, (current) =>
+        applyAoStatusObservation(current, taskState.taskId, status, this.options.failureConfirmationCount ?? 2)
+      );
+    }
+  }
+
+  private async reconcileOutputsForOutcome(input: {
+    task: ExecutionTask;
+    taskState: ExecutionTaskState;
+    state: ExecutionState;
+    plan: TaskPlan;
+    sessions: AoSessionSnapshot[];
+    manualGateMode?: "manual_approve" | "ao_review";
+  }): Promise<OutputValidationFailure | undefined> {
+    const artifactDir = this.options.store.getWorkflowDir(this.options.workflowId);
+    await this.options.store.appendLog(this.options.workflowId, {
+      type: "artifact_output_reconcile_started",
+      taskId: input.task.taskId,
+      attempt: input.taskState.attempt,
+      actor: "runner",
+      aoSessionId: input.taskState.aoSessionId
     });
-    for (const taskId of missingSessionTaskIds) {
-      await this.options.store.appendLog(this.options.workflowId, {
-        type: "task_execution_missing_session",
-        taskId,
-        attempt: state.taskStates[taskId]?.attempt ?? 0,
-        actor: "runner",
-        error: "Working task has no aoSessionId and no matching AO session"
-      });
+    const reconcileResult = await reconcileTaskOutputsFromAoWorktree({
+      task: input.task,
+      plan: input.plan,
+      state: input.state,
+      artifactDir,
+      projectRoot: this.options.projectRoot,
+      aoSessionId: input.taskState.aoSessionId,
+      manualGateMode: input.manualGateMode,
+      worktreePath: findWorktreePathForTaskState(input.taskState, input.sessions),
+      sessions: input.sessions
+    });
+    await this.logReconcileResult(input.taskState, reconcileResult);
+    await this.logFallbackWorktreeResolution(input.taskState, reconcileResult);
+    if (reconcileResult.failures.length > 0) {
+      return {
+        kind: "artifact_output_reconcile_failed",
+        missingArtifacts: [],
+        conflictArtifacts: [],
+        reconcileResult,
+        message: formatReconcileFailure(reconcileResult)
+      };
     }
-    for (const [taskId, failure] of outputFailuresByTaskId.entries()) {
-      await this.options.store.appendLog(this.options.workflowId, {
-        type: failure.kind,
-        taskId,
-        attempt: state.taskStates[taskId]?.attempt ?? 0,
-        actor: "runner",
-        missing: failure.missingArtifacts,
-        conflicts: failure.conflictArtifacts,
-        reconcileResult: failure.reconcileResult
-      });
+    if ((reconcileResult.ambiguousCandidates?.length ?? 0) > 0) {
+      return {
+        kind: "artifact_output_ambiguous",
+        missingArtifacts: [],
+        conflictArtifacts: [],
+        reconcileResult,
+        message: formatReconcileAmbiguous(reconcileResult)
+      };
     }
+    if ((reconcileResult.contractViolations?.length ?? 0) > 0) {
+      return {
+        kind: "artifact_contract_violation",
+        missingArtifacts: [],
+        conflictArtifacts: [],
+        reconcileResult,
+        message: formatReconcileContractViolations(reconcileResult)
+      };
+    }
+    if (reconcileResult.conflicts.length > 0) {
+      return {
+        kind: "artifact_output_conflict",
+        missingArtifacts: [],
+        conflictArtifacts: [],
+        reconcileResult,
+        message: formatReconcileConflicts(reconcileResult)
+      };
+    }
+    return undefined;
+  }
+
+  private async failTaskWithOutputFailure(
+    taskState: ExecutionTaskState,
+    failure: OutputValidationFailure
+  ): Promise<void> {
+    await this.options.store.update(this.options.workflowId, (current) =>
+      failCurrentState({
+        ...current,
+        taskStates: {
+          ...current.taskStates,
+          [taskState.taskId]: {
+            ...(current.taskStates[taskState.taskId] ?? taskState),
+            status: "blocked_for_human",
+            failureReason: failure.kind
+          }
+        }
+      }, {
+        taskId: taskState.taskId,
+        kind: failure.kind,
+        message: failure.message
+      })
+    );
+    await this.options.store.appendLog(this.options.workflowId, {
+      type: failure.kind,
+      taskId: taskState.taskId,
+      attempt: taskState.attempt,
+      actor: "runner",
+      missing: failure.missingArtifacts,
+      conflicts: failure.conflictArtifacts,
+      reconcileResult: failure.reconcileResult
+    });
+  }
+
+  private async validateOutputsAfterOutcome(input: {
+    task: ExecutionTask;
+    taskState: ExecutionTaskState;
+    manualGateMode?: "manual_approve" | "ao_review";
+  }): Promise<OutputValidationFailure | undefined> {
+    const artifactDir = this.options.store.getWorkflowDir(this.options.workflowId);
+    const validation = await validateTaskOutputArtifacts({
+      task: input.task,
+      artifactDir,
+      manualGateMode: input.manualGateMode,
+      aoSessionId: input.taskState.aoSessionId
+    });
+    if (validation.missingArtifacts.length === 0 && validation.conflictArtifacts.length === 0) {
+      return undefined;
+    }
+    const kind = validation.conflictArtifacts.length > 0
+      ? "artifact_output_conflict"
+      : "artifact_output_missing";
+    return {
+      kind,
+      missingArtifacts: validation.missingArtifacts,
+      conflictArtifacts: validation.conflictArtifacts,
+      message: validation.conflictArtifacts.length > 0
+        ? formatConflictArtifacts(validation.conflictArtifacts)
+        : formatMissingArtifacts(validation.missingArtifacts)
+    };
+  }
+
+  private async applyAoTaskOutcome(input: {
+    task: ExecutionTask;
+    taskState: ExecutionTaskState;
+    state: ExecutionState;
+    plan: TaskPlan;
+    sessions: AoSessionSnapshot[];
+    outcome: AoTaskOutcome;
+    manualGateMode?: "manual_approve" | "ao_review";
+  }): Promise<boolean> {
+    const outcome = input.outcome;
+    switch (outcome.kind) {
+      case "completed":
+      case "approved": {
+        const failure = await this.validateOutputsAfterOutcome({
+          task: input.task,
+          taskState: input.taskState,
+          manualGateMode: input.manualGateMode
+        });
+        if (failure) {
+          await this.failTaskWithOutputFailure(input.taskState, failure);
+          return true;
+        }
+        await completeReconciledTask(this.options.store, this.options.workflowId, input.task, input.taskState);
+        return true;
+      }
+      case "rework_required":
+        await pauseForManualGateRework({
+          store: this.options.store,
+          workflowId: this.options.workflowId,
+          taskId: input.task.taskId,
+          targetTaskIds: outcome.targetTaskIds,
+          findings: outcome.findings,
+          rationale: outcome.message ?? "AO reviewer requires upstream rework",
+          actor: "runner"
+        });
+        return true;
+      case "needs_structured_decision": {
+        const message = outcome.message;
+        const requiredOutputs = outcome.requiredOutputs;
+        await this.options.store.update(this.options.workflowId, (current) =>
+          failCurrentState(withTaskFailureReason(current, input.taskState.taskId, "ao_task_needs_structured_decision"), {
+            taskId: input.taskState.taskId,
+            kind: "ao_task_needs_structured_decision",
+            message
+          })
+        );
+        await this.options.store.appendLog(this.options.workflowId, {
+          type: "ao_task_needs_structured_decision",
+          taskId: input.taskState.taskId,
+          attempt: input.taskState.attempt,
+          actor: "runner",
+          aoSessionId: input.taskState.aoSessionId,
+          requiredOutputs
+        });
+        return true;
+      }
+      case "blocked": {
+        const message = outcome.reason;
+        await this.options.store.update(this.options.workflowId, (current) =>
+          failCurrentState(withTaskFailureReason(current, input.taskState.taskId, "manual_gate_blocked"), {
+            taskId: input.taskState.taskId,
+            kind: "manual_gate_blocked",
+            message
+          })
+        );
+        return true;
+      }
+      case "needs_human": {
+        const message = outcome.reason;
+        await this.options.store.update(this.options.workflowId, (current) =>
+          failCurrentState(withTaskFailureReason(current, input.taskState.taskId, "ao_task_needs_input"), {
+            taskId: input.taskState.taskId,
+            kind: "ao_task_needs_input",
+            message
+          })
+        );
+        await this.options.store.appendLog(this.options.workflowId, {
+          type: "ao_task_needs_input",
+          taskId: input.taskState.taskId,
+          attempt: input.taskState.attempt,
+          actor: "runner",
+          aoSessionId: input.taskState.aoSessionId,
+          reason: message
+        });
+        return true;
+      }
+      case "invalid": {
+        const message = outcome.reason;
+        const details = outcome.details;
+        const failureKind: ExecutionErrorKind = outcome.failureKind;
+        await this.options.store.update(this.options.workflowId, (current) =>
+          failCurrentState(withTaskFailureReason(current, input.taskState.taskId, failureKind), {
+            taskId: input.taskState.taskId,
+            kind: failureKind,
+            message
+          })
+        );
+        await this.options.store.appendLog(this.options.workflowId, {
+          type: "ao_task_outcome_invalid",
+          taskId: input.taskState.taskId,
+          attempt: input.taskState.attempt,
+          actor: "runner",
+          reason: message,
+          failureKind,
+          details
+        });
+        if (failureKind === "artifact_output_conflict") {
+          await this.options.store.appendLog(this.options.workflowId, {
+            type: "artifact_output_conflict",
+            taskId: input.taskState.taskId,
+            attempt: input.taskState.attempt,
+            actor: "runner",
+            conflicts: [{ reason: "source_proof_missing", details }]
+          });
+        }
+        return true;
+      }
+    }
+    return false;
   }
 
   private async validateOrReconcileOutputs(input: {
@@ -1018,6 +1259,9 @@ export async function retryExecutionTask(input: {
       current.failure?.taskId === input.taskId &&
       current.failure.kind === "ao_spawn_failed" &&
       task?.status === "pending";
+    if (current.failure?.taskId === input.taskId && current.failure.kind === "ao_task_needs_structured_decision") {
+      throw new Error("Task needs structured decision; retry is disabled until a valid decision artifact is recorded or reconciled");
+    }
     if (!task || (task.status !== "blocked_for_human" && task.status !== "failed" && !retryableFailedDispatch)) {
       throw new Error(`Task ${input.taskId} is not retryable`);
     }
@@ -1090,6 +1334,86 @@ export async function markExecutionTaskCompleted(input: {
     attempt: state.taskStates[input.taskId]?.attempt ?? 0,
     actor: input.actor ?? "user",
     rationale
+  });
+  return state;
+}
+
+export async function dispatchReworkTask(input: {
+  store: ExecutionStateStore;
+  workflowId: string;
+  gateTaskId: string;
+  targetTaskId: string;
+  rationale: string;
+  actor?: "user" | "cli" | "web";
+}): Promise<ExecutionState> {
+  const rationale = input.rationale.trim();
+  if (!rationale) {
+    throw new Error("rationale is required");
+  }
+  const current = await input.store.readState(input.workflowId);
+  const plan = await input.store.readActiveTaskPlan(current);
+  const gateTask = plan.tasks.find((task) => task.taskId === input.gateTaskId);
+  const targetTask = plan.tasks.find((task) => task.taskId === input.targetTaskId);
+  if (!gateTask) {
+    throw new Error(`Unknown gate task ${input.gateTaskId}`);
+  }
+  if (!targetTask) {
+    throw new Error(`Unknown target task ${input.targetTaskId}`);
+  }
+  if (!collectUpstreamTaskIds(gateTask, plan).has(input.targetTaskId)) {
+    throw new Error(`targetTaskId ${input.targetTaskId} is not upstream of gate ${input.gateTaskId}`);
+  }
+  if (current.taskStates[input.targetTaskId]?.status === "superseded") {
+    throw new Error(`targetTaskId ${input.targetTaskId} is superseded; request replan instead`);
+  }
+  const affectedTaskIds = new Set([
+    input.targetTaskId,
+    input.gateTaskId,
+    ...collectDownstreamTaskIds(input.targetTaskId, plan)
+  ]);
+  const state = await input.store.update(input.workflowId, (state) => {
+    const taskStates = { ...state.taskStates };
+    const supersededSessions = new Set(state.supersededSessions ?? []);
+    for (const taskId of affectedTaskIds) {
+      const planTask = plan.tasks.find((task) => task.taskId === taskId);
+      if (!planTask || taskStates[taskId]?.status === "superseded") {
+        continue;
+      }
+      if (taskStates[taskId]?.aoSessionId) {
+        supersededSessions.add(taskStates[taskId].aoSessionId as string);
+      }
+      taskStates[taskId] = {
+        ...(taskStates[taskId] ?? createTaskState(planTask, 0)),
+        status: "pending",
+        aoRole: planTask.aoRole,
+        aoSessionId: undefined,
+        completedAt: null,
+        failureReason: null,
+        statusObservations: []
+      };
+    }
+    return {
+      ...state,
+      status: "running",
+      currentTaskId: null,
+      failure: null,
+      pendingDispatch: null,
+      supersededSessions: [...supersededSessions],
+      manualGateReleases: state.manualGateReleases.filter(
+        (release) => !affectedTaskIds.has(release.taskId)
+      ),
+      taskStates
+    };
+  }) as ExecutionState;
+  await input.store.appendLog(input.workflowId, {
+    type: "task_retry_requested",
+    taskId: input.targetTaskId,
+    attempt: state.taskStates[input.targetTaskId]?.attempt ?? 0,
+    actor: input.actor ?? "web",
+    gateTaskId: input.gateTaskId,
+    reason: "manual_gate_rework",
+    rationale,
+    affectedTaskIds: [...affectedTaskIds]
   });
   return state;
 }
@@ -1244,7 +1568,11 @@ export async function approveManualGate(input: {
     throw new Error("rationale is required");
   }
   const current = await input.store.readState(input.workflowId);
-  if (current.status !== "waiting_manual_gate" && !(input.recovery && current.status === "running")) {
+  if (
+    current.status !== "waiting_manual_gate" &&
+    !(input.recovery && (current.status === "running" ||
+      current.failure?.kind === "ao_task_needs_structured_decision"))
+  ) {
     throw new Error(`Workflow ${input.workflowId} is not waiting for manual gate approval`);
   }
   if (current.currentTaskId && current.currentTaskId !== input.taskId) {
@@ -1290,7 +1618,11 @@ export async function approveManualGate(input: {
         generatedArtifacts = existing.generatedArtifacts ?? [];
         return state;
       }
-      if (state.status !== "waiting_manual_gate" && !(input.recovery && state.status === "running")) {
+      if (
+        state.status !== "waiting_manual_gate" &&
+        !(input.recovery && (state.status === "running" ||
+          state.failure?.kind === "ao_task_needs_structured_decision"))
+      ) {
         throw new Error(`Workflow ${input.workflowId} is not waiting for manual gate approval`);
       }
       const artifacts = existing?.generatedArtifacts?.length
@@ -1647,18 +1979,13 @@ export async function decideManualGate(input: {
       throw new Error("approved manual gate decisions must use approveManualGate to generate gate artifacts");
     }
     if (input.decision === "requires_replan") {
-      return {
-        ...current,
-        status: "paused_for_replan",
-        currentTaskId: input.taskId,
-        failure: {
-          taskId: input.taskId,
-          kind: "manual_gate_requires_replan",
-          message: rationale,
-          occurredAt: new Date().toISOString()
-        },
-        manualGateReleases: [...releases, release]
-      };
+      return setPausedForReplan({
+        state: { ...current, manualGateReleases: releases },
+        taskId: input.taskId,
+        failureKind: "manual_gate_requires_replan",
+        message: rationale,
+        manualGateRelease: release
+      });
     }
     return failCurrentState({
       ...current,
@@ -1675,6 +2002,36 @@ export async function decideManualGate(input: {
     attempt: 0,
     actor: input.actor ?? "user",
     decision: input.decision,
+    rationale
+  });
+  return state;
+}
+
+export async function pauseForManualGateRework(input: {
+  store: ExecutionStateStore;
+  workflowId: string;
+  taskId: string;
+  targetTaskIds: string[];
+  findings: AoOutcomeFinding[];
+  rationale: string;
+  actor?: "user" | "cli" | "runner";
+}): Promise<ExecutionState> {
+  const rationale = input.rationale.trim() || "AO reviewer requires upstream rework";
+  const state = await input.store.update(input.workflowId, (current) =>
+    setPausedForReplan({
+      state: current,
+      taskId: input.taskId,
+      failureKind: "manual_gate_rework_required",
+      message: rationale
+    })
+  ) as ExecutionState;
+  await input.store.appendLog(input.workflowId, {
+    type: "manual_gate_rework_required",
+    taskId: input.taskId,
+    attempt: state.taskStates[input.taskId]?.attempt ?? 0,
+    actor: input.actor ?? "runner",
+    targetTaskIds: input.targetTaskIds,
+    findings: input.findings,
     rationale
   });
   return state;
@@ -2029,6 +2386,101 @@ function failCurrentState(
       occurredAt: new Date().toISOString()
     }
   };
+}
+
+function setPausedForReplan(input: {
+  state: ExecutionState;
+  taskId: string;
+  failureKind: "manual_gate_requires_replan" | "manual_gate_rework_required";
+  message: string;
+  manualGateRelease?: ManualGateRelease;
+  occurredAt?: string;
+}): ExecutionState {
+  const task = input.state.taskStates[input.taskId];
+  return {
+    ...input.state,
+    status: "paused_for_replan",
+    currentTaskId: input.taskId,
+    failure: {
+      taskId: input.taskId,
+      kind: input.failureKind,
+      message: input.message,
+      occurredAt: input.occurredAt ?? new Date().toISOString()
+    },
+    manualGateReleases: input.manualGateRelease
+      ? [
+          ...input.state.manualGateReleases.filter((release) => release.taskId !== input.taskId),
+          input.manualGateRelease
+        ]
+      : input.state.manualGateReleases,
+    taskStates: task
+      ? {
+          ...input.state.taskStates,
+          [input.taskId]: {
+            ...task,
+            failureReason: input.failureKind
+          }
+        }
+      : input.state.taskStates
+  };
+}
+
+function withTaskFailureReason(
+  state: ExecutionState,
+  taskId: string,
+  failureReason: ExecutionErrorKind
+): ExecutionState {
+  const task = state.taskStates[taskId];
+  if (!task) {
+    return state;
+  }
+  return {
+    ...state,
+    taskStates: {
+      ...state.taskStates,
+      [taskId]: {
+        ...task,
+        status: "blocked_for_human",
+        failureReason
+      }
+    }
+  };
+}
+
+function collectUpstreamTaskIds(task: ExecutionTask, plan: TaskPlan): Set<string> {
+  const tasksById = new Map(plan.tasks.map((item) => [item.taskId, item]));
+  const result = new Set<string>();
+  const visit = (taskId: string): void => {
+    if (result.has(taskId)) {
+      return;
+    }
+    result.add(taskId);
+    for (const dependencyId of tasksById.get(taskId)?.dependencies ?? []) {
+      visit(dependencyId);
+    }
+  };
+  for (const dependencyId of task.dependencies) {
+    visit(dependencyId);
+  }
+  return result;
+}
+
+function collectDownstreamTaskIds(taskId: string, plan: TaskPlan): string[] {
+  const result = new Set<string>();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const task of plan.tasks) {
+      if (task.taskId === taskId || result.has(task.taskId)) {
+        continue;
+      }
+      if (task.dependencies.some((dependencyId) => dependencyId === taskId || result.has(dependencyId))) {
+        result.add(task.taskId);
+        changed = true;
+      }
+    }
+  }
+  return [...result];
 }
 
 async function getConditionalSkipDecision(input: {

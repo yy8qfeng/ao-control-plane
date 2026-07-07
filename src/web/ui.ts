@@ -432,6 +432,7 @@ export function renderIndexHtml(): string {
           <button id="executeButton" class="secondary" type="button" disabled>启动连续执行</button>
           <button id="retryExecutionTaskButton" class="secondary" type="button" disabled title="连续执行中断后，可重试当前失败任务。">重试任务</button>
           <button id="reconcileArtifactsButton" class="secondary" type="button" disabled title="任务产物缺失或冲突时，重新从 AO worktree 检查并归集控制面产物。">重新检查产物</button>
+          <button id="dispatchReworkButton" class="secondary" type="button" disabled title="AO 复核要求上游返工时，派发目标任务重新执行。">派发上游返工</button>
           <button id="markExecutionTaskCompletedButton" class="secondary" type="button" disabled title="任务中断后，人工把当前任务标记为已完成并继续。">人工标记完成</button>
           <button id="requestExecutionRevisionButton" class="secondary" type="button" disabled title="任务中断后，提交任务计划修订请求。">提交重规划请求</button>
           <button id="releaseManualGateButton" class="secondary" type="button" disabled title="manual_gate 等待时，人工批准门禁并继续执行。">门禁放行</button>
@@ -504,6 +505,7 @@ export function renderIndexHtml(): string {
     const executeButton = document.querySelector("#executeButton");
     const retryExecutionTaskButton = document.querySelector("#retryExecutionTaskButton");
     const reconcileArtifactsButton = document.querySelector("#reconcileArtifactsButton");
+    const dispatchReworkButton = document.querySelector("#dispatchReworkButton");
     const markExecutionTaskCompletedButton = document.querySelector("#markExecutionTaskCompletedButton");
     const requestExecutionRevisionButton = document.querySelector("#requestExecutionRevisionButton");
     const releaseManualGateButton = document.querySelector("#releaseManualGateButton");
@@ -689,6 +691,14 @@ export function renderIndexHtml(): string {
       const taskId = getRecoverableExecutionTaskId();
       if (!taskId) return;
       await reconcileArtifacts("正在重新检查 AO worktree 产物...");
+    });
+
+    dispatchReworkButton.addEventListener("click", async () => {
+      const gateTaskId = getRecoverableExecutionTaskId();
+      const targetTaskId = getReworkTargetTaskId();
+      if (!gateTaskId || !targetTaskId) return;
+      if (!confirm("确认派发上游返工任务 " + targetTaskId + "？当前门禁会在上游返工完成后重新复核。")) return;
+      await submitReworkDispatch(gateTaskId, targetTaskId);
     });
 
     markExecutionTaskCompletedButton.addEventListener("click", async () => {
@@ -1120,6 +1130,8 @@ export function renderIndexHtml(): string {
       retryExecutionTaskButton.title = getExecutionRecoveryButtonTitle("retry");
       reconcileArtifactsButton.disabled = busy || !canReconcileArtifacts();
       reconcileArtifactsButton.title = getReconcileArtifactsButtonTitle();
+      dispatchReworkButton.disabled = busy || !canDispatchReworkTask();
+      dispatchReworkButton.title = getDispatchReworkButtonTitle();
       markExecutionTaskCompletedButton.disabled = busy || !canRecoverExecutionTask();
       markExecutionTaskCompletedButton.title = getExecutionRecoveryButtonTitle("mark-completed");
       requestExecutionRevisionButton.disabled = busy || !canRecoverExecutionTask();
@@ -1175,6 +1187,8 @@ export function renderIndexHtml(): string {
       retryExecutionTaskButton.title = getExecutionRecoveryButtonTitle("retry");
       reconcileArtifactsButton.disabled = running || !canReconcileArtifacts();
       reconcileArtifactsButton.title = getReconcileArtifactsButtonTitle();
+      dispatchReworkButton.disabled = running || !canDispatchReworkTask();
+      dispatchReworkButton.title = getDispatchReworkButtonTitle();
       markExecutionTaskCompletedButton.disabled = running || !canRecoverExecutionTask();
       markExecutionTaskCompletedButton.title = getExecutionRecoveryButtonTitle("mark-completed");
       requestExecutionRevisionButton.disabled = running || !canRecoverExecutionTask();
@@ -1269,6 +1283,9 @@ export function renderIndexHtml(): string {
       executionDetails.hidden = false;
       executionDetails.replaceChildren();
       executionDetails.appendChild(buildExecutionOverview(state.execution));
+      if (state.execution.aoOutcome) {
+        executionDetails.appendChild(buildTextDetails("AO 结论", formatAoOutcome(state.execution.aoOutcome), true));
+      }
       if (state.execution.artifactDiagnostics) {
         executionDetails.appendChild(buildArtifactDiagnosticsDetails(state.execution.artifactDiagnostics, state.execution));
       }
@@ -1441,6 +1458,9 @@ export function renderIndexHtml(): string {
       if (execution.failure) {
         lines.push("", "失败信息：" + execution.failure.kind + " / " + execution.failure.message);
       }
+      if (execution.aoOutcome) {
+        lines.push("", formatAoOutcome(execution.aoOutcome));
+      }
       if (execution.artifactDiagnostics) {
         lines.push("", formatArtifactDiagnostics(execution.artifactDiagnostics));
       }
@@ -1473,6 +1493,50 @@ export function renderIndexHtml(): string {
       return lines.join("\\n");
     }
 
+    function formatAoOutcome(aoOutcome) {
+      const latestOutcome = isObject(aoOutcome.latestOutcome?.outcome) ? aoOutcome.latestOutcome.outcome : null;
+      const latestRework = isObject(aoOutcome.latestRework) ? aoOutcome.latestRework : null;
+      const latestStructuredDecision = isObject(aoOutcome.latestStructuredDecision) ? aoOutcome.latestStructuredDecision : null;
+      const latestInvalid = isObject(aoOutcome.latestInvalid) ? aoOutcome.latestInvalid : null;
+      const lines = ["AO 结论："];
+      if (aoOutcome.error) {
+        lines.push("- 读取 AO 结论失败：" + aoOutcome.error);
+      }
+      if (latestOutcome) {
+        lines.push("- outcome：" + latestOutcome.kind);
+        if (latestOutcome.message) lines.push("- 说明：" + latestOutcome.message);
+        if (Array.isArray(latestOutcome.requiredOutputs)) {
+          lines.push("- 缺结构化产物：");
+          latestOutcome.requiredOutputs.forEach((path) => lines.push("  - " + path));
+        }
+        if (Array.isArray(latestOutcome.targetTaskIds)) {
+          lines.push("- 返工目标：" + latestOutcome.targetTaskIds.join("、"));
+        }
+        if (Array.isArray(latestOutcome.findings) && latestOutcome.findings.length) {
+          lines.push("- 返工问题：");
+          latestOutcome.findings.forEach((finding) => {
+            if (!isObject(finding)) return;
+            lines.push("  - " + (finding.id || "-") + "：" + (finding.summary || ""));
+            if (finding.requiredAction) lines.push("    action：" + finding.requiredAction);
+          });
+        }
+      }
+      if (latestStructuredDecision && Array.isArray(latestStructuredDecision.requiredOutputs)) {
+        lines.push("- 缺结构化决策：" + (latestStructuredDecision.requiredOutputs || []).join("、"));
+      }
+      if (latestRework && Array.isArray(latestRework.targetTaskIds)) {
+        lines.push("- 当前等待返工目标：" + (latestRework.targetTaskIds || []).join("、"));
+      }
+      if (latestInvalid) {
+        lines.push("- 无效 AO 结论：" + (latestInvalid.failureKind || "") + " / " + (latestInvalid.reason || ""));
+      }
+      return lines.join("\\n");
+    }
+
+    function isObject(value) {
+      return Boolean(value && typeof value === "object" && !Array.isArray(value));
+    }
+
     function formatExecutionEvent(event) {
       if (!event || typeof event !== "object") return String(event);
       const parts = [
@@ -1485,6 +1549,15 @@ export function renderIndexHtml(): string {
       const details = [];
       if (event.type === "artifact_output_reconcile_started") {
         details.push("开始检查 canonical 产物与 AO worktree 候选。");
+      }
+      if (event.type === "ao_task_outcome_resolved" && event.outcome) {
+        details.push("outcome=" + event.outcome.kind);
+      }
+      if (event.type === "manual_gate_rework_required") {
+        details.push("targetTaskIds=" + (event.targetTaskIds || []).join(","));
+      }
+      if (event.type === "ao_task_needs_structured_decision") {
+        details.push("requiredOutputs=" + (event.requiredOutputs || []).join(","));
       }
       if (event.recovered) {
         details.push("from=" + event.recovered.from);
@@ -1670,6 +1743,39 @@ export function renderIndexHtml(): string {
       }
     }
 
+    async function submitReworkDispatch(gateTaskId, targetTaskId) {
+      const jobId = state.execution?.jobId;
+      if (!jobId) return;
+      setBusy(true, "正在派发上游返工...");
+      try {
+        const response = await fetch("/api/ao/execution-jobs/" + encodeURIComponent(jobId) + "/revision-requests", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            projectRoot: getProjectRoot(),
+            workflowId: state.execution.workflowId,
+            triggerTaskId: gateTaskId,
+            targetTaskId,
+            reasonCategory: "manual_gate_rework",
+            rationale: "Web UI 派发上游返工：" + targetTaskId
+          })
+        });
+        state.execution = await readResponse(response);
+        state.activeTab = "execution";
+        activateTab("execution");
+        renderActiveTab();
+        updateSummary();
+        setStatus("ok", "已派发上游返工，调度器会重新执行 " + targetTaskId + "。");
+        if (["running", "waiting_manual_gate", "paused_for_replan"].includes(state.execution.status)) {
+          startPollingExecutionJob(jobId);
+        }
+      } catch (error) {
+        setStatus("bad", error.message || String(error));
+      } finally {
+        setBusy(false);
+      }
+    }
+
     async function reconcileArtifacts(busyMessage) {
       const jobId = state.execution?.jobId;
       if (!jobId) return;
@@ -1795,6 +1901,12 @@ export function renderIndexHtml(): string {
       if (state.execution?.status === "waiting_manual_gate" && state.execution.currentTaskId) {
         return [state.execution.currentTaskId];
       }
+      if (
+        state.execution?.failure?.kind === "ao_task_needs_structured_decision" &&
+        state.execution.failure.taskId
+      ) {
+        return [state.execution.failure.taskId];
+      }
       return (state.execution?.blockedTasks || [])
         .filter((task) => task.kind === "manual_gate")
         .map((task) => task.taskId)
@@ -1817,6 +1929,9 @@ export function renderIndexHtml(): string {
         state.execution?.status === "failed" &&
         state.execution?.failure?.taskId === taskId &&
         state.execution?.failure?.kind === "ao_spawn_failed";
+      if (state.execution?.failure?.kind === "ao_task_needs_structured_decision") {
+        return false;
+      }
       return canRecoverExecutionTask() && (taskStatus === "blocked_for_human" || taskStatus === "failed" || failedDuringDispatch);
     }
 
@@ -1824,7 +1939,30 @@ export function renderIndexHtml(): string {
       const kind = state.execution?.failure?.kind || "";
       return Boolean(getRecoverableExecutionTaskId()) &&
         (state.execution?.status === "failed" || state.execution?.status === "paused_for_replan") &&
-        (kind.includes("artifact_output") || kind === "");
+        (kind.includes("artifact_output") || kind === "ao_task_needs_structured_decision" || kind === "");
+    }
+
+    function getReworkTargetTaskId() {
+      const latestRework = state.execution?.aoOutcome?.latestRework;
+      const latestOutcome = state.execution?.aoOutcome?.latestOutcome?.outcome;
+      const targets = (isObject(latestRework) && Array.isArray(latestRework.targetTaskIds))
+        ? latestRework.targetTaskIds
+        : (isObject(latestOutcome) && Array.isArray(latestOutcome.targetTaskIds))
+          ? latestOutcome.targetTaskIds
+          : [];
+      return Array.isArray(targets) ? targets[0] || "" : "";
+    }
+
+    function canDispatchReworkTask() {
+      return state.execution?.status === "paused_for_replan" &&
+        state.execution?.failure?.kind === "manual_gate_rework_required" &&
+        Boolean(getRecoverableExecutionTaskId() && getReworkTargetTaskId());
+    }
+
+    function getDispatchReworkButtonTitle() {
+      const targetTaskId = getReworkTargetTaskId();
+      if (canDispatchReworkTask()) return "派发上游返工任务 " + targetTaskId + "，完成后重新进入当前门禁复核。";
+      return "仅当 AO 复核给出 rework_required 且包含 targetTaskIds 时可派发上游返工。";
     }
 
     function getReconcileArtifactsButtonTitle() {
@@ -1838,6 +1976,9 @@ export function renderIndexHtml(): string {
       const taskId = getRecoverableExecutionTaskId();
       if (!taskId) return "连续执行中断后可处理当前任务。";
       if (action === "retry") {
+        if (state.execution?.failure?.kind === "ao_task_needs_structured_decision") {
+          return "当前缺少结构化门禁结论，不能直接重试；请先补录门禁结论或重新检查产物。";
+        }
         return canRetryExecutionTask()
           ? "重新派发当前任务 " + taskId + "。"
           : "只有 failed、blocked_for_human 或派发失败的任务可以重试。";

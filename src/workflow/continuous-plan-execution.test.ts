@@ -9,8 +9,10 @@ import {
   approveManualGate,
   ContinuousExecutionRunner,
   decideManualGate,
+  dispatchReworkTask,
   dispatchManualGateReview,
   reconcileExecutionTaskArtifacts,
+  pauseForManualGateRework,
   retryExecutionTask,
   stopExecution
 } from "./continuous-plan-execution.js";
@@ -83,6 +85,284 @@ describe("ContinuousExecutionRunner", () => {
         })
       ])
     );
+  });
+
+  it("turns manual gate needs_input into a structured decision failure without confirmation delay", async () => {
+    const workflowId = "WF-NEEDS-STRUCTURED";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", { status: "completed" }),
+      createTask(workflowId, "TASK-002", {
+        title: "G0 人工复核放行",
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        type: "review",
+        aoRole: "reviewer",
+        outputArtifacts: [
+          {
+            contractId: "g0_review_gate_decision",
+            kind: "g0_review_gate_decision",
+            path: "g0_review_gate_decision.json",
+            required: true
+          }
+        ]
+      })
+    ]));
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "running",
+      currentTaskId: "TASK-002",
+      taskStates: {
+        "TASK-001": {
+          taskId: "TASK-001",
+          status: "completed",
+          aoRole: "backend-senior",
+          attempt: 1,
+          maxAttempts: 3
+        },
+        "TASK-002": {
+          taskId: "TASK-002",
+          status: "working",
+          aoRole: "reviewer",
+          aoSessionId: "ft-structured",
+          attempt: 1,
+          maxAttempts: 3
+        }
+      },
+      manualGateReleases: [{
+        taskId: "TASK-002",
+        decision: "review_dispatched",
+        mode: "ao_review",
+        aoSessionId: "ft-structured"
+      }]
+    }));
+    const runner = new ContinuousExecutionRunner({
+      workflowId,
+      store,
+      ao: createListOnlyAo([{ id: "ft-structured", status: "needs_input", prompt: `[${workflowId} / TASK-002] gate` }]) as Pick<AoCliAdapter, "spawnTask" | "listSessions">,
+      failureConfirmationCount: 3,
+      maxTicks: 1
+    });
+
+    await runner.run();
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("failed");
+    expect(state.failure).toMatchObject({
+      taskId: "TASK-002",
+      kind: "ao_task_needs_structured_decision"
+    });
+    expect(state.taskStates["TASK-002"]?.failureReason).toBe("ao_task_needs_structured_decision");
+  });
+
+  it("dispatches upstream rework by resetting the target and gate tasks", async () => {
+    const workflowId = "WF-REWORK-DISPATCH";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", { status: "completed" }),
+      createTask(workflowId, "TASK-002", {
+        title: "G0 人工复核放行",
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        type: "review",
+        aoRole: "reviewer"
+      })
+    ]));
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "paused_for_replan",
+      currentTaskId: "TASK-002",
+      failure: {
+        taskId: "TASK-002",
+        kind: "manual_gate_rework_required",
+        message: "返工",
+        occurredAt: new Date().toISOString()
+      },
+      taskStates: {
+        "TASK-001": {
+          taskId: "TASK-001",
+          status: "completed",
+          aoRole: "backend-senior",
+          aoSessionId: "ft-producer",
+          attempt: 1,
+          maxAttempts: 3
+        },
+        "TASK-002": {
+          taskId: "TASK-002",
+          status: "working",
+          aoRole: "reviewer",
+          aoSessionId: "ft-reviewer",
+          attempt: 1,
+          maxAttempts: 3,
+          failureReason: "manual_gate_rework_required"
+        }
+      },
+      manualGateReleases: [{
+        taskId: "TASK-002",
+        decision: "review_dispatched",
+        mode: "ao_review",
+        aoSessionId: "ft-reviewer"
+      }]
+    }));
+
+    await dispatchReworkTask({
+      store,
+      workflowId,
+      gateTaskId: "TASK-002",
+      targetTaskId: "TASK-001",
+      rationale: "修复 B1",
+      actor: "user"
+    });
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("running");
+    expect(state.failure).toBeNull();
+    expect(state.taskStates["TASK-001"]?.status).toBe("pending");
+    expect(state.taskStates["TASK-002"]?.status).toBe("pending");
+    expect(state.supersededSessions).toEqual(expect.arrayContaining(["ft-producer", "ft-reviewer"]));
+    expect(state.manualGateReleases).toEqual([]);
+  });
+
+  it("decideManualGate requires_replan writes paused state through the shared helper", async () => {
+    const workflowId = "WF-GATE-REPLAN-HELPER";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", { status: "completed" }),
+      createTask(workflowId, "TASK-002", {
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        type: "review",
+        aoRole: "reviewer"
+      })
+    ]));
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "waiting_manual_gate",
+      currentTaskId: "TASK-002",
+      taskStates: {
+        "TASK-002": {
+          taskId: "TASK-002",
+          status: "blocked_for_human",
+          aoRole: "reviewer",
+          attempt: 1,
+          maxAttempts: 3
+        }
+      }
+    }));
+
+    await decideManualGate({
+      store,
+      workflowId,
+      taskId: "TASK-002",
+      decision: "requires_replan",
+      rationale: "需要重规划",
+      actor: "user"
+    });
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("paused_for_replan");
+    expect(state.currentTaskId).toBe("TASK-002");
+    expect(state.failure).toMatchObject({
+      taskId: "TASK-002",
+      kind: "manual_gate_requires_replan",
+      message: "需要重规划"
+    });
+    expect(state.taskStates["TASK-002"]?.failureReason).toBe("manual_gate_requires_replan");
+    expect(state.manualGateReleases).toEqual([
+      expect.objectContaining({ taskId: "TASK-002", decision: "requires_replan" })
+    ]);
+  });
+
+  it("pauseForManualGateRework writes rework paused state without manual gate release", async () => {
+    const workflowId = "WF-GATE-REWORK-HELPER";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", { status: "completed" }),
+      createTask(workflowId, "TASK-002", {
+        dependencies: ["TASK-001"],
+        dependencyCondition: "manual_gate",
+        type: "review",
+        aoRole: "reviewer"
+      })
+    ]));
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "running",
+      currentTaskId: "TASK-002",
+      manualGateReleases: [{
+        taskId: "TASK-002",
+        decision: "review_dispatched",
+        mode: "ao_review",
+        aoSessionId: "ft-reviewer"
+      }],
+      taskStates: {
+        "TASK-002": {
+          taskId: "TASK-002",
+          status: "working",
+          aoRole: "reviewer",
+          aoSessionId: "ft-reviewer",
+          attempt: 1,
+          maxAttempts: 3
+        }
+      }
+    }));
+
+    await pauseForManualGateRework({
+      store,
+      workflowId,
+      taskId: "TASK-002",
+      targetTaskIds: ["TASK-001"],
+      findings: [{ id: "B1", severity: "blocking", summary: "返工", targetTaskId: "TASK-001" }],
+      rationale: "需要上游返工",
+      actor: "runner"
+    });
+
+    const state = await store.readState(workflowId);
+    expect(state.status).toBe("paused_for_replan");
+    expect(state.failure).toMatchObject({
+      taskId: "TASK-002",
+      kind: "manual_gate_rework_required",
+      message: "需要上游返工"
+    });
+    expect(state.taskStates["TASK-002"]?.failureReason).toBe("manual_gate_rework_required");
+    expect(state.manualGateReleases).toEqual([
+      expect.objectContaining({ taskId: "TASK-002", decision: "review_dispatched" })
+    ]);
+  });
+
+  it("rejects retry while a task needs a structured decision", async () => {
+    const workflowId = "WF-STRUCTURED-RETRY";
+    const { store } = await seedPlan(createPlan(workflowId, [
+      createTask(workflowId, "TASK-001", {
+        dependencyCondition: "manual_gate",
+        type: "review",
+        aoRole: "reviewer"
+      })
+    ]));
+    await store.update(workflowId, (state) => ({
+      ...state,
+      status: "failed",
+      currentTaskId: "TASK-001",
+      failure: {
+        taskId: "TASK-001",
+        kind: "ao_task_needs_structured_decision",
+        message: "缺结构化决策",
+        occurredAt: new Date().toISOString()
+      },
+      taskStates: {
+        "TASK-001": {
+          taskId: "TASK-001",
+          status: "blocked_for_human",
+          aoRole: "reviewer",
+          attempt: 1,
+          maxAttempts: 3,
+          failureReason: "ao_task_needs_structured_decision"
+        }
+      }
+    }));
+
+    await expect(retryExecutionTask({
+      store,
+      workflowId,
+      taskId: "TASK-001",
+      actor: "user"
+    })).rejects.toThrow("needs structured decision");
   });
 
   it("skips replan-only manual gate branches after an approved upstream gate", async () => {

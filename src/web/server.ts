@@ -572,6 +572,25 @@ async function routeRequest(input: {
       return;
     }
     const manager = getExecutionManager(body, input);
+    if (body.reasonCategory === "manual_gate_rework") {
+      const targetTaskId = typeof (body as { targetTaskId?: unknown }).targetTaskId === "string"
+        ? (body as { targetTaskId: string }).targetTaskId
+        : "";
+      if (!targetTaskId) {
+        sendJson(input.response, 400, { error: "targetTaskId is required for manual_gate_rework" });
+        return;
+      }
+      sendJson(
+        input.response,
+        200,
+        await manager.dispatchReworkTask(jobId, {
+          gateTaskId: body.triggerTaskId,
+          targetTaskId,
+          rationale: body.rationale ?? "Web UI 派发上游返工"
+        })
+      );
+      return;
+    }
     sendJson(
       input.response,
       200,
